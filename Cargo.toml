@@ -2,7 +2,7 @@
 name = "umwelt"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 description = "Interest management for real-time simulation: spatial subscription, priority accumulation, and per-viewer bandwidth budgeting."
 license = "Apache-2.0"
 repository = "https://github.com/umwelt-sim/umwelt-rs"
@@ -11,4 +11,21 @@ keywords = ["gamedev", "networking", "replication", "multiplayer", "simulation"]
 categories = ["game-development", "network-programming", "simulation"]
 include = ["src/**/*", "README.md", "LICENSE"]
 
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "subscription"
+harness = false
+
+[[bench]]
+name = "gather"
+harness = false

@@ -11,5 +11,5 @@ pub use pos::{Pos3, Pos2, CellCoord, CellId};
 pub use config::{ConfigError, WorldConfigBuilder, ViewConfigBuilder, ViewConfig, WorldConfig};
 pub use entity::{EntityId, LiveSet};
 pub use gather::{DiscoveredEntities, DiscoveredEntity};
-pub use snapshot::{CellOccupants, CellSnapshot};
+pub use snapshot::{CellOccupants, CellSnapshot, SubCells};
 pub use subscription::{CellList, Subscription};

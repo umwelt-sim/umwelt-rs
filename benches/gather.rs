@@ -413,7 +413,7 @@ fn bench_parallel_town_square(c: &mut Criterion) {
     let cfg = WorldConfig::default();
     let mut group = c.benchmark_group("gather/town_square");
 
-    for &crowd in &[2_048usize, 8_192] {
+    for &crowd in &[2_048usize, 4_096, 8_192] {
         let (entities, _) = hot_cell(&cfg, crowd, crowd, 0xC0FFEE);
         let snap = snapshot_of(&cfg, &entities);
         let vs: Vec<Pos3> = (0..entities.xs.len())
@@ -435,8 +435,94 @@ fn bench_parallel_town_square(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cost of `update` with and without the sub-cell sort, on an 8,192 crowd in one
+/// cell. The whole population is dense, so this is the worst case for the second
+/// sort.
+fn bench_subdivision(c: &mut Criterion) {
+    let cfg = WorldConfig::default();
+    let (entities, _) = hot_cell(&cfg, 8_192, 8_192, 0xC0FFEE);
+
+    let mut group = c.benchmark_group("snapshot/update");
+    for &(label, axis) in &[("subdivision_off", 1u32), ("axis_8", 8u32), ("axis_16", 16u32)] {
+        let mut snap = CellSnapshot::with_subdivision(&cfg, axis, 512);
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                snap.update(
+                    black_box(&entities.xs),
+                    black_box(&entities.ys),
+                    black_box(&entities.zs),
+                    &entities.live,
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+/// The town square with a walk cap. Every entity is a viewer, so the tick cost
+/// is the crowd walking itself. `cap` of `usize::MAX` is the uncapped baseline.
+fn bench_capped_town_square(c: &mut Criterion) {
+    let cfg = WorldConfig::default();
+    let mut group = c.benchmark_group("gather/capped_town_square");
+
+    // 10,000 is deliberately not a power of two. Cell size, sub-grid axis, and
+    // cell shift all are, so a ragged population exercises partial sub-cells,
+    // uneven thread chunking, and a cap that does not divide evenly.
+    for &crowd in &[8_192usize, 10_000] {
+    let (entities, _) = hot_cell(&cfg, crowd, crowd, 0xC0FFEE);
+    let snap = snapshot_of(&cfg, &entities);
+    let vs: Vec<Pos3> = (0..entities.xs.len())
+        .map(|i| Pos3::new(entities.xs[i], entities.ys[i], entities.zs[i]))
+        .collect();
+    let subs = subs_of(&cfg, &vs);
+
+    for &threads in &[1usize, 4] {
+    for &(label, cap) in &[
+        ("uncapped", usize::MAX),
+        ("cap_2048", 2_048usize),
+        ("cap_1024", 1_024),
+        ("cap_512", 512),
+        ("cap_256", 256),
+    ] {
+        let mut per_thread = per_thread_buffers(threads, 16_384);
+        group.throughput(Throughput::Elements(vs.len() as u64));
+        group.bench_function(format!("crowd{crowd}/t{threads}/{label}"), |b| {
+            b.iter(|| {
+                let threads = per_thread.len();
+                let chunk = vs.len().div_ceil(threads);
+                std::thread::scope(|s| {
+                    for ((vc, sc), buf) in vs
+                        .chunks(chunk)
+                        .zip(subs.chunks(chunk))
+                        .zip(per_thread.iter_mut())
+                    {
+                        let snap = &snap;
+                        s.spawn(move || {
+                            for (v, sb) in vc.iter().zip(sc) {
+                                buf.clear();
+                                snap.gather_into_capped(
+                                    black_box(*v),
+                                    black_box(*sb),
+                                    black_box(cap),
+                                    buf,
+                                );
+                                black_box(buf.len());
+                            }
+                        });
+                    }
+                });
+            })
+        });
+    }
+    }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_capped_town_square,
+    bench_subdivision,
     bench_uniform,
     bench_empty,
     bench_cell_size,

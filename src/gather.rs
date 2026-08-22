@@ -5,8 +5,8 @@
 
 use crate::entity::EntityId;
 use crate::fixed::DistSq;
-use crate::snapshot::CellSnapshot;
-use crate::pos::Pos3;
+use crate::snapshot::{CellOccupants, CellSnapshot};
+use crate::pos::{CellCoord, Pos2, Pos3};
 use crate::subscription::Subscription;
 
 /// One entity within a viewer's range, and its distance from that viewer.
@@ -114,30 +114,88 @@ impl CellSnapshot {
     /// vertical cylinder. Height affects the recorded distance, not membership.
     ///
     /// Does not clear `out`. Does not exclude the viewer's own entity.
-    pub fn gather_into(
+    pub fn gather_into(&self, viewer: Pos3, sub: Subscription, out: &mut DiscoveredEntities) {
+        self.gather_into_capped(viewer, sub, usize::MAX, out);
+    }
+
+    /// [`Self::gather_into`], stopping once `out` holds `cap` entries.
+    ///
+    /// Cells are visited outward from the viewer's own cell, and a subdivided
+    /// cell is visited by sub-cell outward from the viewer's own sub-cell, so a
+    /// caller that stops early keeps the nearer entities.
+    ///
+    /// `cap` counts everything in `out`, including entries present before the
+    /// call. It is checked at cell and sub-cell boundaries rather than per
+    /// entity, so `out` may exceed it by up to the population of the last cell
+    /// or sub-cell walked.
+    ///
+    /// The walk enumerates offsets from the viewer's own cell and rejects
+    /// anything outside `sub`, which covers `sub` exactly when it was built by
+    /// `Subscription::at_center` on the viewer's cell.
+    pub fn gather_into_capped(
         &self,
         viewer: Pos3,
         sub: Subscription,
+        cap: usize,
         out: &mut DiscoveredEntities,
     ) {
         let cfg = self.config();
         let radius_sq = DistSq::from_radius(cfg.horizontal_view_radius());
         let viewer_h = viewer.horizontal();
+        let center = cfg.cell_of(viewer_h);
+        debug_assert!(
+            sub.contains(center),
+            "subscription does not contain the viewer's own cell"
+        );
 
-        for coord in sub.cells() {
-            let entities = self.entities_for_cell(cfg.cell_id(coord));
-            for i in 0..entities.len() {
-                // The horizontal terms are computed twice: once here, once in
-                // the 3D distance below.
-                if viewer_h.dist_sq(entities.horizontal(i)) > radius_sq {
-                    continue;
+        for &(dx, dy) in self.cell_order() {
+            let cx = center.x as i32 + dx as i32;
+            let cy = center.y as i32 + dy as i32;
+            if cx < sub.x0 || cx > sub.x1 || cy < sub.y0 || cy > sub.y1 {
+                continue;
+            }
+            let coord = CellCoord::new(cx as u16, cy as u16);
+            let cid = cfg.cell_id(coord);
+
+            match self.sub_cells(cid) {
+                Some(grid) => {
+                    for &b in self.sub_cell_order(coord, viewer_h) {
+                        take(viewer, viewer_h, radius_sq, grid.occupants_at(b as usize), out);
+                        if out.len() >= cap {
+                            return;
+                        }
+                    }
                 }
-                out.push(DiscoveredEntity::new(
-                    entities.ids[i],
-                    viewer.dist_sq(entities.pos(i)),
-                ));
+                None => {
+                    take(viewer, viewer_h, radius_sq, self.entities_for_cell(cid), out);
+                    if out.len() >= cap {
+                        return;
+                    }
+                }
             }
         }
+    }
+}
+
+/// Tests one run of entities against the view radius and appends survivors.
+#[inline(always)]
+fn take(
+    viewer: Pos3,
+    viewer_h: Pos2,
+    radius_sq: DistSq,
+    entities: CellOccupants<'_>,
+    out: &mut DiscoveredEntities,
+) {
+    for i in 0..entities.len() {
+        // The horizontal terms are computed twice: once here, once in
+        // the 3D distance below.
+        if viewer_h.dist_sq(entities.horizontal(i)) > radius_sq {
+            continue;
+        }
+        out.push(DiscoveredEntity::new(
+            entities.ids[i],
+            viewer.dist_sq(entities.pos(i)),
+        ));
     }
 }
 
@@ -249,6 +307,150 @@ mod tests {
         let mut v: Vec<u32> = out.iter().map(|e| e.id.raw()).collect();
         v.sort_unstable();
         v
+    }
+
+    // -- ordered walk and cap -------------------------------------------
+
+    /// `n` entities scattered inside the cell containing `m` metres.
+    fn crowd(cfg: &WorldConfig, n: usize, m: i32, seed: u64) -> Vec<Pos3> {
+        let cell = cfg.cell_size().raw() as u32;
+        let origin = (crate::fixed::Fixed::from_meters(m).raw() as u32) & !(cell - 1);
+        let mut s = seed;
+        let mut next = move |bound: u32| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u32 % bound
+        };
+        (0..n)
+            .map(|_| {
+                Pos3::new(
+                    crate::fixed::Fixed::from_raw((origin + next(cell)) as i32),
+                    crate::fixed::Fixed::from_raw((origin + next(cell)) as i32),
+                    crate::fixed::Fixed::ZERO,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ragged_crowd_is_handled() {
+        // 10,000 is not a power of two, unlike cell size, sub-grid axis, and
+        // cell shift. Partial sub-cells and a cap that does not divide evenly.
+        let cfg = WorldConfig::default();
+        let pts = crowd(&cfg, 10_000, 2048, 0x7A99);
+        let viewer = pts[0];
+        let snap = snapshot_of(&cfg, &pts);
+        let sub = Subscription::at_center(&cfg, cfg.cell_of(viewer.horizontal()));
+
+        let mut full = DiscoveredEntities::new();
+        snap.gather_into(viewer, sub, &mut full);
+
+        let radius_sq = DistSq::from_radius(cfg.horizontal_view_radius());
+        let expected = pts
+            .iter()
+            .filter(|p| viewer.horizontal().dist_sq(p.horizontal()) <= radius_sq)
+            .count();
+        assert_eq!(full.len(), expected, "ragged population must still be found in full");
+
+        for &cap in &[7usize, 333, 1_001, 9_999] {
+            let mut out = DiscoveredEntities::new();
+            snap.gather_into_capped(viewer, sub, cap, &mut out);
+            assert!(out.len() >= cap.min(expected), "cap {cap} under-filled at {}", out.len());
+            assert!(out.len() <= expected, "cap {cap} over-filled at {}", out.len());
+        }
+    }
+
+    #[test]
+    fn uncapped_gather_matches_a_brute_force_scan() {
+        let cfg = WorldConfig::default();
+        let pts = crowd(&cfg, 3000, 2048, 0x1111);
+        let viewer = pts[0];
+        let out = run(&cfg, &pts, viewer);
+
+        let radius_sq = DistSq::from_radius(cfg.horizontal_view_radius());
+        let mut expected: Vec<u32> = pts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| viewer.horizontal().dist_sq(p.horizontal()) <= radius_sq)
+            .map(|(i, _)| i as u32)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(ids(&out), expected, "the ordered walk must not change what is found");
+    }
+
+    #[test]
+    fn cap_limits_the_output() {
+        let cfg = WorldConfig::default();
+        let pts = crowd(&cfg, 4000, 2048, 0x2222);
+        let viewer = pts[0];
+        let snap = snapshot_of(&cfg, &pts);
+        let sub = Subscription::at_center(&cfg, cfg.cell_of(viewer.horizontal()));
+
+        let mut out = DiscoveredEntities::new();
+        snap.gather_into_capped(viewer, sub, 100, &mut out);
+        assert!(out.len() >= 100, "cap should be reached, got {}", out.len());
+        assert!(out.len() < 600, "overshoot is bounded by one sub-cell, got {}", out.len());
+    }
+
+    #[test]
+    fn cap_keeps_the_nearest() {
+        let cfg = WorldConfig::default();
+        let pts = crowd(&cfg, 4000, 2048, 0x3333);
+        let viewer = pts[0];
+        let snap = snapshot_of(&cfg, &pts);
+        let sub = Subscription::at_center(&cfg, cfg.cell_of(viewer.horizontal()));
+
+        let mut full = DiscoveredEntities::new();
+        snap.gather_into(viewer, sub, &mut full);
+        let mut capped = DiscoveredEntities::new();
+        snap.gather_into_capped(viewer, sub, 200, &mut capped);
+
+        let worst_kept = capped.iter().map(|e| e.dist_sq).max().unwrap();
+        let worst_overall = full.iter().map(|e| e.dist_sq).max().unwrap();
+        assert!(worst_kept < worst_overall, "the cap must drop the far entities");
+
+        let nearest = full.iter().map(|e| e.dist_sq).min().unwrap();
+        assert!(
+            capped.iter().any(|e| e.dist_sq == nearest),
+            "the nearest entity must survive the cap"
+        );
+    }
+
+    #[test]
+    fn cap_counts_entries_already_present() {
+        let cfg = WorldConfig::default();
+        let pts = crowd(&cfg, 4000, 2048, 0x4444);
+        let viewer = pts[0];
+        let snap = snapshot_of(&cfg, &pts);
+        let sub = Subscription::at_center(&cfg, cfg.cell_of(viewer.horizontal()));
+
+        let mut out = DiscoveredEntities::new();
+        snap.gather_into_capped(viewer, sub, 300, &mut out);
+        let first = out.len();
+
+        // Already over the cap, so a second call adds at most one sub-cell.
+        snap.gather_into_capped(viewer, sub, 300, &mut out);
+        assert!(
+            out.len() - first < 600,
+            "a call starting over the cap should stop almost immediately"
+        );
+    }
+
+    #[test]
+    fn cells_are_visited_nearest_first() {
+        let cfg = WorldConfig::default();
+        // One entity in the viewer's own cell, one two cells away but in range.
+        let pts = [
+            Pos3::from_meters(2100, 2050, 0),
+            Pos3::from_meters(2300, 2050, 0),
+        ];
+        let viewer = Pos3::from_meters(2060, 2050, 0);
+        let out = run(&cfg, &pts, viewer);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.as_slice()[0].id.raw(),
+            0,
+            "the entity in the viewer's own cell must come first"
+        );
     }
 
     #[test]

@@ -916,6 +916,13 @@ impl ViewConfig {
 
     /// Entities per packet if every record were `record_bytes` wide. Planning
     /// aid only; real packing is greedy over variable-size records.
+    ///
+    /// `record_bytes` is a parameter rather than a stored field so benchmarks
+    /// can sweep it. No wire format exists yet. The 16 used throughout the
+    /// design notes is an assumption: at the default wire precision a quantized
+    /// position is 46 bits, and a per-connection ghost id adds roughly 12, so a
+    /// bare position update is nearer 8 bytes. At 8 the packet holds 116
+    /// records, at 24 it holds 38.
     pub const fn est_records_per_packet(&self, record_bytes: u32) -> u32 {
         if record_bytes == 0 {
             return 0;

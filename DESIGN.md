@@ -351,6 +351,41 @@ tick rate, which affect simulation but not decoding.
 **`ViewConfig`** is per-client policy. Budget, hysteresis, dwell, send rate. May
 differ per client.
 
+### Where 58 records per packet comes from
+
+```
+state_budget = payload_bytes - (header_bytes + event_reserve_bytes)
+             = 1200 - (16 + 256) = 928
+records      = state_budget / record_bytes = 928 / 16 = 58
+```
+
+Four inputs, one verified and three assumed.
+
+`payload_bytes` at 1200 is well founded. Ethernet MTU is 1500, an IPv6 header
+takes 40 and UDP 8, leaving 1452. 1200 survives tunnels, VPNs, and PPPoE without
+fragmenting, and is what QUIC mandates as its minimum datagram size.
+
+`header_bytes` at 16 is a guess. No packet format is designed. It would hold a
+sequence number, an ack or ack bitfield, a tick identifier, and flags.
+
+`event_reserve_bytes` at 256 is a guess. The reasoning holds, since without a
+reserve a dense crowd's position updates fill every packet and a client can stand
+in a mob without learning it died. The number itself is arbitrary.
+
+`record_bytes` at 16 is the weakest and the most load bearing. It is not a stored
+field, only an argument to `est_records_per_packet`, which is deliberate so
+benchmarks can sweep it. From the configured wire precision a quantized position
+is 16 bits per horizontal axis and 14 vertical, so 46 bits or about 6 bytes. A
+per-connection ghost id for a viewer seeing a few thousand entities needs about
+12 bits. A bare position update is therefore nearer 8 bytes. The 16 assumes
+roughly double, presumably for velocity, orientation, or a state mask, none of
+which are specified.
+
+At 8 bytes per record the figure is 116, and at 24 it is 38. Every use of 58 in
+this document inherits that spread, including the examine-to-send ratios for the
+crowded case and the proposed walk cap. It will not be settled until something is
+serialized.
+
 Builder-only construction; private fields, no public literal constructor.
 `Default` must remain a `build()` call. **Do not derive `Deserialize` on
 `WorldConfig`**, because a derived impl constructs field by field and skips validation.
@@ -435,8 +470,17 @@ because it owns single-writer scratch while the snapshot is read concurrently by
 many threads. That is the tick-thread-to-worker-threads handoff.
 
 The scatter walks the source in ascending id order, so each cell's range is
-ascending by id. The gather does not need that. Per-(viewer, entity) state does:
-two ascending runs merge, where unordered ones need a lookup per entity.
+ascending by id. This is a byproduct of the algorithm, not a goal, and costs
+nothing.
+
+Its value is unproven. Entity id is the only key stable across a tick boundary,
+since position, distance, and cell all change, so it is the natural key for
+reconciling per-(viewer, entity) state between ticks. Whether the ordering beats
+a small per-viewer hash map is untested: at the uniform case's ~95 candidates
+such a map fits in L1 and probes cheaply. The ordering would only matter at large
+candidate counts, which is the crowded case, which is the case a walk cap is
+meant to eliminate. It also conflicts with distance ordering within a cell, so if
+a cap is built the two cannot both come from one walk.
 
 Rebuild rather than incremental maintenance: a full sort is
 `O(entities + cells)` regardless of how many entities moved, incremental is
@@ -833,6 +877,106 @@ The library itself contains no threading. `CellSnapshot` and `CellOccupants` are
 buffer, which is all a caller needs to fan out. The replication phase that spends
 those threads belongs to `WorldSimulation` and is not built.
 
+### Walk cap and sub-cell subdivision, measured
+
+A viewer in a crowd examines every entity in the cell to send about 58 records.
+The cap bounds that walk. Three pieces:
+
+1. A cell at or above `sub_threshold` is sorted a second time by sub-cell,
+   giving `SubCells`. Runs over dense cells only, once per update.
+2. `sub_cell_order` returns the sub-cell visit order for a viewer, nearest
+   first. Every order for every origin is precomputed at construction, so a
+   lookup is an index into a 4 KB table rather than a sort. A viewer outside the
+   cell clamps to the nearest edge sub-cell.
+3. `gather_into_capped` walks cells outward from the viewer's own cell, walks a
+   subdivided cell by sub-cell outward from the viewer's own sub-cell, and stops
+   once `out` holds `cap` entries.
+
+Cells had to become distance-ordered as well as sub-cells. A cap on a row-major
+walk fills on whatever cell comes first. The viewer always sits at the center of
+its own subscription, so one ring order serves every viewer and is built once
+from `cell_radius`.
+
+The cap is checked at cell and sub-cell boundaries, not per entity, so `out` can
+exceed it by the population of the last one walked. Truncating mid-run would
+break the distance property the ordering exists to provide.
+
+Town square, four threads, every entity also a viewer. 50 samples.
+
+| cap | 8,192 crowd | % of tick | vs uncapped | 10,000 crowd | % of tick | vs uncapped |
+|---|---|---|---|---|---|---|
+| uncapped | 42.01 ms | 84% | 1.0x | 67.91 ms | 136% | 1.0x |
+| 2,048 | 11.32 ms | 23% | 3.7x | 14.10 ms | 28% | 4.8x |
+| 1,024 | 5.86 ms | 12% | 7.2x | 7.15 ms | 14% | 9.5x |
+| 512 | 3.17 ms | 6.3% | 13.3x | 3.69 ms | 7.4% | 18.4x |
+| 256 | 1.82 ms | 3.6% | 23.1x | 1.97 ms | 3.9% | 34.5x |
+
+**The cap converts a quadratic into a linear.** Uncapped cost is viewers times
+entities examined, and in a town square those are the same number. Going from
+8,192 to 10,000 is a crowd factor of 1.22, so quadratic predicts 1.49 and
+measurement gives 1.62. Capped, cost is viewers times a constant, so linear
+predicts 1.22:
+
+| cap | measured ratio, 8,192 to 10,000 |
+|---|---|
+| uncapped | 1.62 (quadratic predicts 1.49) |
+| 2,048 | 1.25 |
+| 1,024 | 1.22 |
+| 512 | 1.17 |
+| 256 | 1.08 |
+
+At a cap of 512 the crowd is 6.3% of tick against the uniform case's 5.7%, so a
+dense crowd stops being a special case. That is the point of the mechanism, not
+the raw speedup.
+
+The sublinear ratios at small caps are the fixed per-viewer costs becoming
+visible: subscription, ring walk, and empty cells do not scale with the crowd.
+
+Single core, same scenario and run:
+
+| cap | 8,192 crowd | % of tick | 10,000 crowd | % of tick |
+|---|---|---|---|---|
+| uncapped | 152.14 ms | 304% | 229.19 ms | 458% |
+| 2,048 | 38.54 ms | 77% | 46.98 ms | 94% |
+| 1,024 | 20.00 ms | 40% | 24.36 ms | 49% |
+| 512 | 10.89 ms | 22% | 13.78 ms | 28% |
+| 256 | 6.18 ms | 12% | 7.29 ms | 15% |
+
+Both crowd sizes fit one core with room to spare at a cap of 512, which was not
+true of either before. 8,192 goes from 304% of a single core's tick to 22%, a
+14.0x reduction with no threads involved.
+
+The uncapped single-core figure here is 152.14 ms against the 178.79 and
+182.13 ms measured for the same scenario in two earlier runs. That is a 16% gap
+in the direction of the between-run drift already documented. Uncapped and capped
+were measured in the same session here, so the 14.0x ratio is internally
+consistent; the absolute figures across sessions are not.
+
+**Cost of the second sort**, worst case with the whole population in one cell:
+
+| | `update` time |
+|---|---|
+| subdivision off | 75.4 µs |
+| 8x8 sub-grid | 139.7 µs |
+| 16x16 sub-grid | 170.4 µs |
+
+64 µs added against the tens of milliseconds it saves, paid once per tick rather
+than once per viewer. It nearly doubles `update` in this worst case because every
+entity in the world is in the dense cell.
+
+**The semantic cost.** A viewer stops seeing everything within its radius and
+starts seeing the nearest N. That is the entity cap every MMO ships, and it is a
+product decision arriving as an optimization.
+
+**Not established.** What N should be. It has to leave the accumulator enough
+candidates to choose among, and 58 records per packet is itself arithmetic from
+three unverified inputs. The 512 default is a placeholder. Nothing has measured
+what a viewer notices when entities beyond the cap stop existing.
+
+Correctness at a ragged population is tested rather than assumed: cell size,
+`sub_axis`, and `cell_shift` are all powers of two, so a 10,000 crowd exercises
+partial sub-cells, uneven thread chunking, and caps that do not divide evenly.
+
 ### Still to instrument
 
 Entities dropped by budget, per-client bytes per tick, subscription churn rate,
@@ -845,15 +989,16 @@ p99 tick duration, and `DiscoveredEntities::capacity()` after warmup.
 1. ~~Core library: cells, subscription~~ (done)
 2. ~~Snapshot, cell ordering, gather pass~~ (done)
 3. ~~Gather benchmark: uniform and single hot cell~~ (done)
-4. Priority accumulator and budget selection (next)
-5. `WorldSimulation`, the game hook trait, and a minimal `herd` game step
+4. ~~Sub-cell subdivision, distance-ordered walk, walk cap~~ (done)
+5. Priority accumulator and budget selection (next)
+6. `WorldSimulation`, the game hook trait, and a minimal `herd` game step
    (movement, health; nothing else)
-6. Bot harness with adversarial movement patterns
-7. `SimulatorEdge` and the sim-to-edge protocol
-8. Checkpoint path (full-fidelity, distinct from the wire payload)
-9. Cross-region: boundary replication, authority epochs, handoff
-10. Control plane
-11. Second library consumer, to prove the API is not shaped around `herd`
+7. Bot harness with adversarial movement patterns
+8. `SimulatorEdge` and the sim-to-edge protocol
+9. Checkpoint path (full-fidelity, distinct from the wire payload)
+10. Cross-region: boundary replication, authority epochs, handoff
+11. Control plane
+12. Second library consumer, to prove the API is not shaped around `herd`
 
 Notes on order:
 

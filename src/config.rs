@@ -864,7 +864,7 @@ pub struct ViewConfig {
     dwell_ticks: u32,
     hysteresis: Fixed,
 
-    state_budget_bytes: u32,
+    min_state_bytes: u32,
     downstream_bytes_per_sec: u32,
 }
 
@@ -873,15 +873,38 @@ impl ViewConfig {
         ViewConfigBuilder::default()
     }
 
-    /// Bytes per packet available for entity state, after header and reserve.
+    /// Bytes available for state records when no events are pending.
     ///
     /// A byte budget, not a record count: entity payloads are opaque to this
     /// crate, so packing is a greedy fill rather than a division.
-    pub const fn state_budget_bytes(&self) -> u32 {
-        self.state_budget_bytes
+    pub const fn max_state_bytes(&self) -> u32 {
+        self.payload_bytes - self.header_bytes
     }
-    /// Held back so a dense crowd cannot starve out a reliable event. Without
-    /// it, standing in a mob means never learning that you died.
+
+    /// Bytes guaranteed to state even when events are backlogged past the
+    /// reserve.
+    pub const fn min_state_bytes(&self) -> u32 {
+        self.min_state_bytes
+    }
+
+    /// Bytes available for state records given the bytes of events waiting.
+    ///
+    /// The reserve is a floor for events, not a subtraction taken from every
+    /// packet. A client with nothing pending gives the whole reserve back to
+    /// state; a client with less pending than the reserve gives back the
+    /// difference.
+    pub const fn state_bytes_available(&self, pending_event_bytes: u32) -> u32 {
+        let taken = if pending_event_bytes < self.event_reserve_bytes {
+            pending_event_bytes
+        } else {
+            self.event_reserve_bytes
+        };
+        self.payload_bytes - self.header_bytes - taken
+    }
+    /// A floor for events, not a subtraction from every packet. It bounds how
+    /// much of a packet a dense crowd's position updates can take when events
+    /// are waiting; with none waiting, state uses it. Without a reserve,
+    /// standing in a mob means never learning that you died.
     pub const fn event_reserve_bytes(&self) -> u32 {
         self.event_reserve_bytes
     }
@@ -914,20 +937,23 @@ impl ViewConfig {
         self.downstream_bytes_per_sec * 8
     }
 
-    /// Entities per packet if every record were `record_bytes` wide. Planning
-    /// aid only; real packing is greedy over variable-size records.
+    /// Entities per packet if every record were `record_bytes` wide, with no
+    /// events pending. Planning aid only; real packing is greedy over
+    /// variable-size records.
+    ///
+    /// Under a backlog that consumes the whole reserve this falls to
+    /// `min_state_bytes / record_bytes`.
     ///
     /// `record_bytes` is a parameter rather than a stored field so benchmarks
     /// can sweep it. No wire format exists yet. The 16 used throughout the
     /// design notes is an assumption: at the default wire precision a quantized
     /// position is 46 bits, and a per-connection ghost id adds roughly 12, so a
-    /// bare position update is nearer 8 bytes. At 8 the packet holds 116
-    /// records, at 24 it holds 38.
+    /// bare position update is nearer 8 bytes.
     pub const fn est_records_per_packet(&self, record_bytes: u32) -> u32 {
         if record_bytes == 0 {
             return 0;
         }
-        self.state_budget_bytes / record_bytes
+        self.max_state_bytes() / record_bytes
     }
 
     /// Starting point for a given world: one MTU-safe packet per tick,
@@ -1018,7 +1044,7 @@ impl ViewConfigBuilder {
             send_hz,
             dwell_ticks,
             hysteresis,
-            state_budget_bytes: payload_bytes - overhead,
+            min_state_bytes: payload_bytes - overhead,
             downstream_bytes_per_sec: payload_bytes * send_hz,
         })
     }
@@ -1242,7 +1268,35 @@ mod tests {
         let in_view = w.est_entities_in_view(8_192);
         let capacity = v.est_records_per_packet(16);
         assert_eq!(in_view, 200);
-        assert_eq!(capacity, 58);
-        assert!(in_view > capacity * 3);
+        assert_eq!(capacity, 74);
+        assert!(in_view > capacity * 2);
+    }
+
+    #[test]
+    fn event_reserve_is_a_floor_not_a_subtraction() {
+        let w = WorldConfig::default();
+        let v = ViewConfig::default_for(&w);
+
+        // 1200 payload, 16 header, 256 reserve.
+        assert_eq!(v.max_state_bytes(), 1_184);
+        assert_eq!(v.min_state_bytes(), 928);
+
+        // Nothing pending: state gets the reserve back.
+        assert_eq!(v.state_bytes_available(0), 1_184);
+        // Less pending than the reserve: state gets the difference back.
+        assert_eq!(v.state_bytes_available(100), 1_084);
+        // Exactly the reserve, and beyond it, state keeps its floor.
+        assert_eq!(v.state_bytes_available(256), 928);
+        assert_eq!(v.state_bytes_available(5_000), 928);
+    }
+
+    #[test]
+    fn giving_the_reserve_back_buys_records() {
+        let w = WorldConfig::default();
+        let v = ViewConfig::default_for(&w);
+        let idle = v.max_state_bytes() / 16;
+        let backlogged = v.min_state_bytes() / 16;
+        assert_eq!(idle, 74);
+        assert_eq!(backlogged, 58);
     }
 }

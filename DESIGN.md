@@ -62,8 +62,8 @@ and memory mapping are excluded.
 
 Budget selection is a filter that discards most of its input. Computed at the
 default config a viewer's subscription walks roughly 185 entities, of which
-**95 survive the view-radius test** (measured), and roughly 58 records fit in an
-MTU-sized packet. So about half of what the gather examines fails the radius
+**95 survive the view-radius test** (measured), and 74 records fit in an
+MTU-sized packet with no events pending, 58 under a full event backlog. So about half of what the gather examines fails the radius
 test, and about 40% of what survives loses to the budget, so roughly two thirds of
 what is examined never reaches a client.
 
@@ -196,6 +196,62 @@ this is a known price rather than a surprise. The way back, if it ever becomes
 intolerable, is to take position slices again instead of owning the arrays, at
 the price of a per-tick marshaling pass and the despawn problem moving to the
 consumer.
+
+### Events go through umwelt, not around it
+
+State and events have different delivery semantics. Positions are latest-only,
+lossy, and unordered, which is what the gather and the budget are built for.
+Death, chat, loot, and damage are reliable, ordered, and low volume.
+
+Both go to the same client over the same socket, and umwelt owns that socket. A
+consumer forced to build a second reliable channel alongside it has gained
+nothing from the tier split, so event delivery is umwelt's responsibility.
+
+```rust
+impl Step<'_> {
+    /// Queue a reliable, ordered message. The payload is opaque.
+    fn notify(&mut self, target: EventTarget, payload: &[u8]);
+}
+
+pub enum EventTarget {
+    /// The client controlling this entity.
+    Entity(EntityId),
+    /// Every client that currently has a ghost of this entity.
+    Observers(EntityId),
+    /// Every client within a radius of a point.
+    Near(Pos3, Fixed),
+}
+```
+
+The payload is opaque bytes. umwelt reads the target and the length; the game
+serializes the rest. That follows the storage rule above and keeps events from
+growing into a component system.
+
+**`Observers` is the target that justifies putting this in the library.** Which
+clients currently hold a ghost of a given entity is a fact only the replication
+state knows. A game emitting that itself would have to reconstruct the interest
+set, which is the work umwelt exists to do and has been optimized to do quickly.
+`Entity` and `Near` a consumer could plausibly build; `Observers` they could not.
+
+Delivery machinery is umwelt's and is not small: sequence numbers, a sliding
+window per connection, retransmit on loss, and ordered delivery. The TRIBES event
+manager is a worked design for exactly this and the paper describes it.
+
+**Ordering constraint.** An event naming an entity is meaningless to a client
+that has not been told the entity exists. Spawn notifications and events on the
+same entity must be ordered relative to each other. TRIBES gave ghost creation
+the same guaranteed delivery path as events.
+
+**The event reserve is currently a fixed cut and should be a floor.**
+`state_budget_bytes` is computed once as `payload - header - reserve`, so 256 of
+1,200 bytes are unavailable to state even when no events are pending. That is
+over 20% of every packet held for something usually absent. It should be
+reserved only against an actual backlog, with state taking the remainder
+otherwise.
+
+**Blocked on client registration.** `Entity(EntityId)` means "the client
+controlling this entity" and nothing maps a connection to an avatar yet. That is
+the same missing API the accumulator's per-client state needs, not a new one.
 
 ### Payloads leave through a `PayloadSink`
 
@@ -351,13 +407,30 @@ tick rate, which affect simulation but not decoding.
 **`ViewConfig`** is per-client policy. Budget, hysteresis, dwell, send rate. May
 differ per client.
 
-### Where 58 records per packet comes from
+### Where the records-per-packet figure comes from
+
+The event reserve is a **floor for events, not a subtraction from every packet**.
+A client with nothing pending gives the whole reserve back to state; one with
+less pending than the reserve gives back the difference. So there are two
+figures:
 
 ```
-state_budget = payload_bytes - (header_bytes + event_reserve_bytes)
-             = 1200 - (16 + 256) = 928
-records      = state_budget / record_bytes = 928 / 16 = 58
+max_state_bytes = payload_bytes - header_bytes
+                = 1200 - 16 = 1184
+idle records    = 1184 / 16 = 74
+
+min_state_bytes = payload_bytes - (header_bytes + event_reserve_bytes)
+                = 1200 - (16 + 256) = 928
+records under a full backlog = 928 / 16 = 58
 ```
+
+`state_bytes_available(pending_event_bytes)` gives the figure between them.
+Making the reserve a floor is worth 28% more records in the common case, since
+256 of 1200 bytes were previously unavailable to state whether or not any event
+existed.
+
+Uses of 58 elsewhere in this document are the conservative figure, taken under a
+backlog that consumes the entire reserve.
 
 Four inputs, one verified and three assumed.
 
@@ -578,8 +651,9 @@ physically drifted across it.
 This does not indict TRIBES. Two things visible in the paper make it a non-issue
 there: the state mask means idle objects are not in the update list at all, and a
 32-player match does not oversubscribe a packet. Computed at our default config,
-a viewer gathers roughly 95 candidates against roughly 58 record slots, 1.6x
-oversubscribed in the calm uniform case, before any crowding. (An earlier
+a viewer gathers roughly 95 candidates against 74 record slots when idle and 58
+under a full event backlog, so 1.3x to 1.6x oversubscribed in the calm uniform
+case, before any crowding. (An earlier
 version of this document said 185 and 3.2x. 185 is the number *examined*; about
 half fail the radius test.)
 
@@ -969,7 +1043,7 @@ starts seeing the nearest N. That is the entity cap every MMO ships, and it is a
 product decision arriving as an optimization.
 
 **Not established.** What N should be. It has to leave the accumulator enough
-candidates to choose among, and 58 records per packet is itself arithmetic from
+candidates to choose among, and records per packet is itself arithmetic from
 three unverified inputs. The 512 default is a placeholder. Nothing has measured
 what a viewer notices when entities beyond the cap stop existing.
 
@@ -981,6 +1055,43 @@ partial sub-cells, uneven thread chunking, and caps that do not divide evenly.
 
 Entities dropped by budget, per-client bytes per tick, subscription churn rate,
 p99 tick duration, and `DiscoveredEntities::capacity()` after warmup.
+
+### Not yet benchmarked
+
+**Boundary churn.** Entities sitting near the cap edge move in and out of a
+viewer's candidate set as the viewer shifts. Measurable now without the
+accumulator: count entities entering and leaving a capped candidate set per tick,
+as a function of viewer speed and crowd density.
+
+The interaction that matters arrives with the accumulator. An entity that drops
+out and returns looks maximally stale and wins a slot immediately, so the least
+useful part of the visible set could generate the most updates. Neither mechanism
+shows this alone.
+
+**A whole tick over a populated region.** Every benchmark so far measures one
+population shape in isolation: uniform everywhere, or the entire population in
+one cell. Neither is a region in use.
+
+The world is sharded, one sim process per region, so this is a smaller question
+than it first appears. A snapshot is bounded by entities per region, not per
+world. At 16 bytes each, L2 on the benchmark machine holds about 16,000 entities
+and L3 about 520,000, so a region has to be busy before its snapshot stops
+fitting cache.
+
+The question that remains: does a dense cell hold its measured numbers when the
+rest of its own region is also populated? The town square benchmark ran against a
+131 KB snapshot that was entirely the crowd, so the walk had the cache to itself.
+A region carrying 50,000 entities is an 800 KB snapshot, past L2, and the dense
+cell then competes with the rest of the region rather than owning it.
+
+What to build: a region with realistic clustering, most cells sparse and a few
+dense, viewers distributed with the density rather than uniformly, measuring the
+full tick of `update` plus every viewer's gather. Then compare the dense cell's
+per-viewer cost against its measurement in isolation.
+
+Secondary things it would exercise that current benchmarks do not: subdivision
+cost with many dense cells rather than one, and `update` scaling with slot count
+and cell count together rather than one at a time.
 
 ---
 
@@ -1115,7 +1226,8 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   `WorldSimulation`. Client registration is the API that does not exist yet:
   something has to say a connection exists, name its avatar entity, and attach a
   `ViewConfig`. Deferred deliberately; it belongs with the accumulator, since
-  that is what gives per-client state its shape.
+  that is what gives per-client state its shape. Event delivery is blocked on the
+  same API.
 - `Mul`/`Div` rounding disagree for negative values.
 - `protocol_hash` could send raw field values instead of a digest, which is certain rather
   than near-certain, and names the offending field.

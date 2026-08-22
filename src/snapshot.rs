@@ -164,7 +164,7 @@ impl CellSnapshot {
         self.ys.resize(n, Fixed::ZERO);
         self.zs.resize(n, Fixed::ZERO);
 
-        // Pass 1: tally into starts[c + 1], so the running total below lands on
+        // Pass 1: tally into starts[c + 1], so the running total below produces
         // each cell's start offset with no shifting afterwards.
         self.starts.fill(0);
         for i in 0..slots {
@@ -424,5 +424,19 @@ mod tests {
             snap.update(&xs, &ys, &zs, &all_live(xs.len()));
         }
         assert_eq!(snap.ids.capacity(), settled);
+    }
+}
+
+#[cfg(test)]
+mod thread_safety {
+    use super::*;
+
+    /// The replication phase runs many threads over one snapshot. Nothing in it
+    /// may become non-Sync without this failing.
+    #[test]
+    fn snapshot_is_shareable_across_threads() {
+        fn assert_sync<T: Sync + Send>() {}
+        assert_sync::<CellSnapshot>();
+        assert_sync::<CellOccupants<'_>>();
     }
 }

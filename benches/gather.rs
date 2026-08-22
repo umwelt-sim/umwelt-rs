@@ -337,5 +337,112 @@ fn bench_hot_cell(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_uniform, bench_empty, bench_cell_size, bench_hot_cell);
+/// Fans viewers across threads. One buffer per thread, reused across every
+/// viewer that thread handles.
+///
+/// The thread count is `per_thread.len()`. Buffers are passed in rather than
+/// allocated per call so the measurement excludes a malloc per thread per tick.
+fn parallel_gather(
+    snap: &CellSnapshot,
+    vs: &[Pos3],
+    subs: &[Subscription],
+    per_thread: &mut [DiscoveredEntities],
+) {
+    let threads = per_thread.len();
+    assert!(threads > 0, "parallel_gather needs at least one buffer");
+    let chunk = vs.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        for ((vc, sc), buf) in
+            vs.chunks(chunk).zip(subs.chunks(chunk)).zip(per_thread.iter_mut())
+        {
+            s.spawn(move || {
+                for (v, sb) in vc.iter().zip(sc) {
+                    buf.clear();
+                    snap.gather_into(black_box(*v), black_box(*sb), buf);
+                    black_box(buf.len());
+                }
+            });
+        }
+    });
+}
+
+/// One buffer per thread, each sized to hold one viewer's candidates.
+fn per_thread_buffers(threads: usize, capacity: usize) -> Vec<DiscoveredEntities> {
+    (0..threads).map(|_| DiscoveredEntities::with_capacity(capacity)).collect()
+}
+
+/// Scoped-thread spawn and join with no work in between. Whatever this costs is
+/// included in every parallel figure below and can be subtracted from it.
+fn bench_spawn_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gather/spawn_only");
+    for &t in &[1usize, 2, 4, 8] {
+        group.bench_with_input(BenchmarkId::from_parameter(t), &t, |b, &t| {
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    for _ in 0..t {
+                        s.spawn(|| black_box(0u64));
+                    }
+                })
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_parallel_uniform(c: &mut Criterion) {
+    let cfg = WorldConfig::default();
+    let entities = uniform(&cfg, 8_192, 0xA11CE);
+    let snap = snapshot_of(&cfg, &entities);
+    let vs = viewers(&cfg, 10_000, 0xBEEF);
+    let subs = subs_of(&cfg, &vs);
+
+    let mut group = c.benchmark_group("gather/parallel_uniform");
+    for &t in &[1usize, 2, 4, 8] {
+        let mut per_thread = per_thread_buffers(t, 1_024);
+        group.throughput(Throughput::Elements(vs.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(t), &t, |b, _| {
+            b.iter(|| parallel_gather(&snap, &vs, &subs, &mut per_thread))
+        });
+    }
+    group.finish();
+}
+
+/// The town square. Every entity in one cell, and every entity is also a viewer,
+/// so the tick cost is the full crowd walking the full crowd.
+fn bench_parallel_town_square(c: &mut Criterion) {
+    let cfg = WorldConfig::default();
+    let mut group = c.benchmark_group("gather/town_square");
+
+    for &crowd in &[2_048usize, 8_192] {
+        let (entities, _) = hot_cell(&cfg, crowd, crowd, 0xC0FFEE);
+        let snap = snapshot_of(&cfg, &entities);
+        let vs: Vec<Pos3> = (0..entities.xs.len())
+            .map(|i| Pos3::new(entities.xs[i], entities.ys[i], entities.zs[i]))
+            .collect();
+        let subs = subs_of(&cfg, &vs);
+        println!("town square {crowd}: {:.0} examined per viewer", examined(&cfg, &snap, &subs));
+
+        for &t in &[1usize, 2, 4, 8] {
+            let mut per_thread = per_thread_buffers(t, crowd.next_power_of_two());
+            group.throughput(Throughput::Elements(vs.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new(format!("crowd{crowd}"), t),
+                &t,
+                |b, _| b.iter(|| parallel_gather(&snap, &vs, &subs, &mut per_thread)),
+            );
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_uniform,
+    bench_empty,
+    bench_cell_size,
+    bench_hot_cell,
+    bench_spawn_overhead,
+    bench_parallel_uniform,
+    bench_parallel_town_square
+);
 criterion_main!(benches);

@@ -33,6 +33,10 @@ impl DiscoveredEntity {
 ///
 /// Held per worker thread and reused across viewers. [`clear`](Self::clear)
 /// retains the allocation.
+///
+/// 128-byte alignment to avoid invalidating caches on other cores when processing
+/// in parallel.
+#[repr(align(128))]
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveredEntities {
     items: Vec<DiscoveredEntity>,
@@ -153,6 +157,16 @@ mod tests {
         // 4 bytes of id and 8 of squared distance, padded to DistSq's
         // 8-byte alignment.
         assert_eq!(size_of::<DiscoveredEntity>(), 16);
+    }
+
+    #[test]
+    fn buffers_do_not_share_a_cache_line() {
+        let v: Vec<DiscoveredEntities> = (0..4).map(|_| DiscoveredEntities::new()).collect();
+        for w in v.windows(2) {
+            let a = &w[0] as *const _ as usize;
+            let b = &w[1] as *const _ as usize;
+            assert!(b - a >= 128, "adjacent buffers are {} bytes apart", b - a);
+        }
     }
 
     #[test]

@@ -697,12 +697,141 @@ The 8,192-entity hot cell measures 2.37 ns per entity, the fastest figure in the
 set, because a crowd is one enormous contiguous run. The crowd is already the
 best case for memory access, not the worst.
 
-So the town square costs 159 ms per tick because there are 8,192 entities and
-8,192 viewers looking at them. It is arithmetic, not cache. The next lever cannot
+So the town square costs roughly 180 ms per tick on one core, and consumes
+essentially the whole 50 ms budget across four, because there are 8,192 entities
+and 8,192 viewers looking at them. It is arithmetic, not cache. The next lever cannot
 be "examine each entity faster", which is close to exhausted. It has to be
 "examine fewer entities," and the priority accumulator does not do that. It caps
 what is sent while every one of those 8,192 is still examined to decide which 58
 win.
+
+### Parallel scaling, measured
+
+Viewers partitioned across threads, each thread with its own output buffer, all
+reading one snapshot immutably. Two independent runs at 50 samples and 10 s
+measurement time.
+
+**Report ratios, not absolute times.** Eight of twelve absolute figures had
+non-overlapping confidence intervals between the two runs, drifting 1% to 9%,
+while each run's internal interval was around 1%. The instability is machine
+state between runs, not sampling, and more samples do not remove it. Speedups
+are stable because whatever scales a run cancels in the ratio.
+
+| threads | uniform 10k | town square 2,048 | town square 8,192 |
+|---|---|---|---|
+| 1 | 1.00 | 1.00 | 1.00 |
+| 2 | 1.93 | 1.93 | 1.90 |
+| 4 | 3.58 | 3.58 | 3.60 |
+| 8 | 4.56 | 3.44 | 3.36 |
+
+Absolute times, averaged across the two runs and good to about 10%: uniform
+10.25 / 5.31 / 2.87 / 2.25 ms; town square 2,048 at 11.82 / 6.13 / 3.30 /
+3.44 ms; town square 8,192 at 180 / 95 / 50 / 54 ms.
+
+**Hyperthreading helps the uniform case and hurts the crowded one.** Eight
+threads beats four for uniform (4.56 against 3.58) and loses to four for both
+crowd sizes. Six of six across three scenarios and two runs. The cause is not
+established; measuring cache misses or pinning threads would settle it. Thread
+count should be configurable rather than fixed at logical core count.
+
+**Uniform is settled.** About 2.25 ms at eight threads, roughly 4.5% of a 50 ms
+tick, down from 18.8% single-threaded.
+
+**The town square consumes the entire tick.** Four threads gives 48.4 ms and
+51.9 ms across the two runs against a 50 ms budget, for the gather alone, with
+nothing spent on simulation, scoring, or assembly. Straddling the budget rather
+than fitting inside it.
+
+**The 8,192 single-threaded figure is about 180 ms.** Two 50-sample runs gave
+178.79 and 182.13. The extrapolation of one probe viewer times the crowd size
+gives 159 ms, so extrapolation underestimates by roughly 13%. Two earlier
+10-sample runs gave 188.65 and 159.30 and are not trustworthy.
+
+### False sharing, measured
+
+`DiscoveredEntities` carries `#[repr(align(128))]`. Removing it and rerunning:
+
+| | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| uniform | same | 1.7x worse | 2.6x worse | 2.8x worse |
+| town square 2,048 | same | 4.9x worse | 11.9x worse | 7.3x worse |
+| town square 8,192 | same | 5.0x worse | 6.1x worse | 7.6x worse |
+
+**Single-threaded is unchanged in all three scenarios** (10.04 against 10.35,
+11.75 against 11.88, 179.92 against 178.79). With one thread there is no second
+thread to contend with. That control rules out a plain layout effect and leaves
+inter-thread coherence traffic as the explanation, though cache-line transfers
+were not measured directly.
+
+Without the alignment, parallelism is actively harmful: the 2,048 town square
+goes from 11.75 ms serial to 39.65 ms at four threads, 3.4x slower for four times
+the hardware.
+
+The mechanism: the buffers' heap data is entirely separate, but the 24-byte `Vec`
+headers sit adjacent in a `Vec<DiscoveredEntities>`, and `push` writes the length
+field. A test asserts adjacent buffers land at least 128 bytes apart; with the
+attribute removed it reports 24.
+
+Any per-worker mutable state added later needs the same treatment.
+
+#### Confirmed by `perf c2c`
+
+The mechanism above is no longer inferred. `perf c2c` samples memory accesses
+with PEBS and reports HITM events, meaning a load that found its line held in
+another core's cache in modified state, forcing a write-back and a transfer.
+That transfer is the cost of false sharing.
+
+Both builds profiled on the same workload, the 2,048 town square at four threads.
+
+| | unaligned | aligned |
+|---|---|---|
+| total local HITM | 6,056 | 120 |
+| shared cache lines reported | 22 | 99 |
+| worst single line | 99.47%, 6,024 HITM | 7.50%, 9 HITM |
+| loads sampled at 30+ cycles latency | 115,262 | 21,806 |
+| benchmark time under perf | 32.3 ms | 3.49 ms |
+
+Unaligned, one cache line at `0x5d8e9f2f8480` carried 99.47% of every HITM event
+in the program, and 79,823 of 271,016 sampled memory records touched it. Within
+that line the stores landed at offsets `0x00`, `0x18`, and `0x30`: a stride of
+exactly 24 bytes, which is the size of a `Vec` header and therefore of an
+unaligned `DiscoveredEntities`. Three buffers in one line, each written by a
+different thread. The offsets between them carried the loads, which is `push`
+reading pointer and capacity before writing length. Every contending code address
+resolved to `gather_into` with `push` inlined.
+
+Aligned, that line is absent. No remaining line exceeds 9 HITM, 89 of the 99 sit
+at one event each, and four of the top five addresses are in kernel space rather
+than in this program. That is a noise floor, not contention.
+
+Reading note: HITM is charged to the load that had to fetch the line back, not to
+the store that dirtied it. The HITM column names victims. The store column, with
+its 24-byte stride, is the evidence.
+
+The 81% drop in loads sampled at 30 or more cycles is a second, independent
+signal. The same workload doing the same work has far fewer slow loads once the
+lines are separated, because the loads were slow on account of waiting for them.
+
+#### Symbolization caveat
+
+`perf` correlates data addresses to code by recording both the data address and
+the instruction pointer in each PEBS sample, then resolving the instruction
+pointer against the binary's symbol table. The pairing is recorded by hardware,
+not inferred.
+
+Resolution quality is another matter. There is no `[profile.release]` section in
+`Cargo.toml`, so release builds carry no debug info, and `perf` falls back to
+nearest-preceding-symbol lookup. The `umwelt::gather` attributions are
+corroborated by several distinct instruction pointers resolving to the same hot
+function, but the report also attributes some samples to
+`std::sys::backtrace::__rus...`, which is almost certainly a nearest-symbol
+error, and source columns show codegen unit names rather than file and line.
+Adding `[profile.release] debug = 1` would give line-level attribution.
+
+The library itself contains no threading. `CellSnapshot` and `CellOccupants` are
+`Sync + Send`, asserted by test, and `gather_into` takes a caller-supplied
+buffer, which is all a caller needs to fan out. The replication phase that spends
+those threads belongs to `WorldSimulation` and is not built.
 
 ### Still to instrument
 
@@ -765,6 +894,13 @@ A standby simulation cannot be fed by the client stream. Two designs:
 - `WorldSimulation`'s tick loop runs on a dedicated pinned OS thread, not Tokio.
   Tokio belongs in `SimulatorEdge`, where the work is connection-shaped.
 - Per-client work parallelizes across threads reading the published snapshot.
+  Measured at 3.6x on 4 physical cores. Hyperthreading past that helps the
+  uniform case and hurts the crowded one, so thread count should be
+  configurable.
+- Any per-worker mutable state must be separated onto its own cache line.
+  `DiscoveredEntities` handles its own; anything added beside it must too.
+- Any per-worker mutable state must be separated onto its own cache line.
+  `DiscoveredEntities` handles its own; anything added beside it must too.
 - `ArcSwap` or `triple_buffer` for the tick-thread-to-worker-threads handoff.
 - Struct-of-arrays. `Pos3` is a **value type**, what functions take and return.
   Never `Vec<Pos3>`.

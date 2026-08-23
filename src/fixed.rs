@@ -190,10 +190,7 @@ impl Mul for Fixed {
     type Output = Fixed;
     /// Fixed times fixed. The raw product carries 20 fractional bits, so it
     /// is shifted back down by 10. Widened to `i64` first because two 32-bit
-    /// values overflow `i32` before the shift can bring them back in range.
-    ///
-    /// Truncates toward negative infinity (arithmetic shift), unlike
-    /// [`Div`], which truncates toward zero. Both are deterministic.
+    /// values overflow `i32` before the shift can bring them back in range.    
     #[inline(always)]
     fn mul(self, rhs: Fixed) -> Fixed {
         Fixed(((self.0 as i64 * rhs.0 as i64) >> FIXED_SHIFT) as i32)
@@ -232,7 +229,7 @@ impl Div<i32> for Fixed {
 // ---------------------------------------------------------------------------
 
 impl fmt::Display for Fixed {
-    /// Metres to three decimal places, computed without floating point so
+    /// Meters to three decimal places, computed without floating point so
     /// output is identical everywhere.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let neg = self.0 < 0;
@@ -263,9 +260,8 @@ impl fmt::Debug for Fixed {
 /// magnitude overflows `i32`: across a 4 km region the largest squared
 /// separation is around 5.3e13, which needs 64 bits.
 ///
-/// Ordering is preserved by squaring, so comparisons work directly and the
-/// priority scorer never needs a square root. Use [`DistSq::from_radius`] to
-/// build a comparable threshold.
+/// Ordering is preserved by squaring, so comparisons work directly and 
+/// ranking algorithms never need a square root. 
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct DistSq(u64);
@@ -291,9 +287,8 @@ impl DistSq {
     }
 
     /// Approximate distance via integer square root. For display and coarse
-    /// bucketing only; prefer comparing squared values.
-    pub const fn sqrt_approx(self) -> Fixed {
-        // Newton's method on integers. Deterministic, no float, no libm.
+    /// bucketing only. For comparison use the squared values.
+    pub const fn sqrt_approx(self) -> Fixed {        
         if self.0 == 0 {
             return Fixed::ZERO;
         }

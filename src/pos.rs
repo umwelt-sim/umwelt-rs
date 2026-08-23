@@ -6,9 +6,8 @@
 //! 
 //! "Raw units" are referred to in multiple places in different modules. No matter
 //! what the runtime configuration contains, a single raw unit will _always_ be 
-//! equal to `1/1024` meters or `0.9766` millimeters. This amounts to the slowest
-//! possible entity moving 1 unit per tick at 20 Hz moves around 2cm/s.
-//!
+//! equal to `1/1024` meters or `0.9766` millimeters. The net result of this
+//! is that the slowest possible entity moving 1 unit per tick at 20 Hz moves around 2cm/s.
 //!
 //! # Axes
 //!
@@ -31,10 +30,7 @@
 //! # Storage
 //!
 //! [`Pos3`] is a **value type**: functions take and return this directly from the stack without ever performing
-//! a pointer de-reference. This is important for hot-path calculations on a ~50ms budget tick. This isn't
-//! a storage _layout_. Entity positions are managed as a struct of arrays (a separate `Vec<Fixed>` per axis), so
-//! the scoring loop streams contiguous memory and can vectorise. A `Vec<Pos3>` interleaves the axes and loses both.
-//! The library doesn't enforce this, but `Pos3` should never appear inside a `Vec`.
+//! a pointer de-reference. This is important for hot-path calculations on a ~50ms budget tick. 
 
 use core::{
     fmt,

@@ -1,12 +1,10 @@
-//! Entity identity.
+//! Entities are opaque objects tracked by the simulator. All identities
+//! are guaranteed to be unique within a region, where a region is owned 
+//! by a simulator process.
 
 use core::fmt;
 
 /// An entity's identity within a region.
-///
-/// A dense index, not a generational handle. A reused id is indistinguishable
-/// from the original, so a client holding a ghost of the despawned entity will
-/// alias the new one.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct EntityId(u32);

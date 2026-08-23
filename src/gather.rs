@@ -1,7 +1,9 @@
 //! The gather pass and its output.
 //!
-//! The pass itself is [`CellSnapshot::gather_into`]; a gather is a query against
-//! a snapshot, so the snapshot is the receiver.
+//! The pass itself is [`CellSnapshot::gather_into`]. Gathering
+//! is the act of fetching cell and entity candidates from a
+//! portion of the world. There are different gathers for different
+//! purposes.
 
 use crate::entity::EntityId;
 use crate::fixed::DistSq;

@@ -1,13 +1,11 @@
-//! Encoding for entity records.
+//! Encoding and decoding for entity update records.
 //!
 //! A record is an [`EntityId`] followed by a quantized position packed into the
-//! fewest whole bytes the configured precision needs. Record size is fixed for a
-//! given [`WorldConfig`] and depends on `horizontal_bits` and `vertical_bits`,
-//! which are derived from region extent and wire precision.
+//! fewest whole bytes the configured precision needs. The record size
+//! depends on the horizontal and vertical bits derived by a [`WorldConfig`].
 //!
-//! The three quantized axes are packed against each other rather than
-//! byte-aligned individually. At the default region with lossless precision that
-//! is 22, 22, and 20 bits, which is 64 packed against 72 aligned.
+//! Multiple records are included per packet. If available, additional game
+//! data supplied from outside this library is added to the packet after records.
 //!
 //! Records carry no game state. A consumer replicating health or orientation
 //! appends its own bytes; that is not built.
@@ -42,19 +40,19 @@ impl RecordCodec {
         }
     }
 
-    /// Bytes one record occupies. Four for the id plus the packed position.
+    /// The number of bytes a record occupies
     #[inline(always)]
     pub fn record_bytes(&self) -> usize {
         4 + self.pos_bytes
     }
 
-    /// Bytes the packed position occupies, without the id.
+    /// The number of bytes the encoded position occupies
     #[inline(always)]
     pub fn position_bytes(&self) -> usize {
         self.pos_bytes
     }
 
-    /// Appends one record to `out`.
+    /// Appends one record to the output buffer
     #[inline]
     pub fn encode(&self, id: EntityId, pos: Pos3, out: &mut Vec<u8>) {
         out.extend_from_slice(&id.raw().to_le_bytes());
@@ -66,9 +64,7 @@ impl RecordCodec {
 
     /// Reads one record from the front of `buf`.
     ///
-    /// Returns `None` if `buf` is shorter than one record. The decoded position
-    /// is the quantized value, so it differs from the encoded one by up to one
-    /// step of the configured precision unless that precision is lossless.
+    /// Returns `None` if `buf` is shorter than one record. 
     #[inline]
     pub fn decode(&self, buf: &[u8]) -> Option<(EntityId, Pos3)> {
         if buf.len() < self.record_bytes() {

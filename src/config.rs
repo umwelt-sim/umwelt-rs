@@ -1,25 +1,20 @@
 //! Runtime world configuration.
 //!
-//! There are two different configuration types with different use cases:
-//!
-//! - [`WorldConfig`] is **protocol-critical**. Every simulation, edge, and
-//!   client touching a region must hold identical values or they will decode
-//!   each other's packets into garbage. Compare [`WorldConfig::protocol_hash`]
-//!   at connect time and reject on mismatch.
-//!
+//! [`WorldConfig`] is required for any participant exchanging world data
+//! as it contains protocol level configuration. Every simulation, edge, and
+//! client touching a region must hold identical world config or they will decode
+//! each other's packets into garbage. Compare [`WorldConfig::protocol_hash`]
+//! at connect time and reject on mismatch.
 //!
 //! # Units
 //!
 //! Distances are [`Fixed`]; see [`crate::fixed`] for the representation and
 //! why it is an integer rather than `f32`.
 //!
-//! Every derived value is derived using integer arithmetic,
-//! so nothing needs `sqrt` or `ceil`, which are not available in `const fn`.
-//! Additionally, several fields must be powers of two because
-//! dividing by a runtime value is far slower than shifting by one.
-//! [`WorldConfigBuilder::build`] enforces these and other rules so you should
-//! never manually create an instance of [`WorldConfig`] unless you're writing
-//! tests for this module.
+//! In order to maintain optimized memory and wire layouts, some fields in
+//! the configuration must be powers of two. [`WorldConfigBuilder::build`] 
+//! enforces these and other rules so you should never manually create an 
+//! instance of [`WorldConfig`] unless you're writing tests for this module.
 //!
 //! # Axes
 //!
@@ -143,10 +138,6 @@ impl core::error::Error for ConfigError {}
 // ---------------------------------------------------------------------------
 
 /// Shared, protocol-critical world description.
-///
-/// All fields are private and there is no public literal constructor, so
-/// [`WorldConfigBuilder::build`] is the only way in. Derived values are
-/// computed once during validation and then read as fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldConfig {
     // Authored.
@@ -402,16 +393,10 @@ impl WorldConfig {
     // -- misc -------------------------------------------------------------
 
     /// Stable digest of the fields that affect wire decoding. Exchange at
-    /// connect time and reject on mismatch.
-    ///
-    /// Deliberately excludes speed and tick rate, which change how the world
-    /// simulates but not how packets decode, so peers may disagree about them
-    /// without garbling each other.
-    ///
-    /// This is a hash, so a mismatch is certain to be caught but a match is
-    /// only near-certain. If you would rather have certainty and a message
-    /// naming the offending field, send the values themselves — it is a
-    /// handful of integers, once per connection.
+    /// connect time and reject on mismatch. This digest only covers the
+    /// configuration values that are required for protocol setup and
+    /// exchange over the wire. All other configuration values can change
+    /// without invalidating communications.    
     pub const fn protocol_hash(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         h = fnv(h, FIXED_SHIFT);
@@ -518,6 +503,8 @@ impl Default for WorldConfig {
 // Builder
 // ---------------------------------------------------------------------------
 
+/// The validating builder used to create checked instances of world configuration.
+/// Never create world configurations outside the builder except for internal testing.
 #[derive(Debug, Clone, Default)]
 pub struct WorldConfigBuilder {
     region_size: Option<Fixed>,
@@ -557,10 +544,6 @@ impl WorldConfigBuilder {
         self
     }
 
-
-
-
-
     /// Validate and compute all derived values.
     pub fn build(self) -> Result<WorldConfig, ConfigError> {
         use ConfigError::*;
@@ -585,11 +568,7 @@ impl WorldConfigBuilder {
         let region_raw = region_size.raw() as u32;
         let vertical_raw = vertical_extent.raw() as u32;
 
-        // Cell size is derived, not supplied. Half the view radius measured
-        // fastest in the cell-size sweep, and flooring to a power of two keeps
-        // the division-free cell lookup. Both extents are powers of two, so
-        // `region % cell == 0` holds for free, and flooring loses at most a
-        // factor of two from `radius / 2`, which bounds `cell_radius` at 4.
+        // Cell size is derived, not supplied.       
         let cell_raw = 1u32 << ((horizontal_view_radius.raw() as u32 / 2).max(1).ilog2());
         let cell_size = Fixed::from_raw(cell_raw as i32);
 

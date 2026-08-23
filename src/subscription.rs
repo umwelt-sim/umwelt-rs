@@ -4,7 +4,7 @@ use core::fmt;
 
 /// The bounding box describing the region to which a viewer is subscribed.
 /// This is more efficient than storing the list of cells to which a viewer
-/// is susbcribed.
+/// is subscribed.
 ///
 /// A viewer subscribes to every cell within `cell_radius` of the cell they
 /// occupy, clipped to the region. That set is always bounded by a rectangle.
@@ -14,10 +14,6 @@ use core::fmt;
 /// Held per viewer as their current subscription state. Comparing an old
 /// subscription against a new one gives the cells entered and exited by a
 /// move.
-///
-/// Bounds are `i32` so the subtraction in [`subscription_at`] can go negative
-/// before clamping. After construction all four lie within
-/// `0..cells_per_axis`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Subscription {
     pub x0: i32,

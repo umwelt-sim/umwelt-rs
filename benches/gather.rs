@@ -251,61 +251,6 @@ fn bench_empty(c: &mut Criterion) {
         });
 }
 
-/// Same population and same region, different cell size. Holds the working set
-/// constant at 8,192 entities and varies how many of them sit in one contiguous
-/// run.
-fn bench_cell_size(c: &mut Criterion) {
-    let mut group = c.benchmark_group("gather/cell_size");
-    for &m in &[64i32, 128, 256, 512] {
-        let cfg = match WorldConfig::builder()
-            .region_size_m(4096)
-            .vertical_extent_m(1024)
-            .cell_size_m(m)
-            .horizontal_view_radius_m(256)
-            .max_horizontal_speed_m_per_sec(40)
-            .tick_hz(20)
-            .horizontal_precision(Fixed::from_raw(64))
-            .vertical_bits(14)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                println!("cell {m} m: rejected by build(): {e:?}");
-                continue;
-            }
-        };
-
-        let entities = uniform(&cfg, 8_192, 0xA11CE);
-        let snap = snapshot_of(&cfg, &entities);
-        let vs = viewers(&cfg, 1_000, 0xBEEF);
-        let subs = subs_of(&cfg, &vs);
-
-        let cells = mean_cells(&subs);
-        let ex = examined(&cfg, &snap, &subs);
-        let kept = mean_candidates(&snap, &vs, &subs);
-        println!(
-            "cell {m} m: radius {}, {:.2} cells walked, {:.1} per cell, {:.1} examined, {:.1} kept",
-            cfg.cell_radius(),
-            cells,
-            ex / cells,
-            ex,
-            kept
-        );
-
-        let mut out = DiscoveredEntities::with_capacity(16_384);
-        group.throughput(Throughput::Elements(vs.len() as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(m), &m, |b, _| {
-            b.iter(|| {
-                for (v, sb) in vs.iter().zip(&subs) {
-                    out.clear();
-                    snap.gather_into(black_box(*v), black_box(*sb), &mut out);
-                    black_box(out.len());
-                }
-            })
-        });
-    }
-    group.finish();
-}
 
 fn bench_hot_cell(c: &mut Criterion) {
     let cfg = WorldConfig::default();
@@ -519,13 +464,51 @@ fn bench_capped_town_square(c: &mut Criterion) {
     group.finish();
 }
 
+/// Same population and same region, different cell size, using the
+/// `with_cell_size_m` escape hatch. Holds the working set constant at 8,192
+/// entities and varies how many sit in one contiguous run.
+fn bench_cell_size(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gather/cell_size");
+    for &m in &[64i32, 128, 256, 512] {
+        let cfg = WorldConfig::default().with_cell_size_m(m);
+        let entities = uniform(&cfg, 8_192, 0xA11CE);
+        let snap = snapshot_of(&cfg, &entities);
+        let vs = viewers(&cfg, 1_000, 0xBEEF);
+        let subs = subs_of(&cfg, &vs);
+
+        let cells = mean_cells(&subs);
+        let ex = examined(&cfg, &snap, &subs);
+        println!(
+            "cell {m} m: radius {}, {:.2} cells walked, {:.1} per cell, {:.1} examined, {:.1} kept",
+            cfg.cell_radius(),
+            cells,
+            ex / cells,
+            ex,
+            mean_candidates(&snap, &vs, &subs)
+        );
+
+        let mut out = DiscoveredEntities::with_capacity(16_384);
+        group.throughput(Throughput::Elements(vs.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(m), &m, |b, _| {
+            b.iter(|| {
+                for (v, sb) in vs.iter().zip(&subs) {
+                    out.clear();
+                    snap.gather_into(black_box(*v), black_box(*sb), &mut out);
+                    black_box(out.len());
+                }
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_cell_size,
     bench_capped_town_square,
     bench_subdivision,
     bench_uniform,
     bench_empty,
-    bench_cell_size,
     bench_hot_cell,
     bench_spawn_overhead,
     bench_parallel_uniform,

@@ -103,8 +103,7 @@ hooks into their game.
 **The consumer builds two binaries.** A simulation server that creates and
 configures a `WorldSimulation`, and an edge server that creates and configures a
 `SimulatorEdge`. Both link this crate. Beyond that the consumer writes a
-`WorldConfig`, a `ViewConfig`, their game logic as hooks, and two `main`
-functions.
+`WorldConfig`, their game logic as hooks, and two `main` functions.
 
 **umwelt owns:** the tick loop and the clock, entity position storage, entity id
 allocation and lifetime (via `LiveSet`), the cell-ordered snapshot, subscription, gather,
@@ -404,81 +403,98 @@ must agree or positions decode into plausible garbage. Guarded by
 unlike `DefaultHasher`, and dependency-free). Deliberately excludes speed and
 tick rate, which affect simulation but not decoding.
 
-**`ViewConfig`** is per-client policy. Budget, hysteresis, dwell, send rate. May
-differ per client.
+**Everything else is derived.** The builder takes five values, all of which a
+game developer knows:
 
-### Where the records-per-packet figure comes from
+```rust
+WorldConfig::builder()
+    .region_size_m(4096)
+    .vertical_extent_m(1024)
+    .horizontal_view_radius_m(256)
+    .max_horizontal_speed_m_per_sec(40)
+    .tick_hz(20)
+    .build()?
+```
 
-The event reserve is a **floor for events, not a subtraction from every packet**.
-A client with nothing pending gives the whole reserve back to state; one with
-less pending than the reserve gives back the difference. So there are two
-figures:
+Cell size is `1 << (view_radius_raw / 2).ilog2()`, the largest power of two at
+or below half the view radius, which the cell-size sweep measured as the fastest
+range. Both extents are already required to be powers of two, so
+`region % cell == 0` holds for free, and flooring loses at most a factor of two
+from `radius / 2`, which bounds `cell_radius` at 4. Neither needs checking.
+
+Wire precision is lossless, so `horizontal_bits` is `log2(region_raw)`,
+`vertical_bits` is `log2(vertical_raw)`, and both quantization shifts are zero.
+A single global precision has to serve the nearest entity, and at arm's length
+sub-pixel error is sub-millimetre, so there is nothing to trade away. The cost
+is bounded: a record is 12 bytes at the default region and 16 at the largest one
+`Fixed` can express.
+
+`WorldConfig::with_cell_size_m` overrides the derived cell size and recomputes
+the grid. It exists so the cell-size sweep can be re-run and panics rather than
+returning an error, since it is a benchmarking tool and not a consumer path.
+
+**There is no `ViewConfig`.** An earlier revision had one holding payload size,
+header size, event reserve, send rate, dwell, and hysteresis. Nothing used it,
+and only send rate had a plausible consumer story. Payload size is MTU
+discovery, header size is our protocol, and dwell and hysteresis are subscription
+tuning a consumer has no basis to pick. Per-connection policy belongs to
+`SimulatorEdge`, constructed from what a client declares at connect plus what the
+connection is measurably doing, which is the model TRIBES used.
+
+`ConfigError` went from 15 variants to 6 as a result. Nine became impossible
+rather than merely unchecked.
+
+### Records per packet
+
+The record is **12 bytes**, measured rather than assumed: 4 for an `EntityId`
+and 8 for a position packed at 22, 22, and 20 bits. `RecordCodec::record_bytes`
+computes it from config.
+
+The packet figures below use constants that no longer live anywhere, since they
+were on `ViewConfig`. They belong to packet assembly, which is not built. They
+are kept here as the arithmetic, not as an API reference.
+
+The event reserve is a floor for events, not a subtraction from every packet, so
+there are two figures:
 
 ```
 max_state_bytes = payload_bytes - header_bytes
                 = 1200 - 16 = 1184
-idle records    = 1184 / 16 = 74
+idle records    = 1184 / 12 = 98
 
 min_state_bytes = payload_bytes - (header_bytes + event_reserve_bytes)
                 = 1200 - (16 + 256) = 928
-records under a full backlog = 928 / 16 = 58
+records under a full backlog = 928 / 12 = 77
 ```
 
 `state_bytes_available(pending_event_bytes)` gives the figure between them.
-Making the reserve a floor is worth 28% more records in the common case, since
-256 of 1200 bytes were previously unavailable to state whether or not any event
-existed.
 
-Uses of 58 elsewhere in this document are the conservative figure, taken under a
-backlog that consumes the entire reserve.
+**A uniform viewer gathers 95 candidates and 98 fit in a packet, so it is not
+oversubscribed in the calm case.** Earlier revisions of this document, and three
+published posts, said it was. That rested on an assumed 16-byte record. The
+budget binds under crowding and not otherwise.
 
-Four inputs, one verified and three assumed.
+Of the remaining inputs, `payload_bytes` at 1200 is well founded: Ethernet MTU is
+1500, an IPv6 header takes 40 and UDP 8, leaving 1452, and 1200 survives tunnels,
+VPNs, and PPPoE without fragmenting, which is what QUIC mandates as its minimum
+datagram size.
 
-`payload_bytes` at 1200 is well founded. Ethernet MTU is 1500, an IPv6 header
-takes 40 and UDP 8, leaving 1452. 1200 survives tunnels, VPNs, and PPPoE without
-fragmenting, and is what QUIC mandates as its minimum datagram size.
+`header_bytes` at 16 is still a guess. No packet format is designed. It would
+hold a sequence number, an ack or ack bitfield, a tick identifier, and flags.
 
-`header_bytes` at 16 is a guess. No packet format is designed. It would hold a
-sequence number, an ack or ack bitfield, a tick identifier, and flags.
+`event_reserve_bytes` at 256 is still a guess. Without a reserve a dense crowd's
+position updates fill every packet and a client can stand in a mob without
+learning it died. The number itself is arbitrary.
 
-`event_reserve_bytes` at 256 is a guess. The reasoning holds, since without a
-reserve a dense crowd's position updates fill every packet and a client can stand
-in a mob without learning it died. The number itself is arbitrary.
+Record size varies with region and precision, since bits per axis is
+`log2(extent / precision)`. A 16 km region costs 13 bytes. Coarsening precision
+to 1/16 m costs 10, saving 2 bytes at the price of quantized motion below
+`precision * tick_hz`, which is 1.25 m/s at 20 Hz.
 
-`record_bytes` at 16 is the weakest and the most load bearing. It is not a stored
-field, only an argument to `est_records_per_packet`, which is deliberate so
-benchmarks can sweep it. From the configured wire precision a quantized position
-is 16 bits per horizontal axis and 14 vertical, so 46 bits or about 6 bytes. A
-per-connection ghost id for a viewer seeing a few thousand entities needs about
-12 bits. A bare position update is therefore nearer 8 bytes. The 16 assumes
-roughly double, presumably for velocity, orientation, or a state mask, none of
-which are specified.
-
-At 8 bytes per record the figure is 116, and at 24 it is 38. Every use of 58 in
-this document inherits that spread, including the examine-to-send ratios for the
-crowded case and the proposed walk cap. It will not be settled until something is
-serialized.
-
-Builder-only construction; private fields, no public literal constructor.
-`Default` must remain a `build()` call. **Do not derive `Deserialize` on
-`WorldConfig`**, because a derived impl constructs field by field and skips validation.
-Deserialize into the builder.
-
-Precision is the preferred input; bits is the escape hatch. Supplying both is an
-error.
-
-Boundary rule: quantization coarser than a cell is rejected with `>`, not `>=`.
-Both grids are powers of two anchored at zero, so buckets align to cells. A
-bucket of exactly one cell resolves to the correct cell; only a larger bucket
-spans a boundary.
-
-### Default config, verified derivations
-
-| value | result |
-|---|---|
+---|---|
 | region | 4096 m |
 | vertical extent | 1024 m |
-| cell size | 128 m |
+| cell size | 128 m (derived from view radius) |
 | horizontal view radius | 256 m |
 | max horizontal speed | 40 m/s |
 | tick rate | 20 Hz |
@@ -489,10 +505,14 @@ spans a boundary.
 | subscription grid | 5x5, 25 cells |
 | tick duration | 50 ms |
 | max move per tick | 2 m |
-| horizontal bits | 16 |
-| horizontal precision | 1/16 m |
-| vertical bits | 14 |
-| wire steps per cell | 2048 |
+| horizontal bits | 22 (derived) |
+| horizontal precision | 1/1024 m, lossless (fixed) |
+| vertical bits | 20 (derived) |
+| wire steps per cell | 131,072 |
+| record bytes | 12 |
+
+Only region size, vertical extent, view radius, max speed, and tick rate are
+authored. Everything else in this table derives from those five.
 
 ---
 
@@ -1225,7 +1245,7 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 - Per-client state (subscription, accumulator scores, send cadence) belongs to
   `WorldSimulation`. Client registration is the API that does not exist yet:
   something has to say a connection exists, name its avatar entity, and attach a
-  `ViewConfig`. Deferred deliberately; it belongs with the accumulator, since
+  the edge. Deferred deliberately; it belongs with the accumulator, since
   that is what gives per-client state its shape. Event delivery is blocked on the
   same API.
 - `Mul`/`Div` rounding disagree for negative values.

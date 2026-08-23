@@ -7,9 +7,6 @@
 //!   each other's packets into garbage. Compare [`WorldConfig::protocol_hash`]
 //!   at connect time and reject on mismatch.
 //!
-//! - [`ViewConfig`] is **local policy**. It can differ per node and per
-//!   client. A phone on cellular data gets a smaller budget than a desktop on
-//!   fiber. No two view configs ever need to agree with each other.
 //!
 //! # Units
 //!
@@ -51,11 +48,14 @@ pub const MAX_SUB_GRID_CELLS: usize = {
     axis * axis
 };
 
-/// Default worst-case wire error bar per axis: 64 raw units, or 1/16 m.
+/// Default wire precision: one raw unit, or 1/1024 m, which is lossless.
 ///
-/// A starting point, not a derivation. Whether it is acceptable depends on
-/// the client's rendering and interpolation, which this crate cannot see.
-pub const DEFAULT_PRECISION: Fixed = Fixed::from_raw(64);
+/// Lossless by default so nothing is discarded unless a consumer asks for it.
+/// Coarser precision saves bytes but quantizes motion: an entity moving less
+/// than one step per tick appears to stand still and then jump. That threshold
+/// is `precision * tick_hz`, which at 1/16 m and 20 Hz is 1.25 m/s, inside the
+/// range of a walking character.
+pub const DEFAULT_PRECISION: Fixed = Fixed::from_raw(1);
 
 // ---------------------------------------------------------------------------
 // Axis
@@ -86,21 +86,10 @@ pub enum ConfigError {
     /// A distance was zero or negative. [`Fixed`] is signed, so this has to be
     /// checked before any unsigned bit operation.
     NonPositive(&'static str),
-    /// Cell size must be a power of two so `pos >> cell_shift` replaces a
-    /// division. With a runtime cell size the compiler cannot do this for us.
-    CellSizeNotPowerOfTwo { cell_size: Fixed },
     /// Extent must be a power of two so wire quantisation divides evenly.
     ExtentNotPowerOfTwo { axis: Axis, extent: Fixed },
-    /// A region must contain a whole number of cells.
-    RegionNotWholeCells {
-        region_size: Fixed,
-        cell_size: Fixed,
-    },
     /// View radius larger than the region makes subscription meaningless.
     RadiusExceedsRegion { radius: Fixed, region_size: Fixed },
-    /// Subscription radius beyond [`MAX_CELL_RADIUS`]. Usually means the cell
-    /// size is far too small relative to the view radius.
-    CellRadiusTooLarge { cell_radius: u32, max: u32 },
     /// An entity able to cross more than one cell boundary per axis per tick
     /// breaks the strip-delta subscription update, which assumes at most one
     /// row and one column change per move. Horizontal movement only; vertical
@@ -111,29 +100,6 @@ pub enum ConfigError {
     },
     /// Tick rate must divide evenly into a second so tick duration is exact.
     TickRateIndivisible { tick_hz: u32 },
-    /// Wire bits must be positive and no wider than the axis extent.
-    BadPositionBits { axis: Axis, bits: u32, width: u32 },
-    /// Bits and precision were both supplied for the same axis. They specify
-    /// the same thing from opposite directions; give one.
-    ConflictingPositionSpec { axis: Axis },
-    /// Requested precision was zero or negative. There is no such bit count.
-    BadPrecision { axis: Axis, precision: Fixed },
-    /// Requested precision is coarser than the axis extent, leaving no bits.
-    PrecisionExceedsExtent {
-        axis: Axis,
-        precision: Fixed,
-        extent: Fixed,
-    },
-    /// Wire quantisation is coarser than a cell, so a decoded position can
-    /// land in a different cell than the true one. Any client doing spatial
-    /// reasoning on received positions would disagree with the server.
-    QuantErrorExceedsCell { precision: Fixed, cell_size: Fixed },
-    /// Header and event reserve have consumed the whole packet.
-    BudgetExhausted {
-        payload: u32,
-        header: u32,
-        reserve: u32,
-    },
     /// A required field was never set on the builder.
     Missing(&'static str),
 }
@@ -144,34 +110,14 @@ impl fmt::Display for ConfigError {
         match self {
             NonPositive(field) => {
                 write!(f, "`{field}` must be greater than zero")
-            }
-            CellSizeNotPowerOfTwo { cell_size } => write!(
-                f,
-                "cell size {cell_size} is not a power of two; \
-                 cell lookup would need a runtime division"
-            ),
-            ExtentNotPowerOfTwo { axis, extent } => write!(
+            }            ExtentNotPowerOfTwo { axis, extent } => write!(
                 f,
                 "{axis} extent {extent} is not a power of two; \
                  wire quantisation would not divide evenly"
-            ),
-            RegionNotWholeCells {
-                region_size,
-                cell_size,
-            } => write!(
-                f,
-                "region size {region_size} is not a whole multiple of cell size {cell_size}"
-            ),
-            RadiusExceedsRegion {
+            ),            RadiusExceedsRegion {
                 radius,
                 region_size,
-            } => write!(f, "view radius {radius} exceeds region size {region_size}"),
-            CellRadiusTooLarge { cell_radius, max } => write!(
-                f,
-                "subscription radius of {cell_radius} cells exceeds the maximum of {max}; \
-                 cell size is probably too small for the view radius"
-            ),
-            SpeedExceedsCellPerTick {
+            } => write!(f, "view radius {radius} exceeds region size {region_size}"),            SpeedExceedsCellPerTick {
                 move_per_tick,
                 cell_size,
             } => write!(
@@ -185,41 +131,6 @@ impl fmt::Display for ConfigError {
                     "tick rate {tick_hz} Hz does not divide evenly into 1000 ms"
                 )
             }
-            BadPositionBits { axis, bits, width } => {
-                write!(f, "{axis} wire bits {bits} must be in 1..={width}")
-            }
-            ConflictingPositionSpec { axis } => write!(
-                f,
-                "both bits and precision were set for the {axis} axis; supply one"
-            ),
-            BadPrecision { axis, precision } => {
-                write!(f, "{axis} precision {precision} must be greater than zero")
-            }
-            PrecisionExceedsExtent {
-                axis,
-                precision,
-                extent,
-            } => write!(
-                f,
-                "{axis} precision {precision} is coarser than the extent {extent}"
-            ),
-            QuantErrorExceedsCell {
-                precision,
-                cell_size,
-            } => write!(
-                f,
-                "wire precision {precision} is coarser than cell size {cell_size}; \
-                 a decoded position could land in the wrong cell"
-            ),
-            BudgetExhausted {
-                payload,
-                header,
-                reserve,
-            } => write!(
-                f,
-                "payload {payload} leaves nothing for state after header {header} \
-                 and event reserve {reserve}"
-            ),
             Missing(field) => write!(f, "required field `{field}` was not set"),
         }
     }
@@ -513,6 +424,55 @@ impl WorldConfig {
         h
     }
 
+    /// A copy with `cell_size` overridden, for benchmarking the spatial index
+    /// at sizes the derivation would not pick.
+    ///
+    /// Not part of the normal path. Cell size derives from the view radius and
+    /// a consumer has no reason to set it; this exists so the cell-size sweep
+    /// can be re-run.
+    ///
+    /// # Panics
+    ///
+    /// If the size is not positive, not a power of two in raw units, does not
+    /// divide the region evenly, produces a cell radius above
+    /// [`MAX_CELL_RADIUS`], or is small enough that an entity at
+    /// `max_horizontal_speed` crosses more than one boundary per tick.
+    pub fn with_cell_size_m(&self, m: i32) -> WorldConfig {
+        let cell_size = Fixed::from_meters(m);
+        let cell_raw = cell_size.raw() as u32;
+        let region_raw = self.region_size.raw() as u32;
+
+        assert!(cell_size.raw() > 0, "cell size must be positive");
+        assert!(cell_raw.is_power_of_two(), "cell size {cell_size} is not a power of two");
+        assert!(
+            region_raw % cell_raw == 0,
+            "cell size {cell_size} does not divide region {}",
+            self.region_size
+        );
+        let cell_radius = (self.horizontal_view_radius.raw() as u32).div_ceil(cell_raw);
+        assert!(
+            cell_radius <= MAX_CELL_RADIUS,
+            "cell size {cell_size} gives cell radius {cell_radius}, above {MAX_CELL_RADIUS}"
+        );
+        assert!(
+            (self.max_move_per_tick.raw() as u32) < cell_raw,
+            "an entity moving {} per tick crosses a {cell_size} cell",
+            self.max_move_per_tick
+        );
+
+        WorldConfig {
+            cell_size,
+            cell_shift: cell_raw.trailing_zeros(),
+            cell_mask: (cell_raw - 1) as i32,
+            cells_per_axis: region_raw / cell_raw,
+            cells_per_region: (region_raw / cell_raw) * (region_raw / cell_raw),
+            cell_radius,
+            sub_grid_axis: 2 * cell_radius + 1,
+            sub_grid_cells: (2 * cell_radius + 1) * (2 * cell_radius + 1),
+            ..*self
+        }
+    }
+
     /// Uniform-distribution estimate of entities in one viewer's subscription.
     /// A planning aid, not a runtime quantity — real worlds cluster, so treat
     /// this as a floor and expect hot cells to be far worse.
@@ -537,8 +497,8 @@ const fn fnv(mut h: u64, v: u32) -> u64 {
 }
 
 impl Default for WorldConfig {
-    /// 4096 m region, 1024 m vertical, 128 m cells, 256 m view radius,
-    /// 40 m/s cap, 20 Hz, 1/16 m wire precision.
+    /// 4096 m region, 1024 m vertical, 256 m view radius, 40 m/s cap, 20 Hz.
+    /// Cell size derives to 128 m and wire precision is lossless.
     ///
     /// Must stay a `build()` call. Replacing this with a struct literal would
     /// skip validation and defeat the private fields.
@@ -546,7 +506,6 @@ impl Default for WorldConfig {
         Self::builder()
             .region_size_m(4096)
             .vertical_extent_m(1024)
-            .cell_size_m(128)
             .horizontal_view_radius_m(256)
             .max_horizontal_speed_m_per_sec(40)
             .tick_hz(20)
@@ -563,14 +522,9 @@ impl Default for WorldConfig {
 pub struct WorldConfigBuilder {
     region_size: Option<Fixed>,
     vertical_extent: Option<Fixed>,
-    cell_size: Option<Fixed>,
     horizontal_view_radius: Option<Fixed>,
     max_horizontal_speed: Option<Fixed>,
     tick_hz: Option<u32>,
-    horizontal_bits: Option<u32>,
-    horizontal_precision: Option<Fixed>,
-    vertical_bits: Option<u32>,
-    vertical_precision: Option<Fixed>,
 }
 
 impl WorldConfigBuilder {
@@ -587,13 +541,6 @@ impl WorldConfigBuilder {
         self
     }
 
-    /// Cell edge length in whole metres. Half the view radius is the usual
-    /// choice: it gives a 5x5 subscription grid covering roughly twice the
-    /// ideal circle, against 2.9x for a 3x3.
-    pub fn cell_size_m(mut self, m: i32) -> Self {
-        self.cell_size = Some(Fixed::from_meters(m));
-        self
-    }
 
     pub fn horizontal_view_radius_m(mut self, m: i32) -> Self {
         self.horizontal_view_radius = Some(Fixed::from_meters(m));
@@ -610,45 +557,9 @@ impl WorldConfigBuilder {
         self
     }
 
-    /// Bits per horizontal axis on the wire. Mutually exclusive with
-    /// [`horizontal_precision`].
-    ///
-    /// [`horizontal_precision`]: Self::horizontal_precision
-    pub fn horizontal_bits(mut self, bits: u32) -> Self {
-        self.horizontal_bits = Some(bits);
-        self
-    }
 
-    /// Worst-case horizontal wire error to tolerate.
-    ///
-    /// Usually preferable to [`horizontal_bits`]: you know what error is
-    /// acceptable, not how many bits buys it. It also keeps precision
-    /// independent of region size, so enlarging the world raises the bit count
-    /// rather than silently doubling the error.
-    ///
-    /// Rounded so the achieved precision is at least as fine as requested.
-    ///
-    /// [`horizontal_bits`]: Self::horizontal_bits
-    pub fn horizontal_precision(mut self, p: Fixed) -> Self {
-        self.horizontal_precision = Some(p);
-        self
-    }
 
-    /// Bits for the vertical axis. Mutually exclusive with
-    /// [`vertical_precision`].
-    ///
-    /// [`vertical_precision`]: Self::vertical_precision
-    pub fn vertical_bits(mut self, bits: u32) -> Self {
-        self.vertical_bits = Some(bits);
-        self
-    }
 
-    /// Worst-case vertical wire error to tolerate. Defaults to whatever the
-    /// horizontal axis resolved to.
-    pub fn vertical_precision(mut self, p: Fixed) -> Self {
-        self.vertical_precision = Some(p);
-        self
-    }
 
     /// Validate and compute all derived values.
     pub fn build(self) -> Result<WorldConfig, ConfigError> {
@@ -656,7 +567,6 @@ impl WorldConfigBuilder {
 
         let region_size = self.region_size.ok_or(Missing("region_size"))?;
         let vertical_extent = self.vertical_extent.ok_or(Missing("vertical_extent"))?;
-        let cell_size = self.cell_size.ok_or(Missing("cell_size"))?;
         let horizontal_view_radius = self
             .horizontal_view_radius
             .ok_or(Missing("horizontal_view_radius"))?;
@@ -669,17 +579,20 @@ impl WorldConfigBuilder {
         // unsigned bit operation below.
         positive(region_size, "region_size")?;
         positive(vertical_extent, "vertical_extent")?;
-        positive(cell_size, "cell_size")?;
         positive(horizontal_view_radius, "horizontal_view_radius")?;
         positive(max_horizontal_speed, "max_horizontal_speed")?;
 
         let region_raw = region_size.raw() as u32;
         let vertical_raw = vertical_extent.raw() as u32;
-        let cell_raw = cell_size.raw() as u32;
 
-        if !cell_raw.is_power_of_two() {
-            return Err(CellSizeNotPowerOfTwo { cell_size });
-        }
+        // Cell size is derived, not supplied. Half the view radius measured
+        // fastest in the cell-size sweep, and flooring to a power of two keeps
+        // the division-free cell lookup. Both extents are powers of two, so
+        // `region % cell == 0` holds for free, and flooring loses at most a
+        // factor of two from `radius / 2`, which bounds `cell_radius` at 4.
+        let cell_raw = 1u32 << ((horizontal_view_radius.raw() as u32 / 2).max(1).ilog2());
+        let cell_size = Fixed::from_raw(cell_raw as i32);
+
         if !region_raw.is_power_of_two() {
             return Err(ExtentNotPowerOfTwo {
                 axis: Axis::Horizontal,
@@ -690,12 +603,6 @@ impl WorldConfigBuilder {
             return Err(ExtentNotPowerOfTwo {
                 axis: Axis::Vertical,
                 extent: vertical_extent,
-            });
-        }
-        if region_raw % cell_raw != 0 {
-            return Err(RegionNotWholeCells {
-                region_size,
-                cell_size,
             });
         }
         if horizontal_view_radius.raw() > region_size.raw() {
@@ -709,12 +616,7 @@ impl WorldConfigBuilder {
         }
 
         let cell_radius = (horizontal_view_radius.raw() as u32).div_ceil(cell_raw);
-        if cell_radius > MAX_CELL_RADIUS {
-            return Err(CellRadiusTooLarge {
-                cell_radius,
-                max: MAX_CELL_RADIUS,
-            });
-        }
+        debug_assert!(cell_radius <= MAX_CELL_RADIUS, "derived cell size broke the radius bound");
 
         let max_move_per_tick = Fixed::from_raw(max_horizontal_speed.raw() / tick_hz as i32);
         if max_move_per_tick.raw() as u32 >= cell_raw {
@@ -724,42 +626,16 @@ impl WorldConfigBuilder {
             });
         }
 
-        // Wire widths. Precision is the preferred input; bits is the escape
-        // hatch for callers who need an exact field width.
-        let horizontal_width = region_raw.trailing_zeros();
-        let horizontal_bits = resolve_bits(
-            Axis::Horizontal,
-            self.horizontal_bits,
-            self.horizontal_precision,
-            DEFAULT_PRECISION,
-            region_size,
-            horizontal_width,
-        )?;
-
-        let horizontal_quant_shift = horizontal_width - horizontal_bits;
-        let horizontal_precision = Fixed::from_raw(1 << horizontal_quant_shift);
-
-        if horizontal_precision.raw() as u32 > cell_raw {
-            return Err(QuantErrorExceedsCell {
-                precision: horizontal_precision,
-                cell_size,
-            });
-        }
-
-        // Vertical defaults to whatever the horizontal axis resolved to, so a
-        // caller who tunes one gets a consistent other.
-        let vertical_width = vertical_raw.trailing_zeros();
-        let vertical_bits = resolve_bits(
-            Axis::Vertical,
-            self.vertical_bits,
-            self.vertical_precision,
-            horizontal_precision,
-            vertical_extent,
-            vertical_width,
-        )?;
-
-        let vertical_quant_shift = vertical_width - vertical_bits;
-        let vertical_precision = Fixed::from_raw(1 << vertical_quant_shift);
+        // Wire widths. Precision is lossless, so a position keeps every bit the
+        // simulation computed with and the quantization shift is zero. A single
+        // global precision has to serve the nearest entity, and at arm's length
+        // sub-pixel error is sub-millimetre, so there is nothing to trade away.
+        let horizontal_bits = region_raw.trailing_zeros();
+        let horizontal_quant_shift = 0;
+        let horizontal_precision = Fixed::from_raw(1);
+        let vertical_bits = vertical_raw.trailing_zeros();
+        let vertical_quant_shift = 0;
+        let vertical_precision = Fixed::from_raw(1);
 
         let cells_per_axis = region_raw / cell_raw;
         let sub_grid_axis = 2 * cell_radius + 1;
@@ -799,256 +675,7 @@ fn positive(v: Fixed, name: &'static str) -> Result<(), ConfigError> {
     }
 }
 
-/// Resolve one axis's wire width from whichever of bits or precision was given.
-fn resolve_bits(
-    axis: Axis,
-    bits: Option<u32>,
-    precision: Option<Fixed>,
-    default_precision: Fixed,
-    extent: Fixed,
-    width: u32,
-) -> Result<u32, ConfigError> {
-    let resolved = match (bits, precision) {
-        (Some(_), Some(_)) => return Err(ConfigError::ConflictingPositionSpec { axis }),
-        (Some(b), None) => b,
-        (None, Some(p)) => bits_for_precision(axis, p, extent, width)?,
-        (None, None) => bits_for_precision(axis, default_precision, extent, width)?,
-    };
 
-    if resolved == 0 || resolved > width {
-        return Err(ConfigError::BadPositionBits {
-            axis,
-            bits: resolved,
-            width,
-        });
-    }
-    Ok(resolved)
-}
-
-/// Fewest bits keeping worst-case error at or below `precision`.
-///
-/// Error is `1 << quant_shift`, so the largest usable shift is
-/// `floor(log2(precision))`.
-fn bits_for_precision(
-    axis: Axis,
-    precision: Fixed,
-    extent: Fixed,
-    width: u32,
-) -> Result<u32, ConfigError> {
-    if precision.raw() <= 0 {
-        return Err(ConfigError::BadPrecision { axis, precision });
-    }
-    let shift = (precision.raw() as u32).ilog2();
-    if shift >= width {
-        return Err(ConfigError::PrecisionExceedsExtent {
-            axis,
-            precision,
-            extent,
-        });
-    }
-    Ok(width - shift)
-}
-
-// ---------------------------------------------------------------------------
-// ViewConfig
-// ---------------------------------------------------------------------------
-
-/// Per-viewer policy. Not protocol-critical: two clients may hold different
-/// values without either misbehaving, so this can be negotiated per session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ViewConfig {
-    payload_bytes: u32,
-    header_bytes: u32,
-    event_reserve_bytes: u32,
-    send_hz: u32,
-    dwell_ticks: u32,
-    hysteresis: Fixed,
-
-    min_state_bytes: u32,
-    downstream_bytes_per_sec: u32,
-}
-
-impl ViewConfig {
-    pub fn builder() -> ViewConfigBuilder {
-        ViewConfigBuilder::default()
-    }
-
-    /// Bytes available for state records when no events are pending.
-    ///
-    /// A byte budget, not a record count: entity payloads are opaque to this
-    /// crate, so packing is a greedy fill rather than a division.
-    pub const fn max_state_bytes(&self) -> u32 {
-        self.payload_bytes - self.header_bytes
-    }
-
-    /// Bytes guaranteed to state even when events are backlogged past the
-    /// reserve.
-    pub const fn min_state_bytes(&self) -> u32 {
-        self.min_state_bytes
-    }
-
-    /// Bytes available for state records given the bytes of events waiting.
-    ///
-    /// The reserve is a floor for events, not a subtraction taken from every
-    /// packet. A client with nothing pending gives the whole reserve back to
-    /// state; a client with less pending than the reserve gives back the
-    /// difference.
-    pub const fn state_bytes_available(&self, pending_event_bytes: u32) -> u32 {
-        let taken = if pending_event_bytes < self.event_reserve_bytes {
-            pending_event_bytes
-        } else {
-            self.event_reserve_bytes
-        };
-        self.payload_bytes - self.header_bytes - taken
-    }
-    /// A floor for events, not a subtraction from every packet. It bounds how
-    /// much of a packet a dense crowd's position updates can take when events
-    /// are waiting; with none waiting, state uses it. Without a reserve,
-    /// standing in a mob means never learning that you died.
-    pub const fn event_reserve_bytes(&self) -> u32 {
-        self.event_reserve_bytes
-    }
-    pub const fn payload_bytes(&self) -> u32 {
-        self.payload_bytes
-    }
-    pub const fn header_bytes(&self) -> u32 {
-        self.header_bytes
-    }
-    /// Packets per second to this viewer. May be below the world tick rate; a
-    /// slow client skips intermediate states, which is correct for position
-    /// data.
-    pub const fn send_hz(&self) -> u32 {
-        self.send_hz
-    }
-    /// Ticks a cell must stay out of range before its subscription drops. Exit
-    /// is the expensive direction, so err toward holding on.
-    pub const fn dwell_ticks(&self) -> u32 {
-        self.dwell_ticks
-    }
-    /// Deadband around a cell boundary. Stops a viewer loitering on a boundary
-    /// from thrashing subscriptions.
-    pub const fn hysteresis(&self) -> Fixed {
-        self.hysteresis
-    }
-    pub const fn downstream_bytes_per_sec(&self) -> u32 {
-        self.downstream_bytes_per_sec
-    }
-    pub const fn downstream_bits_per_sec(&self) -> u32 {
-        self.downstream_bytes_per_sec * 8
-    }
-
-    /// Entities per packet if every record were `record_bytes` wide, with no
-    /// events pending. Planning aid only; real packing is greedy over
-    /// variable-size records.
-    ///
-    /// Under a backlog that consumes the whole reserve this falls to
-    /// `min_state_bytes / record_bytes`.
-    ///
-    /// `record_bytes` is a parameter rather than a stored field so benchmarks
-    /// can sweep it. No wire format exists yet. The 16 used throughout the
-    /// design notes is an assumption: at the default wire precision a quantized
-    /// position is 46 bits, and a per-connection ghost id adds roughly 12, so a
-    /// bare position update is nearer 8 bytes.
-    pub const fn est_records_per_packet(&self, record_bytes: u32) -> u32 {
-        if record_bytes == 0 {
-            return 0;
-        }
-        self.max_state_bytes() / record_bytes
-    }
-
-    /// Starting point for a given world: one MTU-safe packet per tick,
-    /// hysteresis at a sixteenth of a cell, two seconds of dwell.
-    ///
-    /// Must stay a `build()` call.
-    pub fn default_for(world: &WorldConfig) -> Self {
-        Self::builder()
-            .payload_bytes(1_200)
-            .header_bytes(16)
-            .event_reserve_bytes(256)
-            .send_hz(world.tick_hz())
-            .dwell_ticks(world.tick_hz() * 2)
-            .hysteresis(world.cell_size() / 16)
-            .build()
-            .expect("default view config is valid")
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ViewConfigBuilder {
-    payload_bytes: Option<u32>,
-    header_bytes: Option<u32>,
-    event_reserve_bytes: Option<u32>,
-    send_hz: Option<u32>,
-    dwell_ticks: Option<u32>,
-    hysteresis: Option<Fixed>,
-}
-
-impl ViewConfigBuilder {
-    /// Largest UDP payload to emit. 1200 is a conservative choice for a 1500
-    /// MTU after IPv6, UDP, transport framing, and tunnel headroom.
-    pub fn payload_bytes(mut self, b: u32) -> Self {
-        self.payload_bytes = Some(b);
-        self
-    }
-    pub fn header_bytes(mut self, b: u32) -> Self {
-        self.header_bytes = Some(b);
-        self
-    }
-    pub fn event_reserve_bytes(mut self, b: u32) -> Self {
-        self.event_reserve_bytes = Some(b);
-        self
-    }
-    pub fn send_hz(mut self, hz: u32) -> Self {
-        self.send_hz = Some(hz);
-        self
-    }
-    pub fn dwell_ticks(mut self, t: u32) -> Self {
-        self.dwell_ticks = Some(t);
-        self
-    }
-    pub fn hysteresis(mut self, h: Fixed) -> Self {
-        self.hysteresis = Some(h);
-        self
-    }
-
-    pub fn build(self) -> Result<ViewConfig, ConfigError> {
-        use ConfigError::*;
-
-        let payload_bytes = self.payload_bytes.ok_or(Missing("payload_bytes"))?;
-        let header_bytes = self.header_bytes.unwrap_or(16);
-        let event_reserve_bytes = self.event_reserve_bytes.unwrap_or(0);
-        let send_hz = self.send_hz.ok_or(Missing("send_hz"))?;
-        let dwell_ticks = self.dwell_ticks.unwrap_or(0);
-        let hysteresis = self.hysteresis.unwrap_or(Fixed::ZERO);
-
-        if hysteresis.raw() < 0 {
-            return Err(NonPositive("hysteresis"));
-        }
-        if send_hz == 0 {
-            return Err(NonPositive("send_hz"));
-        }
-
-        let overhead = header_bytes.saturating_add(event_reserve_bytes);
-        if overhead >= payload_bytes {
-            return Err(BudgetExhausted {
-                payload: payload_bytes,
-                header: header_bytes,
-                reserve: event_reserve_bytes,
-            });
-        }
-
-        Ok(ViewConfig {
-            payload_bytes,
-            header_bytes,
-            event_reserve_bytes,
-            send_hz,
-            dwell_ticks,
-            hysteresis,
-            min_state_bytes: payload_bytes - overhead,
-            downstream_bytes_per_sec: payload_bytes * send_hz,
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1062,7 +689,6 @@ mod tests {
         WorldConfig::builder()
             .region_size_m(4096)
             .vertical_extent_m(1024)
-            .cell_size_m(128)
             .horizontal_view_radius_m(256)
             .max_horizontal_speed_m_per_sec(40)
             .tick_hz(20)
@@ -1079,13 +705,13 @@ mod tests {
         assert_eq!(w.sub_grid_cells(), 25);
         assert_eq!(w.tick_ms(), 50);
         assert_eq!(w.max_move_per_tick(), Fixed::from_meters(2));
-        assert_eq!(w.horizontal_bits(), 16);
-        assert_eq!(w.horizontal_quant_shift(), 6);
-        assert_eq!(w.horizontal_precision(), Fixed::from_raw(64));
-        assert_eq!(w.vertical_bits(), 14);
-        assert_eq!(w.vertical_quant_shift(), 6);
-        assert_eq!(w.wire_steps_per_cell(), 2048);
-        assert!(!w.is_lossless_horizontal());
+        assert_eq!(w.horizontal_bits(), 22);
+        assert_eq!(w.horizontal_quant_shift(), 0);
+        assert_eq!(w.horizontal_precision(), Fixed::from_raw(1));
+        assert_eq!(w.vertical_bits(), 20);
+        assert_eq!(w.vertical_quant_shift(), 0);
+        assert_eq!(w.wire_steps_per_cell(), 131_072);
+        assert!(w.is_lossless_horizontal());
     }
 
     #[test]
@@ -1145,84 +771,13 @@ mod tests {
         assert!(!w.contains(Pos3::from_meters(-1, 0, 0)));
     }
 
-    #[test]
-    fn precision_and_bits_agree() {
-        let by_bits = base().horizontal_bits(16).build().unwrap();
-        let by_precision = base()
-            .horizontal_precision(Fixed::from_raw(64))
-            .build()
-            .unwrap();
-        assert_eq!(by_bits.horizontal_bits(), by_precision.horizontal_bits());
-        assert_eq!(by_bits.protocol_hash(), by_precision.protocol_hash());
-    }
 
-    #[test]
-    fn precision_rounds_in_callers_favour() {
-        // 100 raw units is not a power of two; log2 floors to 6, giving 64.
-        let w = base()
-            .horizontal_precision(Fixed::from_raw(100))
-            .build()
-            .unwrap();
-        assert_eq!(w.horizontal_precision(), Fixed::from_raw(64));
-        assert!(w.horizontal_precision().raw() <= 100);
-    }
 
-    #[test]
-    fn vertical_defaults_to_horizontal_precision() {
-        let w = base()
-            .horizontal_precision(Fixed::from_raw(16))
-            .build()
-            .unwrap();
-        assert_eq!(w.vertical_precision(), w.horizontal_precision());
-    }
 
-    #[test]
-    fn rejects_conflicting_position_spec() {
-        let err = base()
-            .horizontal_bits(16)
-            .horizontal_precision(Fixed::from_raw(64))
-            .build()
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::ConflictingPositionSpec {
-                axis: Axis::Horizontal
-            }
-        ));
-    }
 
-    #[test]
-    fn rejects_precision_coarser_than_a_cell() {
-        // 4 bits over a 22-bit region leaves an 18-bit shift: 262144 raw
-        // units, spanning two 128 m cells.
-        let err = base().horizontal_bits(4).build().unwrap_err();
-        assert!(matches!(err, ConfigError::QuantErrorExceedsCell { .. }));
-    }
 
-    #[test]
-    fn precision_equal_to_a_cell_is_allowed() {
-        // 17-bit shift gives exactly one cell per bucket. Lossy, but the
-        // decoded position resolves to the correct cell.
-        let w = base().horizontal_bits(5).build().unwrap();
-        assert_eq!(w.horizontal_precision(), w.cell_size());
-        assert_eq!(w.wire_steps_per_cell(), 1);
-    }
 
-    #[test]
-    fn lossless_wire_is_allowed() {
-        let w = base()
-            .horizontal_precision(Fixed::from_raw(1))
-            .build()
-            .unwrap();
-        assert!(w.is_lossless_horizontal());
-        assert_eq!(w.horizontal_bits(), 22);
-    }
 
-    #[test]
-    fn rejects_non_power_of_two_cell() {
-        let err = base().cell_size_m(100).build().unwrap_err();
-        assert!(matches!(err, ConfigError::CellSizeNotPowerOfTwo { .. }));
-    }
 
     #[test]
     fn rejects_non_positive_extent() {
@@ -1231,9 +786,67 @@ mod tests {
     }
 
     #[test]
+    fn cell_size_derives_to_half_the_view_radius() {
+        let w = WorldConfig::default();
+        assert_eq!(w.cell_size(), Fixed::from_meters(128));
+        assert_eq!(w.horizontal_view_radius(), Fixed::from_meters(256));
+        assert_eq!(w.cell_radius(), 2);
+    }
+
+    #[test]
+    fn derived_cell_size_floors_to_a_power_of_two() {
+        // 300 m radius halves to 150 m, which floors to 128 m.
+        let w = base().horizontal_view_radius_m(300).build().unwrap();
+        assert_eq!(w.cell_size(), Fixed::from_meters(128));
+        assert_eq!(w.cell_radius(), 3);
+    }
+
+    #[test]
+    fn derived_cell_size_never_breaks_the_radius_bound() {
+        for r in 4..=2048 {
+            let w = base().horizontal_view_radius_m(r).build();
+            if let Ok(w) = w {
+                assert!(
+                    w.cell_radius() <= MAX_CELL_RADIUS,
+                    "radius {r} m gave cell radius {}",
+                    w.cell_radius()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cell_size_override_recomputes_the_grid() {
+        let w = WorldConfig::default().with_cell_size_m(64);
+        assert_eq!(w.cell_size(), Fixed::from_meters(64));
+        assert_eq!(w.cells_per_axis(), 64);
+        assert_eq!(w.cells_per_region(), 4096);
+        assert_eq!(w.cell_radius(), 4);
+        assert_eq!(w.sub_grid_axis(), 9);
+        // Wire widths are untouched, but cell size is protocol-critical: a
+        // client decoding a CellCoord has to agree on what a cell is.
+        assert_eq!(w.horizontal_bits(), WorldConfig::default().horizontal_bits());
+        assert_ne!(w.protocol_hash(), WorldConfig::default().protocol_hash());
+    }
+
+    #[test]
+    #[should_panic(expected = "not a power of two")]
+    fn cell_size_override_rejects_non_power_of_two() {
+        WorldConfig::default().with_cell_size_m(100);
+    }
+
+    #[test]
+    #[should_panic(expected = "above")]
+    fn cell_size_override_rejects_too_many_cells_in_view() {
+        // 32 m cells against a 256 m radius needs a radius of 8.
+        WorldConfig::default().with_cell_size_m(32);
+    }
+
+    #[test]
     fn rejects_entity_that_can_skip_a_cell() {
+        // A 2 m view radius derives a 1 m cell, and 40 m/s at 20 Hz moves 2 m
+        // per tick.
         let err = base()
-            .cell_size_m(1)
             .horizontal_view_radius_m(2)
             .build()
             .unwrap_err();
@@ -1249,8 +862,11 @@ mod tests {
 
     #[test]
     fn protocol_hash_catches_wire_layout_change() {
+        // Bits per axis derive from region extent, so this is the only way to
+        // change them.
         let a = base().build().unwrap();
-        let b = base().horizontal_bits(14).build().unwrap();
+        let b = base().region_size_m(2048).build().unwrap();
+        assert_ne!(a.horizontal_bits(), b.horizontal_bits());
         assert_ne!(a.protocol_hash(), b.protocol_hash());
     }
 
@@ -1261,42 +877,6 @@ mod tests {
         assert_ne!(a.protocol_hash(), b.protocol_hash());
     }
 
-    #[test]
-    fn average_viewer_is_already_over_budget() {
-        let w = WorldConfig::default();
-        let v = ViewConfig::default_for(&w);
-        let in_view = w.est_entities_in_view(8_192);
-        let capacity = v.est_records_per_packet(16);
-        assert_eq!(in_view, 200);
-        assert_eq!(capacity, 74);
-        assert!(in_view > capacity * 2);
-    }
 
-    #[test]
-    fn event_reserve_is_a_floor_not_a_subtraction() {
-        let w = WorldConfig::default();
-        let v = ViewConfig::default_for(&w);
 
-        // 1200 payload, 16 header, 256 reserve.
-        assert_eq!(v.max_state_bytes(), 1_184);
-        assert_eq!(v.min_state_bytes(), 928);
-
-        // Nothing pending: state gets the reserve back.
-        assert_eq!(v.state_bytes_available(0), 1_184);
-        // Less pending than the reserve: state gets the difference back.
-        assert_eq!(v.state_bytes_available(100), 1_084);
-        // Exactly the reserve, and beyond it, state keeps its floor.
-        assert_eq!(v.state_bytes_available(256), 928);
-        assert_eq!(v.state_bytes_available(5_000), 928);
-    }
-
-    #[test]
-    fn giving_the_reserve_back_buys_records() {
-        let w = WorldConfig::default();
-        let v = ViewConfig::default_for(&w);
-        let idle = v.max_state_bytes() / 16;
-        let backlogged = v.min_state_bytes() / 16;
-        assert_eq!(idle, 74);
-        assert_eq!(backlogged, 58);
-    }
 }

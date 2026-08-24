@@ -43,7 +43,7 @@ pub use codec::RecordCodec;
 pub use packet::{PacketHeader, PacketReader, PacketWriter};
 pub use budget::PacketBudget;
 pub use sim::{
-    ClientLimits, Game, Handoff, NullSink, PayloadSink, RecordingSink, Step, TickStats, ViewerId,
-    WorldSimulation,
+    ClientLimits, Flow, Game, Handoff, NullSink, Overrun, Pacing, PayloadSink, RecordingSink,
+    RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
 pub use subscription::{CellList, Subscription};

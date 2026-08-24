@@ -42,5 +42,8 @@ pub use select::{Policy, Ranked, Selection, Weights, select};
 pub use codec::RecordCodec;
 pub use packet::{PacketHeader, PacketReader, PacketWriter};
 pub use budget::PacketBudget;
-pub use sim::{ClientLimits, Game, Step, TickStats, ViewerId, WorldSimulation};
+pub use sim::{
+    ClientLimits, Game, NullSink, PayloadSink, RecordingSink, Step, TickStats, ViewerId,
+    WorldSimulation,
+};
 pub use subscription::{CellList, Subscription};

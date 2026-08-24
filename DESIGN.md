@@ -789,6 +789,36 @@ per-viewer queue.
 This is bytes in a buffer and nothing else. No socket, no framing to an edge, no
 transport.
 
+### Payloads leave through a sink
+
+`PayloadSink` is a trait the consumer supplies at construction. `send` takes
+`&self` and the trait is `Sync`, because it is called once per served viewer per
+tick from every worker thread at once. An implementation must not block: the
+tick is waiting on it.
+
+Static dispatch with a defaulted type parameter, `WorldSimulation<G, S =
+NullSink>`, which is the shape `HashMap<K, V, S = RandomState>` uses for the
+same reason. There is one sink per simulation, chosen at startup and never
+swapped, which is the case generics are for. It also keeps a sink inspectable:
+`sim.sink()` returns the concrete type, so a test reads what was sent without an
+`Arc` held alongside. A boxed trait object would type-erase that away.
+
+Attaching one is consuming, so the type is inferred and no other constructor has
+to name it:
+
+```rust
+let sim = WorldSimulation::new(cfg, game).with_sink(EdgeSink::connect(addr)?);
+```
+
+`NullSink` discards, costs nothing to hold, and is what a benchmark measuring
+the simulation rather than the transport wants. `RecordingSink` keeps the latest
+payload per viewer for tests and examples; it allocates and locks, so it is not
+a production path.
+
+Not built: the shipped implementation that speaks the sim-to-edge protocol,
+which is the one that would hand off to an I/O thread and drop rather than
+queue.
+
 ### Simulation and viewers
 
 `WorldSimulation` owns positions, liveness, the odometer, the snapshot and

@@ -22,6 +22,7 @@ use crate::odometer::Odometer;
 use crate::packet::{DESPAWN_BYTES, PacketWriter};
 use crate::pos::Pos3;
 use crate::select::{Policy, Selection, select};
+use crate::sim::sink::{NullSink, PayloadSink};
 use crate::sim::viewer::{ClientLimits, Viewer, ViewerId};
 use crate::snapshot::CellSnapshot;
 use crate::subscription::Subscription;
@@ -158,7 +159,8 @@ struct Scratch {
 
 /// Everything a worker reads and nothing it writes, so it is shared across
 /// threads by reference.
-struct Frame<'a> {
+struct Frame<'a, S: PayloadSink> {
+    sink: &'a S,
     tick: u32,
     cfg: &'a WorldConfig,
     snap: &'a CellSnapshot,
@@ -173,7 +175,7 @@ struct Frame<'a> {
 
 /// Subscribes, gathers, scores, selects and assembles for one viewer. Returns
 /// whether it was served, leaving the payload in `w.writer`.
-fn serve(f: &Frame<'_>, id: ViewerId, v: &mut Viewer, w: &mut Scratch) -> bool {
+fn serve<S: PayloadSink>(f: &Frame<'_, S>, id: ViewerId, v: &mut Viewer, w: &mut Scratch) -> bool {
     if !v.registered || !v.due(id, f.tick) {
         return false;
     }
@@ -219,6 +221,8 @@ fn serve(f: &Frame<'_>, id: ViewerId, v: &mut Viewer, w: &mut Scratch) -> bool {
         }),
     );
 
+    f.sink.send(id, writer.payload());
+
     // Departures are found by the eviction inside `select`, after this tick's
     // records were chosen, so they ride the next packet.
     v.pending_despawns.extend_from_slice(selection.departed());
@@ -243,9 +247,10 @@ pub struct Outbound<'a> {
 }
 
 /// One region's simulation.
-pub struct WorldSimulation<G: Game> {
+pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     cfg: WorldConfig,
     game: G,
+    sink: S,
 
     xs: Vec<Fixed>,
     ys: Vec<Fixed>,
@@ -268,8 +273,10 @@ pub struct WorldSimulation<G: Game> {
     tick: u32,
 }
 
-impl<G: Game> WorldSimulation<G> {
-    pub fn new(cfg: WorldConfig, game: G) -> WorldSimulation<G> {
+impl<G: Game> WorldSimulation<G, NullSink> {
+    /// Discards payloads. Attach one with
+    /// [`with_sink`](WorldSimulation::with_sink).
+    pub fn new(cfg: WorldConfig, game: G) -> WorldSimulation<G, NullSink> {
         WorldSimulation::with_replication(
             cfg,
             game,
@@ -291,13 +298,14 @@ impl<G: Game> WorldSimulation<G> {
         game: G,
         walk_cap: usize,
         policy: Policy,
-    ) -> WorldSimulation<G> {
+    ) -> WorldSimulation<G, NullSink> {
         let codec = RecordCodec::new(&cfg);
         let snap = CellSnapshot::new(&cfg);
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let mut sim = WorldSimulation {
             cfg,
             game,
+            sink: NullSink,
             xs: Vec::new(),
             ys: Vec::new(),
             zs: Vec::new(),
@@ -315,6 +323,44 @@ impl<G: Game> WorldSimulation<G> {
         };
         sim.set_thread_count(threads);
         sim
+    }
+}
+
+impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
+    /// Sends finished payloads to `sink` instead of wherever they were going.
+    ///
+    /// Consuming rather than a setter so the sink's type is inferred and no
+    /// other constructor has to name it:
+    ///
+    /// ```ignore
+    /// let sim = WorldSimulation::new(cfg, game).with_sink(EdgeSink::connect(addr)?);
+    /// ```
+    pub fn with_sink<T: PayloadSink>(self, sink: T) -> WorldSimulation<G, T> {
+        WorldSimulation {
+            cfg: self.cfg,
+            game: self.game,
+            sink,
+            xs: self.xs,
+            ys: self.ys,
+            zs: self.zs,
+            live: self.live,
+            odo: self.odo,
+            snap: self.snap,
+            viewers: self.viewers,
+            free: self.free,
+            workers: self.workers,
+            threads: self.threads,
+            walk_cap: self.walk_cap,
+            policy: self.policy,
+            codec: self.codec,
+            tick: self.tick,
+        }
+    }
+
+    /// Where payloads are going.
+    #[inline(always)]
+    pub fn sink(&self) -> &S {
+        &self.sink
     }
 
     /// Worker threads used for per-viewer replication.
@@ -490,6 +536,7 @@ impl<G: Game> WorldSimulation<G> {
         self.snap.update(&self.xs, &self.ys, &self.zs, &self.live);
 
         let frame = Frame {
+            sink: &self.sink,
             tick: self.tick,
             cfg: &self.cfg,
             snap: &self.snap,
@@ -565,6 +612,8 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use crate::sim::sink::RecordingSink;
+
     /// Every entity walks along x, wrapping inside the region so nothing ever
     /// leaves it.
     struct Walk {
@@ -601,7 +650,10 @@ mod tests {
 
     /// `n` entities on a grid around the middle of the region, close enough
     /// together that a viewer among them sees many of them.
-    fn populate<G: Game>(sim: &mut WorldSimulation<G>, n: usize) -> Vec<EntityId> {
+    fn populate<G: Game, S: PayloadSink>(
+        sim: &mut WorldSimulation<G, S>,
+        n: usize,
+    ) -> Vec<EntityId> {
         let mut ids = Vec::with_capacity(n);
         let mut step = Step {
             xs: &mut sim.xs,
@@ -868,6 +920,61 @@ mod tests {
         for (id, pos) in seen {
             assert_eq!(Some(pos), s.position(id), "the wire is lossless at this config");
         }
+    }
+
+    #[test]
+    fn a_sink_receives_a_payload_per_served_viewer() {
+        use crate::packet::PacketReader;
+        let mut s = sim(Walk::new(1)).with_sink(RecordingSink::new());
+        let ids = populate(&mut s, 200);
+        let a = s.register_viewer(ids[0], ClientLimits::default());
+        let b = s.register_viewer(ids[1], ClientLimits::default());
+
+        let stats = s.tick();
+        assert_eq!(stats.viewers, 2);
+        assert_eq!(s.sink().sends(), 2, "one payload per served viewer");
+
+        let codec = RecordCodec::new(&WorldConfig::default());
+        for v in [a, b] {
+            let bytes = s.sink().latest(v).expect("served");
+            let r = PacketReader::new(&codec, &bytes).expect("well formed");
+            assert_eq!(r.header().tick, 1);
+            assert_eq!(r.header().sequence, 1, "sequence starts at one per client");
+            assert!(r.updates().count() > 0);
+        }
+    }
+
+    #[test]
+    fn a_sink_hears_nothing_for_a_viewer_that_is_not_due() {
+        let mut s = sim(Walk::new(1)).with_sink(RecordingSink::new());
+        let ids = populate(&mut s, 60);
+        s.register_viewer(ids[0], ClientLimits { payload_bytes: 1200, send_period: 4 });
+        let mut served = 0;
+        for _ in 0..4 {
+            served += s.tick().viewers;
+        }
+        assert_eq!(served, 1);
+        assert_eq!(s.sink().sends(), 1, "a sink is only handed what was assembled");
+    }
+
+    #[test]
+    fn a_sequence_number_advances_once_per_payload() {
+        use crate::packet::PacketHeader;
+        let mut s = sim(Walk::new(1)).with_sink(RecordingSink::new());
+        let ids = populate(&mut s, 60);
+        let v = s.register_viewer(ids[0], ClientLimits::default());
+        for tick in 1..=6u32 {
+            s.tick();
+            let bytes = s.sink().latest(v).expect("served");
+            let h = PacketHeader::decode(&bytes).expect("well formed");
+            assert_eq!(h.sequence, tick as u16);
+            assert_eq!(h.tick, tick);
+        }
+    }
+
+    #[test]
+    fn the_default_sink_is_free_to_hold() {
+        assert_eq!(size_of::<NullSink>(), 0);
     }
 
     #[test]

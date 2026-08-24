@@ -4,9 +4,11 @@
 //! state, runs the tick loop, and does all per-client replication work against
 //! the snapshot it publishes to itself.
 
+mod sink;
 mod viewer;
 mod world;
 
+pub use sink::{NullSink, PayloadSink, RecordingSink};
 pub use viewer::{ClientLimits, ViewerId};
 pub use world::{
     DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP, Game, Outbound, Step, TickStats, WorldSimulation,

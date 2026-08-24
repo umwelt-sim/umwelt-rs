@@ -27,36 +27,26 @@ use crate::sim::viewer::ViewerId;
 /// sit for beyond the tick that produced it.
 const POLL: Duration = Duration::from_millis(1);
 
-/// One buffer and what it is.
-///
-/// Both under one lock on purpose. An earlier version kept the fill state in an
-/// atomic outside the mutex, and a producer stashing between the drain's scan
-/// and its swap left that flag set after the payload had already been taken, so
-/// the next drain delivered an empty spare as though it were a frame.
-#[derive(Debug, Default)]
-struct Frame {
-    buf: Vec<u8>,
-    filled: bool,
-}
-
-/// One viewer's handoff point. Always holds exactly one buffer, which is either
-/// a payload waiting to go out or a spare waiting to be filled.
+/// One viewer's handoff point. Empty means nothing is waiting; a payload is
+/// never empty, since it always carries a header.
 #[derive(Debug, Default)]
 struct Slot {
-    frame: Mutex<Frame>,
-    /// A hint for the drain's scan, so it locks only slots worth locking. The
-    /// truth is `Frame::filled`; a stale hint costs one wasted lock.
+    buf: Mutex<Vec<u8>>,
+    /// A hint for the drain's scan, so it locks only slots worth locking. Set
+    /// and cleared under `buf`, so it cannot disagree with what is there.
     ready: AtomicBool,
 }
 
-/// Written by every worker on every send. On its own cache line so it does not
-/// false-share with anything the I/O thread writes, and a store rather than a
-/// read-modify-write because all the I/O thread needs is "something happened".
+/// Whether a slot is waiting to be drained.
+///
+/// A store rather than a read-modify-write: the I/O thread needs only that
+/// something happened, not how much. Carries its own cache line because workers
+/// write it while the I/O thread writes `Progress`.
 #[derive(Debug, Default)]
 #[repr(align(128))]
-struct Doorbell(AtomicBool);
+struct HasWork(AtomicBool);
 
-/// Written only by the I/O thread, and likewise kept apart.
+/// Written only by the I/O thread.
 #[derive(Debug, Default)]
 #[repr(align(128))]
 struct Progress {
@@ -67,10 +57,10 @@ struct Progress {
 #[derive(Debug)]
 struct Shared<S> {
     inner: S,
-    /// Grows when a viewer is served for the first time. Boxed so growing does
-    /// not move a slot another thread is working on.
-    slots: RwLock<Vec<Box<Slot>>>,
-    doorbell: Doorbell,
+    /// Grows when a viewer is served for the first time, which is the only
+    /// reason this is a lock at all.
+    slots: RwLock<Vec<Slot>>,
+    has_work: HasWork,
     progress: Progress,
     running: AtomicBool,
     alive: AtomicBool,
@@ -78,28 +68,24 @@ struct Shared<S> {
 }
 
 impl<S: PayloadSink> Shared<S> {
-    /// Swaps `payload` into a slot and returns whatever was there.
+    /// Copies `payload` into a slot, superseding anything not yet drained.
     ///
-    /// No copy: the buffers change hands. The lock is held for a pointer swap,
-    /// and the I/O thread holds it only for the same, never across a call into
-    /// the wrapped sink.
+    /// The buffer is kept between calls, so this reuses its capacity rather
+    /// than allocating. The I/O thread holds the same lock only to swap a
+    /// buffer out, never across a call into the wrapped sink.
     ///
-    /// Losing the race hands `payload` straight back undelivered, which is the
-    /// one frame this design is willing to lose.
-    fn stash(&self, slot: &Slot, payload: Vec<u8>) -> Vec<u8> {
-        match slot.frame.try_lock() {
-            Ok(mut frame) => {
-                // Whatever was there comes back, whether that was a spare or a
-                // payload this one supersedes.
-                let spare = std::mem::replace(&mut frame.buf, payload);
-                frame.filled = true;
+    /// Losing the race drops the frame, which is the one thing this design is
+    /// willing to lose.
+    fn stash(&self, slot: &Slot, payload: &[u8]) {
+        match slot.buf.try_lock() {
+            Ok(mut buf) => {
+                buf.clear();
+                buf.extend_from_slice(payload);
                 slot.ready.store(true, Ordering::Release);
-                self.doorbell.0.store(true, Ordering::Release);
-                spare
+                self.has_work.0.store(true, Ordering::Release);
             }
             Err(_) => {
                 self.progress.dropped.fetch_add(1, Ordering::Relaxed);
-                payload
             }
         }
     }
@@ -122,21 +108,20 @@ impl<S: PayloadSink> Shared<S> {
             }
         }
         for &i in ready.iter() {
-            let payload = {
-                // Slots only ever grow, so `i` stays valid. Leaving a spare in
-                // the same swap keeps the slot holding a buffer at all times,
-                // so a producer arriving next finds one to take.
+            {
+                // Slots only ever grow, so `i` stays valid. Swapping keeps both
+                // buffers and their capacity; clearing marks the slot free.
                 let slots = self.slots.read().expect("not poisoned");
-                let mut frame = slots[i].frame.lock().expect("not poisoned");
-                if !frame.filled {
+                let mut buf = slots[i].buf.lock().expect("not poisoned");
+                if buf.is_empty() {
                     slots[i].ready.store(false, Ordering::Release);
                     continue;
                 }
-                frame.filled = false;
+                std::mem::swap(&mut *buf, spare);
+                buf.clear();
                 slots[i].ready.store(false, Ordering::Release);
-                std::mem::replace(&mut frame.buf, std::mem::take(spare))
-            };
-            *spare = self.inner.send(ViewerId::from_raw(i as u32), payload);
+            }
+            self.inner.send(ViewerId::from_raw(i as u32), spare);
             self.progress.delivered.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -163,7 +148,7 @@ impl<S: PayloadSink + Send + Sync + 'static> Handoff<S> {
         let shared = Arc::new(Shared {
             inner,
             slots: RwLock::new(Vec::new()),
-            doorbell: Doorbell::default(),
+            has_work: HasWork::default(),
             progress: Progress::default(),
             running: AtomicBool::new(true),
             alive: AtomicBool::new(true),
@@ -179,7 +164,7 @@ impl<S: PayloadSink + Send + Sync + 'static> Handoff<S> {
                     let mut spare = Vec::new();
                     let mut ready = Vec::new();
                     while shared.running.load(Ordering::Acquire) {
-                        if shared.doorbell.0.swap(false, Ordering::AcqRel) {
+                        if shared.has_work.0.swap(false, Ordering::AcqRel) {
                             shared.drain(&mut spare, &mut ready);
                         }
                         std::thread::park_timeout(POLL);
@@ -219,10 +204,7 @@ impl<S: PayloadSink + Send + Sync + 'static> Handoff<S> {
     /// Payloads stashed and not yet drained.
     pub fn pending(&self) -> usize {
         let slots = self.shared.slots.read().expect("not poisoned");
-        slots
-            .iter()
-            .filter(|s| s.frame.lock().expect("not poisoned").filled)
-            .count()
+        slots.iter().filter(|s| !s.buf.lock().expect("not poisoned").is_empty()).count()
     }
 
     /// Waits for everything stashed to reach the wrapped sink. Returns whether
@@ -245,7 +227,7 @@ impl<S: PayloadSink + Send + Sync + 'static> Handoff<S> {
             if !self.healthy() || std::time::Instant::now() >= deadline {
                 return false;
             }
-            self.shared.doorbell.0.store(true, Ordering::Release);
+            self.shared.has_work.0.store(true, Ordering::Release);
             if let Some(t) = self.shared.thread.get() {
                 t.unpark();
             }
@@ -255,19 +237,20 @@ impl<S: PayloadSink + Send + Sync + 'static> Handoff<S> {
 }
 
 impl<S: PayloadSink + Send + Sync + 'static> PayloadSink for Handoff<S> {
-    fn send(&self, viewer: ViewerId, payload: Vec<u8>) -> Vec<u8> {
+    fn send(&self, viewer: ViewerId, payload: &[u8]) {
         {
             let slots = self.shared.slots.read().expect("not poisoned");
             if let Some(slot) = slots.get(viewer.index()) {
-                return self.shared.stash(slot, payload);
+                self.shared.stash(slot, payload);
+                return;
             }
         }
         // Only the first time a viewer is served.
         let mut slots = self.shared.slots.write().expect("not poisoned");
         while slots.len() <= viewer.index() {
-            slots.push(Box::default());
+            slots.push(Slot::default());
         }
-        self.shared.stash(&slots[viewer.index()], payload)
+        self.shared.stash(&slots[viewer.index()], payload);
     }
 }
 
@@ -297,8 +280,8 @@ mod tests {
     #[test]
     fn payloads_reach_the_wrapped_sink() {
         let h = Handoff::new(RecordingSink::new());
-        h.send(v(0), b"first".to_vec());
-        h.send(v(2), b"second".to_vec());
+        h.send(v(0), b"first");
+        h.send(v(2), b"second");
         assert!(h.flush(Duration::from_secs(5)));
         assert_eq!(h.inner().latest(v(0)).as_deref(), Some(&b"first"[..]));
         assert_eq!(h.inner().latest(v(2)).as_deref(), Some(&b"second"[..]));
@@ -309,9 +292,8 @@ mod tests {
     fn a_slow_sink_does_not_delay_the_sender() {
         struct Slow;
         impl PayloadSink for Slow {
-            fn send(&self, _v: ViewerId, p: Vec<u8>) -> Vec<u8> {
+            fn send(&self, _v: ViewerId, _p: &[u8]) {
                 std::thread::sleep(Duration::from_millis(5));
-                p
             }
         }
 
@@ -321,7 +303,7 @@ mod tests {
         // Every one of these is a viewer seen for the first time, so every one
         // has to grow the slot vector while the I/O thread is mid-drain.
         for k in 0..60 {
-            h.send(v(k), payload.clone());
+            h.send(v(k), &payload);
         }
         let took = t.elapsed();
         // Delivering even one of these takes 5 ms. Sixty would take three
@@ -333,7 +315,7 @@ mod tests {
     fn a_blocking_sink_does_not_stop_the_sender_at_all() {
         struct Forever(AtomicBool);
         impl PayloadSink for Forever {
-            fn send(&self, _v: ViewerId, _p: Vec<u8>) -> Vec<u8> {
+            fn send(&self, _v: ViewerId, _p: &[u8]) {
                 self.0.store(true, Ordering::Release);
                 loop {
                     std::thread::sleep(Duration::from_millis(5));
@@ -345,7 +327,7 @@ mod tests {
         let payload = vec![7u8; 64];
         let t = std::time::Instant::now();
         for tick in 0..500u32 {
-            h.send(v(tick % 8), payload.to_vec());
+            h.send(v(tick % 8), &payload);
             std::thread::yield_now();
         }
         assert!(
@@ -361,14 +343,14 @@ mod tests {
     fn a_superseded_payload_is_replaced_not_queued() {
         let h = Handoff::new(RecordingSink::new());
         for k in 0..50u8 {
-            h.send(v(0), vec![k; 8]);
+            h.send(v(0), &[k; 8]);
         }
         assert!(h.flush(Duration::from_secs(5)));
         assert!(h.delivered() < 50, "supersedes must collapse, not queue: {}", h.delivered());
 
         // With nothing in flight the next stash cannot lose a race, so what a
         // client ends up holding is the freshest frame produced.
-        h.send(v(0), vec![99u8; 8]);
+        h.send(v(0), &[99u8; 8]);
         assert!(h.flush(Duration::from_secs(5)));
         assert_eq!(h.inner().latest(v(0)).expect("delivered"), vec![99u8; 8]);
     }
@@ -378,14 +360,14 @@ mod tests {
         let seen = Arc::new(RecordingSink::new());
         struct Fanout(Arc<RecordingSink>);
         impl PayloadSink for Fanout {
-            fn send(&self, viewer: ViewerId, payload: Vec<u8>) -> Vec<u8> {
-                self.0.send(viewer, payload)
+            fn send(&self, viewer: ViewerId, payload: &[u8]) {
+                self.0.send(viewer, payload);
             }
         }
 
         let h = Handoff::new(Fanout(Arc::clone(&seen)));
         for k in 0..16u32 {
-            h.send(v(k), b"bye".to_vec());
+            h.send(v(k), b"bye");
         }
         drop(h);
         for k in 0..16u32 {
@@ -397,23 +379,23 @@ mod tests {
     fn a_panicking_sink_takes_only_its_own_thread() {
         struct Boom;
         impl PayloadSink for Boom {
-            fn send(&self, _v: ViewerId, _p: Vec<u8>) -> Vec<u8> {
+            fn send(&self, _v: ViewerId, _p: &[u8]) {
                 panic!("sink exploded");
             }
         }
 
         let h = Handoff::new(Boom);
-        h.send(v(0), b"x".to_vec());
+        h.send(v(0), b"x");
         // The I/O thread dies; sending keeps working and keeps not blocking.
         for _ in 0..200 {
-            h.send(v(0), b"x".to_vec());
+            h.send(v(0), b"x");
             if !h.healthy() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(!h.healthy(), "a panicked I/O thread must be reportable");
-        h.send(v(1), b"still fine".to_vec());
+        h.send(v(1), b"still fine");
     }
 
     #[test]
@@ -423,15 +405,14 @@ mod tests {
         // after the payload had gone, so the next drain shipped the spare.
         struct Reject;
         impl PayloadSink for Reject {
-            fn send(&self, viewer: ViewerId, payload: Vec<u8>) -> Vec<u8> {
+            fn send(&self, viewer: ViewerId, payload: &[u8]) {
                 assert!(!payload.is_empty(), "viewer {viewer:?} got an empty frame");
-                payload
             }
         }
 
         let h = Handoff::new(Reject);
         for round in 0..2000u32 {
-            h.send(v(round % 4), vec![1u8; 64]);
+            h.send(v(round % 4), &[1u8; 64]);
             if round % 3 == 0 {
                 std::thread::yield_now();
             }
@@ -448,7 +429,7 @@ mod tests {
                 let h = &h;
                 scope.spawn(move || {
                     for _ in 0..500 {
-                        h.send(v(t), vec![t as u8; 32]);
+                        h.send(v(t), &[t as u8; 32]);
                     }
                 });
             }

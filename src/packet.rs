@@ -74,12 +74,11 @@ impl PacketHeader {
 pub struct PacketWriter {
     codec: RecordCodec,
     buf: Vec<u8>,
-    payload_bytes: usize,
 }
 
 impl PacketWriter {
     pub fn new(codec: RecordCodec, payload_bytes: usize) -> PacketWriter {
-        PacketWriter { codec, buf: Vec::with_capacity(payload_bytes), payload_bytes }
+        PacketWriter { codec, buf: Vec::with_capacity(payload_bytes) }
     }
 
     #[inline(always)]
@@ -143,34 +142,6 @@ impl PacketWriter {
         &self.buf
     }
 
-    /// Hands the assembled payload out, leaving an empty buffer behind.
-    ///
-    /// Pair it with [`restore`](Self::restore): building again before then
-    /// allocates.
-    #[inline(always)]
-    pub fn take(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buf)
-    }
-
-    /// Takes a buffer back, growing it to hold a whole payload if it is short.
-    ///
-    /// A sink that returns the buffer it was given costs nothing here. One that
-    /// hands back an empty `Vec` costs an allocation every time, which is why
-    /// the trait says the capacity is what matters and not the contents.
-    #[inline]
-    pub fn restore(&mut self, mut buf: Vec<u8>) {
-        buf.clear();
-        if buf.capacity() < self.payload_bytes {
-            buf.reserve_exact(self.payload_bytes);
-        }
-        self.buf = buf;
-    }
-
-    /// Bytes a payload of these counts would occupy.
-    #[inline]
-    pub fn size_of(&self, despawns: usize, updates: usize) -> usize {
-        PacketHeader::BYTES + despawns * DESPAWN_BYTES + updates * self.codec.record_bytes()
-    }
 }
 
 /// Reads a payload back, which is what a client does.
@@ -301,14 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn size_of_predicts_what_build_writes() {
+    fn a_payload_is_a_header_then_its_records() {
         let c = codec();
         let mut w = PacketWriter::new(c.clone(), 1200);
         let gone: Vec<EntityId> = (0..5).map(id).collect();
         let moved: Vec<(EntityId, Pos3)> =
             (0..30).map(|k| (id(100 + k), Pos3::from_meters(k as i32, 0, 0))).collect();
-        let want = w.size_of(gone.len(), moved.len());
-        assert_eq!(w.build(1, 1, &gone, moved).len(), want);
+        assert_eq!(w.build(1, 1, &gone, moved).len(), 16 + 5 * 4 + 30 * 12);
     }
 
     #[test]
@@ -335,26 +305,6 @@ mod tests {
                 "a payload {cut} bytes short must not parse"
             );
         }
-    }
-
-    #[test]
-    fn taking_and_restoring_keeps_the_larger_buffer() {
-        let c = codec();
-        let mut w = PacketWriter::new(c.clone(), 1200);
-        w.build(1, 1, &[], vec![(id(1), Pos3::from_meters(1, 2, 3))]);
-        let out = w.take();
-        assert!(out.capacity() >= 1200);
-        assert_eq!(w.buf.capacity(), 0, "taking leaves nothing behind");
-
-        // A sink that hands back nothing must still leave the writer able to
-        // build a whole payload.
-        w.restore(Vec::new());
-        assert!(w.buf.capacity() >= 1200, "a short buffer must be grown, not accepted");
-
-        // One that hands back what it was given costs nothing.
-        let before = out.capacity();
-        w.restore(out);
-        assert_eq!(w.buf.capacity(), before, "a sized buffer is taken as it is");
     }
 
     #[test]

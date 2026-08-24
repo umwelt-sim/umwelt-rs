@@ -254,11 +254,8 @@ fn serve<S: PayloadSink>(
     });
 
     let handoff = std::time::Instant::now();
-    // The buffer changes hands rather than being copied, and one comes back to
-    // build the next payload in.
-    let spare = f.sink.send(id, writer.take());
+    f.sink.send(id, writer.payload());
     stats.sink_nanos += handoff.elapsed().as_nanos() as u64;
-    writer.restore(spare);
 
     // Departures are found by the eviction inside `select`, after this tick's
     // records were chosen, so they ride the next packet.
@@ -996,7 +993,7 @@ mod tests {
     fn a_panicking_sink_is_not_swallowed() {
         struct Boom;
         impl crate::sim::sink::PayloadSink for Boom {
-            fn send(&self, _v: ViewerId, _p: Vec<u8>) -> Vec<u8> {
+            fn send(&self, _v: ViewerId, _p: &[u8]) {
                 panic!("sink exploded");
             }
         }
@@ -1011,9 +1008,8 @@ mod tests {
     fn a_slow_sink_delays_the_tick_but_is_attributed() {
         struct Slow;
         impl crate::sim::sink::PayloadSink for Slow {
-            fn send(&self, _v: ViewerId, p: Vec<u8>) -> Vec<u8> {
+            fn send(&self, _v: ViewerId, _p: &[u8]) {
                 std::thread::sleep(std::time::Duration::from_micros(200));
-                p
             }
         }
         let mut s = sim(Walk::new(1)).with_sink(Slow);

@@ -62,10 +62,12 @@ and memory mapping are excluded.
 
 Budget selection is a filter that discards most of its input. Computed at the
 default config a viewer's subscription walks roughly 185 entities, of which
-**95 survive the view-radius test** (measured), and 74 records fit in an
-MTU-sized packet with no events pending, 58 under a full event backlog. So about half of what the gather examines fails the radius
-test, and about 40% of what survives loses to the budget, so roughly two thirds of
-what is examined never reaches a client.
+**95 survive the view-radius test** (measured), and 98 records fit in an
+MTU-sized packet with no events pending, 77 under a full event backlog. So about
+half of what the gather examines fails the radius test, and under a full backlog
+about a fifth of what survives loses to the budget. Computed, half to three
+fifths of what is examined never reaches a client, and the budget binds only
+under a backlog or under crowding.
 
 Running that filter before the network hop means the bytes leaving the
 simulation are exactly the bytes clients receive. That is the floor; no byte
@@ -157,9 +159,10 @@ cannot deliver.
 **Rule: umwelt stores only what umwelt's own code reads.**
 
 Position is stored because the gather reads it. Liveness is stored because the
-sort needs it. An importance class enters only if scoring reads it, which the
-accumulator will decide. Health, inventory, and AI state never enter, because
-nothing in the replication pipeline reads them.
+sort needs it. Accumulated displacement is stored for priority scoring, which is
+not built, so it is the one field currently admitted on intent rather than on an
+existing caller; see §Odometer. Health, inventory, and AI state never enter,
+because nothing in the replication pipeline reads them.
 
 The rule is testable against any proposed field: name the umwelt code that reads
 it, or it belongs to the consumer.
@@ -188,6 +191,32 @@ What counts as movement:
 - Any query over entities by which data they carry.
 - Type erasure or dynamic dispatch anywhere in entity storage.
 - Storage that varies per entity rather than being uniform across all of them.
+
+**Justified: the odometer.** `Odometer` stores accumulated displacement per
+entity slot, plus the previous positions the accumulation is computed from. That
+is the second per-entity field the list above flags, recorded here as the rule
+requires.
+
+- Priority scoring is the only thing that will read it, which is the test in
+  §What umwelt stores. Scoring is not built, so this field currently passes that
+  test on intent rather than on a caller.
+- It is derived from positions umwelt already owns. Nothing the consumer writes
+  reaches it, and nothing can be attached beside it. The type is public, as
+  `CellSnapshot` and `Subscription` are, so the piece stays benchmarkable; no
+  consumer path hands one out.
+- Only a monotone total is exposed and direction never leaves the type. A caller
+  keeping its own history could difference two readings and recover speed
+  magnitude; it could not recover a vector.
+- Private per-entity-scale scratch is not new. `CellSnapshot` holds
+  `scratch_ids`, `scratch_xs`, `scratch_ys`, and `scratch_zs`, sized to the
+  largest dense cell, which in the worst case is the whole population.
+
+Computed: 16 bytes per entity, 4 for the total and 12 for the previous position,
+so 800 KB at 50,000 entities. Measured: one pass costs 2.30 ns per slot, 0.23%
+of a 50 ms tick at that population.
+
+The failure mode the rule guards against is arbitrary composition. This adds one
+fixed scalar plus a copy of a field already stored, and no means to add another.
 
 The accepted cost of owning storage: a consumer already running an ECS holds two
 entity registries and maps between them. Bevy interop was never a design goal, so
@@ -518,8 +547,13 @@ authored. Everything else in this table derives from those five.
 
 ## What is built
 
-`fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`.
-75 library tests pass.
+`fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
+`odometer`, `ghost`, `select`, `budget`, `sim`. 170 library tests pass.
+
+A tick runs end to end: the game moves entities, the odometer observes how far
+they went, the snapshot is rebuilt in cell order, and every due viewer is
+subscribed, gathered, scored and selected against it. It stops at a `Selection`
+per viewer. Packet assembly, events and transport are not built.
 
 ### Subscription
 
@@ -609,9 +643,148 @@ Known inefficiency: the horizontal terms are computed twice, once in the range
 test and once inside the 3D distance. Fusing them is a candidate if a benchmark
 shows it matters.
 
+`DiscoveredEntity` carries the entity's index into the snapshot's entity arrays
+alongside its id, so reading a selected entity's position needs no id lookup.
+`CellSnapshot::pos_at` resolves it. The field occupies padding that `DistSq`'s
+alignment already required, so the record is still 16 bytes, which a test
+asserts. Whether any gather figure moved is unverified: no before-and-after was
+run on one machine.
+
+### Odometer
+
+`Odometer` holds one `u32` per entity slot: the running sum of how far that
+entity moved between consecutive calls to `accumulate`, in raw `Fixed` units.
+The difference between an entity's reading now and its reading when a client was
+last told about it bounds how far that client's copy has fallen behind.
+
+Consequences of scoring on displacement rather than elapsed time:
+
+- An entity that has not moved generates no score and is never resent. That is
+  the property §What the paper actually contains credits to the TRIBES state
+  mask, reached without a mask or a component system.
+- Starvation is structural rather than tuned, given one constraint on the weight
+  table: every band inside the view radius must carry a non-zero weight. Under
+  that, a moving entity's score grows without bound so it wins a slot
+  eventually, and a still one has no reason to.
+- Boundary churn separates by cause, within the grace period. An entity that
+  left a viewer's candidate set because the viewer moved, and returns having
+  walked very little, scores near zero; one that returns because it walked
+  scores high and should be sent. Elapsed time cannot tell those apart. Past the
+  grace period the ghost is gone and a returning entity is sent regardless.
+  Unverified: no measurement of churn exists.
+
+Displacement is `|dx| + |dy| + |dz|`. Computed: that over-estimates the
+Euclidean step by up to 1.73x, direction-dependent, and needs no square root.
+Under movement that changes direction it is noise rather than bias against any
+one entity; a permanent diagonal is the case that would show it. Unmeasured.
+
+The total wraps and the per-call step saturates. Opposite on purpose: a
+saturating total would pin at `u32::MAX` and freeze that entity's score forever,
+which is the starvation this exists to avoid, while a wrapping step would turn
+an absurd single-tick jump into a small number. Computed: the total wraps after
+4,194,304 m of path, about 29 hours at 40 m/s. Differences below 2^32 units stay
+exact across a wrap.
+
+Dead slots are skipped rather than updated, so a reading freezes on despawn. The
+cost is that reusing a slot for a different entity would charge the newcomer for
+its separation from the previous occupant. `LiveSet` already says a freed slot is
+not safe to reuse without compaction or a quarantine; this gives that condition
+teeth.
+
+Nothing distinguishes a step from a teleport. Both are measured, since both
+leave a client's copy equally wrong.
+
+### Ghost table
+
+`GhostTable` holds, per viewer, what that client has been told about each
+entity: the odometer reading at the last send, and the tick the entity was last
+in the viewer's ghost set. An entity with no entry is one the client does not
+know exists, and only a send creates one.
+
+Open addressing, linear probing, power-of-two slots, held at or below half full.
+Computed: 12 bytes per slot, so 24 bytes per ghost. The hash is fixed rather
+than seeded so a replay reconstructs identical probe orders; entity ids are
+server-assigned, so there is nothing to defend against.
+
+Deletion is Knuth's backward shift, leaving no tombstone. Eviction is a single
+forward sweep: backward shift moves an entry either to a slot at or after the
+removal point, which the cursor has yet to reach, or, once the probe scan has
+wrapped the end of the table, between two slots the cursor already passed and
+kept. Staleness is fixed for the duration of a call, so an entry the cursor kept
+once it would keep again. Measured with temporary instrumentation: the eviction
+test's 128 configurations wrap the probe scan 24 times, so the case that
+argument turns on is exercised rather than assumed.
+
+Nothing leaves the table unreported. `evict` appends every dropped id, so a
+caller can always tell a client what it no longer holds.
+
+**The mark advances on send, not on acknowledgement.** A lost packet therefore
+leaves a client's copy of a since-idle entity permanently wrong: the entity has
+stopped moving, so its drift stays zero and it is never resent. This is what the
+paper's Most Recent State handles. It cannot be fixed before there is a protocol
+with sequence numbers, and fixing it will need a pending mark beside the
+acknowledged one, growing a record from 12 bytes to 16. Unresolved.
+
+### Selection
+
+`select` scores a viewer's ghost set, ranks it, and commits the result.
+
+**Relevance and staleness do different jobs.** Distance decides what a client
+knows about, because it changes slowly and so the ghost set holds still. Drift
+decides what is worth sending, because it resets every time something is sent.
+The ghost set is the nearest `ghost_cap` candidates, which the gather already
+delivers in order, so choosing it costs nothing. Everything in it is stamped, so
+only an entity that has left the set ages out.
+
+Score is `drift x weight(band)` where `band` is `dist_sq.raw().ilog2()`. One
+multiply, no divide, no square root, integer throughout, so replay stays
+bit-identical. Ties break on candidate index, which the gather's walk order
+fixes.
+
+An entity the client has never seen scores as a ghost that has drifted by
+`unseen_drift`, defaulting to the view radius, on the same scale as any other
+score. A near stranger still beats a barely stale neighbour; a distant stranger
+loses to a badly stale one.
+
+An update that scored zero consumes no slot. That is the whole point of scoring
+on displacement: an entity whose client copy is already correct has nothing to
+say. Under it, a still world sends nothing at all.
+
+Starvation is structural rather than tuned, given one constraint on the weight
+table: every band inside the view radius must carry a non-zero weight. `Weights`
+refuses a zero.
+
+### Packet budget
+
+`PacketBudget` turns a connection's declared payload size into the record count
+selection is given. Per-connection, built from what a client declared plus this
+protocol's overheads.
+
+The event reserve is a floor rather than a subtraction:
+`state = payload - header - min(pending, reserve)`. Measured against the default
+config, 98 records fit an idle packet and 77 under a backlog at or past the
+reserve.
+
+### Simulation and viewers
+
+`WorldSimulation` owns positions, liveness, the odometer, the snapshot and
+per-viewer state, and calls a consumer's `Game` once per tick. `Step` hands the
+game mutable position slices, spawn and despawn.
+
+Registration is logical. `register_viewer(avatar, ClientLimits)` names the
+entity a client controls and what its connection declared; nothing in the
+simulation sees a socket. Viewer ids are reusable, unlike entity ids, because a
+recycled viewer is a different client with an empty ghost set and there is
+nothing for a stale reference to alias.
+
+`TickStats` counts viewers served, candidates gathered, records sent, first
+sightings and departures, which covers part of §Still to instrument.
+
+Not built: `run` and its clock, threading, packet assembly, events.
+
 ---
 
-## The priority accumulator (not built)
+## The priority accumulator
 
 ### Origin
 
@@ -671,19 +844,45 @@ physically drifted across it.
 This does not indict TRIBES. Two things visible in the paper make it a non-issue
 there: the state mask means idle objects are not in the update list at all, and a
 32-player match does not oversubscribe a packet. Computed at our default config,
-a viewer gathers roughly 95 candidates against 74 record slots when idle and 58
-under a full event backlog, so 1.3x to 1.6x oversubscribed in the calm uniform
-case, before any crowding. (An earlier
-version of this document said 185 and 3.2x. 185 is the number *examined*; about
-half fail the radius test.)
+a viewer gathers roughly 95 candidates against 98 record slots when idle and 77
+under a full event backlog, so the calm uniform case is not oversubscribed at all
+and reaches only 1.2x under a full backlog. The budget binds under crowding.
+(Two earlier versions of this document were wrong here. One said 185 candidates
+and 3.2x; 185 is the number *examined* and about half fail the radius test. The
+other said 74 and 58 slots, which are 16-byte-record figures against a measured
+12-byte record.)
+
+### Decided: the score is accumulated position error
+
+Not built. This records the decision and the shape intended, not an
+implementation.
+
+Score is `drift x weight(distance band)`, where `drift` is the odometer
+difference since this client was last told about the entity and `weight` is a
+table indexed by `dist_sq.raw().ilog2()`. One multiply, no divide, no square
+root, integer throughout, so replay stays bit-identical. Ties break on
+`EntityId`.
+
+The alternative was elapsed time since last send, which needs no per-entity
+storage. Rejected because a still entity's score grows without bound under it.
+Computed from the assumption that the curve is fair across candidates, and
+unverified, idle entities would then take slots in proportion to their share of
+the candidate set. Rejected also because the growth curve would be tuned against
+a proxy with no error signal feeding back. See §Odometer.
+
+The weight table itself is not decided; that is open question 2.
 
 ### Open questions
 
-1. **Where per-(viewer, entity) state lives.** Measured: 10k viewers times ~95
+1. ~~**Where per-(viewer, entity) state lives.**~~ Decided: `GhostTable`, one
+   open-addressed table per viewer keyed by entity id, bounded by the ghost cap
+   rather than by the candidate set. Measured: 10k viewers times ~95
    candidates is ~950k pairs per tick. Keying off the replication set rather than
    the subscription set bounds it, since an entity only needs a score once it is
-   a live candidate. Ascending-by-id cells make reconciling this tick's
-   candidates against last tick's scores a merge rather than a lookup per entity.
+   a live candidate. An earlier revision expected the ascending-by-id cell
+   ordering to make the reconcile a merge rather than a lookup per entity. The
+   distance-ordered walk means candidates no longer arrive id-sorted, which
+   §Snapshot predicted when the cap was proposed.
 2. **The growth curve.** What function makes a distant entity update at a rate
    that looks right to a human rather than merely being cheap. Tuning against
    perception, not a derivation.
@@ -1071,26 +1270,192 @@ Correctness at a ragged population is tested rather than assumed: cell size,
 `sub_axis`, and `cell_shift` are all powers of two, so a 10,000 crowd exercises
 partial sub-cells, uneven thread chunking, and caps that do not divide evenly.
 
+### Odometer benchmark, measured
+
+Apple M1, 8 cores, single-threaded. **Not the machine the figures above were
+taken on.** Cross-machine comparison with them is not valid.
+
+Every slot live:
+
+| slots | per call | per slot | of a 50 ms tick |
+|---|---|---|---|
+| 10,000 | 22.87 µs | 2.29 ns | 0.046% |
+| 50,000 | 115.03 µs | 2.30 ns | 0.23% |
+| 100,000 | 231.10 µs | 2.31 ns | 0.46% |
+
+Flat across an order of magnitude. Computed: the working set is 28 bytes per
+slot, so 2.8 MB at 100,000, which still fits the 4 MB this machine's
+`hw.l2cachesize` reports. A cliff should appear past roughly 140,000 slots.
+Predicted from that figure alone, not run, and the M1 memory hierarchy has a
+system-level cache behind L2 that this ignores.
+
+Dead slots, at 50,000 slots:
+
+| live | dead | per call | vs all live |
+|---|---|---|---|
+| 50,000 | 0 | 115.54 µs | 1.00x |
+| 25,000 | 25,000 | 72.91 µs | 0.63x |
+| 12,500 | 37,500 | 52.55 µs | 0.45x |
+
+Computed from the first two rows: a live slot costs 2.31 ns and a dead one
+0.61 ns, about 26%. The third row checks to within 2%. This is the first number
+on the §Open items concern that a long-running region pays for slots ever
+allocated rather than entities alive. Computed, at a 20:1 dead-to-live ratio one
+live slot at 2.31 ns and twenty dead at 0.61 ns total 14.51 ns against 2.31 ns of
+useful work, so the pass costs 6.3 times what it accomplishes.
+
+Positions are held fixed across timed calls. Displacement values do not change
+the instruction path, so this measures the pass and not an idle population.
+
+Same machine and session, for the ratio: `gather/uniform/10000` measures
+7.139 ms with 95.3 candidates per viewer, against 9.38 ms and 95 on the Core
+i7-6700, so the M1 runs the same work about 1.3x faster at 95.3 candidates
+against the recorded 95. At the gather benchmark's own 8,192 entities the
+odometer is 0.26% of
+the gather, 1.88 ns per viewer against 714 ns. Computed: the 8,192 odometer
+figure is interpolated from 2.29 ns per slot. The ratio improves as viewers
+grow, since only the gather scales with viewer count.
+
+### Whole-pipeline benchmark, measured
+
+Apple M1, 8 cores, single-threaded, against a 50 ms tick. **Not the machine the
+subscription and gather figures were taken on.**
+
+The per-tick work every row also pays, with no viewers registered, is 60 µs at
+8,192 entities: 0.12% of a tick. Essentially all cost is per-viewer.
+
+| scenario | viewers | tick | of a tick | per viewer |
+|---|---|---|---|---|
+| uniform | 1,000 | 2.51 ms | 5% | 2.45 µs |
+| uniform | 8,192 | 20.55 ms | 41% | 2.50 µs |
+| same world, nothing moving | 8,192 | 13.20 ms | 26% | 1.60 µs |
+| clustered region | 1,000 | 6.81 ms | 14% | 6.75 µs |
+| clustered region | 10,000 | 65.44 ms | 131% | 6.54 µs |
+| town square | 2,048 | 11.23 ms | 22% | 5.45 µs |
+| town square | 8,192 | 49.73 ms | 99% | 6.06 µs |
+
+The clustered rows are the region-in-use case §Not yet benchmarked asked for:
+50,000 entities, most cells sparse and eight dense ones holding sixty percent,
+viewers drawn from the population so they land where the density is. It behaves
+like a mild town square rather than like the uniform case.
+
+**What the accumulator saves**, measured: the same world and the same viewers
+cost 13.20 ms when nothing moves against 20.55 ms when everything does, and the
+still case sends no records at all.
+
+Every earlier figure for this pipeline was assembled by adding separately
+measured stages, two of them by subtraction. Those estimates were 55% optimistic
+uniform and, before the fix below, wrong by 4.2x crowded.
+
+### Measured: choosing the ghost set by staleness churns it
+
+The first whole-pipeline run found the ghost set thrashing wherever the cap
+bound. Measured, 8,192 viewers in one cell, 581 candidates each:
+
+| ghost cap | records per viewer | of which first sightings | ghosts departed |
+|---|---|---|---|
+| 64 | 64.0 | 64.00 | 64.00 |
+| 128 | 98.0 | 98.00 | 98.00 |
+| 256 | 98.0 | 76.42 | 71.71 |
+| 512 | 98.0 | 0.89 | 1.15 |
+
+At a cap of 128 every record in every packet was a first sighting and 98 ghosts
+departed per viewer per tick: clients were told about entities, told to forget
+them, and told again, with no position update ever getting through. The uniform
+case, where the cap does not bind, showed none of it.
+
+Two causes, both in the first version of `select`:
+
+- An entity the client had never seen scored above every refresh. With more
+  candidates than ghost slots there is a permanent supply of unseen entities, so
+  the top `ghost_cap` were always strangers and every existing ghost fell below
+  the line.
+- The ghost set was chosen by score, which is staleness. Sending an entity
+  resets its drift to zero, so the entity just corrected became the least stale
+  and was dropped first.
+
+The fix is §Selection: distance chooses the set, drift chooses what to send, and
+an unseen entity scores finitely. Measured afterwards, every scenario reports no
+arrivals and no departures at steady state, and the crowded cases run 1.7x to
+2.5x faster:
+
+| scenario | before | after |
+|---|---|---|
+| uniform, 8,192 | 20.58 ms | 20.55 ms |
+| clustered, 10,000 | 114.10 ms | 65.44 ms |
+| town square, 2,048 | 24.26 ms | 11.23 ms |
+| town square, 8,192 | 123.84 ms | 49.73 ms |
+
+Uniform is unchanged because the cap never bound there.
+
+**This is the failure §Not yet benchmarked predicted**: "An entity that drops out
+and returns looks maximally stale and wins a slot immediately, so the least
+useful part of the visible set could generate the most updates." Nothing short
+of the whole pipeline could see it. An isolated benchmark of the ghost table
+measured a table at rest, and under the bug it was never at rest, so that
+benchmark's conclusion that a cap of 256 beat 512 by 2.5x was an artifact of a
+state the real pipeline never reached.
+
+### Ghost cap and walk cap, measured
+
+Both sweeps are the town square at 8,192 viewers, after the fix, with the gather
+sized to the ghost cap.
+
+| ghost cap | tick | per viewer |
+|---|---|---|
+| 64 | 17.74 ms | 2.16 µs |
+| 128 | 28.27 ms | 3.44 µs |
+| 256 | 48.21 ms | 5.88 µs |
+| 512 | 96.26 ms | 11.75 µs |
+
+Monotone and close to linear in the cap, which it was not before the fix. The
+cap is a dial between cost and how many entities a client can see.
+
+Selection keeps the nearest `ghost_cap` candidates and discards the rest
+unscored, so a walk cap above the ghost cap is waste. At a ghost cap of 256:
+
+| walk cap | candidates gathered | tick |
+|---|---|---|
+| 256 | 322.8 | 44.54 ms |
+| 512 | 581.3 | 48.29 ms |
+| 1,024 | 1,094.0 | 57.22 ms |
+
+7.8% for matching them, and one fewer parameter. Safe because the cap is checked
+at cell boundaries, so a walk cap of 256 still delivers ~323 candidates and
+fills the set. `DEFAULT_WALK_CAP` is now `DEFAULT_GHOST_CAP`.
+
+The overshoot is bounded by the subdivision threshold, not by a sub-cell: a cell
+below the threshold is walked whole. A gather buffer must be sized
+`walk_cap + sub_threshold` or it grows inside a tick.
+
 ### Still to instrument
 
-Entities dropped by budget, per-client bytes per tick, subscription churn rate,
-p99 tick duration, and `DiscoveredEntities::capacity()` after warmup.
+`TickStats` now counts viewers served, candidates gathered, records sent, first
+sightings and departures per tick, so entities dropped by budget is covered and
+arrivals and departures are visible.
+
+Left: per-client bytes per tick, subscription churn rate, p99 tick duration, and
+`DiscoveredEntities::capacity()` after warmup.
 
 ### Not yet benchmarked
 
-**Boundary churn.** Entities sitting near the cap edge move in and out of a
-viewer's candidate set as the viewer shifts. Measurable now without the
-accumulator: count entities entering and leaving a capped candidate set per tick,
-as a function of viewer speed and crowd density.
+**Boundary churn.** ~~Measurable now without the accumulator.~~ Measured, and it
+was a bug rather than a cost: see §Measured: choosing the ghost set by staleness
+churns it. The prediction that a returning entity "looks maximally stale and
+wins a slot immediately" was exactly right, and the pipeline benchmark is the
+only thing that could see it.
 
-The interaction that matters arrives with the accumulator. An entity that drops
-out and returns looks maximally stale and wins a slot immediately, so the least
-useful part of the visible set could generate the most updates. Neither mechanism
-shows this alone.
+What remains unmeasured is churn under a *moving* viewer. The pipeline benchmark
+oscillates entities in place so a population shape survives thousands of
+iterations, which holds distances nearly constant and understates how often
+entities cross a view radius. A viewer walking through a crowd is the case that
+would exercise `grace`, and nothing does yet.
 
-**A whole tick over a populated region.** Every benchmark so far measures one
-population shape in isolation: uniform everywhere, or the entire population in
-one cell. Neither is a region in use.
+**A whole tick over a populated region.** ~~Every benchmark so far measures one
+population shape in isolation.~~ Built and measured: see the clustered rows of
+§Whole-pipeline benchmark. What follows in this section is the reasoning that
+motivated it, kept because the question it asks about cache behaviour is still
+open.
 
 The world is sharded, one sim process per region, so this is a smaller question
 than it first appears. A snapshot is bounded by entities per region, not per
@@ -1121,9 +1486,9 @@ and cell count together rather than one at a time.
 2. ~~Snapshot, cell ordering, gather pass~~ (done)
 3. ~~Gather benchmark: uniform and single hot cell~~ (done)
 4. ~~Sub-cell subdivision, distance-ordered walk, walk cap~~ (done)
-5. Priority accumulator and budget selection (next)
-6. `WorldSimulation`, the game hook trait, and a minimal `herd` game step
-   (movement, health; nothing else)
+5. ~~Priority accumulator and budget selection~~ (done)
+6. `WorldSimulation` and the game hook trait (done); a minimal `herd` game step
+   (movement, health; nothing else) is next
 7. Bot harness with adversarial movement patterns
 8. `SimulatorEdge` and the sim-to-edge protocol
 9. Checkpoint path (full-fidelity, distinct from the wire payload)
@@ -1239,15 +1604,26 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   Word-level skipping in `LiveSet` would cut that to one test per 64 dead slots;
   not built, not measured.
 - `CellSnapshot` has no id-to-slot lookup, so nothing can answer "where is entity
-  N." Needed to locate a client's own avatar and to route an event to a specific
-  entity. The cheap fix is one array of length n written during the scatter,
-  where the writes are sequential.
+  N." Still needed to locate a client's own avatar and to route an event to a
+  specific entity. The replication path no longer needs it: `DiscoveredEntity`
+  carries the snapshot index and `CellSnapshot::pos_at` resolves it. The cheap
+  fix for the remaining cases is one array of length n written during the
+  scatter, where the writes are sequential.
 - Per-client state (subscription, accumulator scores, send cadence) belongs to
   `WorldSimulation`. Client registration is the API that does not exist yet:
   something has to say a connection exists, name its avatar entity, and attach a
   the edge. Deferred deliberately; it belongs with the accumulator, since
   that is what gives per-client state its shape. Event delivery is blocked on the
   same API.
+- **A ghost's mark advances on send rather than on acknowledgement**, so a lost
+  packet leaves a client's copy of a since-idle entity permanently wrong. There
+  is no protocol to acknowledge against yet. Fixing it needs a pending mark
+  beside the acknowledged one, growing a ghost record from 12 bytes to 16.
+- Per-viewer work is single-threaded. The loop is shaped for chunking, and
+  viewers are not padded to a cache line, so a partition must be cut on a
+  boundary that keeps two threads off one line.
+- `WorldSimulation` has no `run`. The clock and the pinned thread belong with
+  the edge work.
 - `Mul`/`Div` rounding disagree for negative values.
 - `protocol_hash` could send raw field values instead of a digest, which is certain rather
   than near-certain, and names the offending field.

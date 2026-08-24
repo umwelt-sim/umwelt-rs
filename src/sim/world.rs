@@ -148,6 +148,14 @@ pub struct TickStats {
     pub departed: u64,
     /// Despawn records actually written, which lag departures by a tick.
     pub despawns_sent: u64,
+    /// Viewers whose subscription box moved this tick.
+    ///
+    /// A box is the cells within `cell_radius` of the viewer's own cell, so it
+    /// only moves when the viewer crosses a cell boundary. Against
+    /// [`viewers`](Self::viewers) it is the share of served viewers that
+    /// changed which cells they subscribe to, which is what a cross-region or
+    /// edge-side subscription protocol would have to carry.
+    pub subs_changed: u64,
     /// Payload bytes assembled.
     pub bytes: u64,
     /// Nanoseconds spent inside [`PayloadSink::send`], summed across workers.
@@ -175,6 +183,7 @@ impl TickStats {
         self.new_ghosts += o.new_ghosts;
         self.departed += o.departed;
         self.despawns_sent += o.despawns_sent;
+        self.subs_changed += o.subs_changed;
         self.bytes += o.bytes;
         self.sink_nanos += o.sink_nanos;
     }
@@ -233,6 +242,11 @@ fn serve<S: PayloadSink>(
     }
 
     let sub = Subscription::at_center(f.cfg, f.cfg.cell_of(at.horizontal()));
+    // A box only moves when its viewer crosses a cell boundary, so this counts
+    // crossings rather than motion.
+    if v.sub != Some(sub) {
+        w.stats.subs_changed += 1;
+    }
     v.sub = Some(sub);
 
     w.found.clear();
@@ -1143,6 +1157,28 @@ mod tests {
         assert_eq!(s.workers.len(), 1);
         s.set_thread_count(6);
         assert_eq!(s.workers.len(), 6);
+    }
+
+    #[test]
+    fn a_subscription_changes_only_when_its_viewer_crosses_a_cell() {
+        // A one meter step, against a cell that is many meters across.
+        let mut s = sim(Walk::new(1));
+        let ids = populate(&mut s, 60);
+        s.register_viewer(ids[0], ClientLimits::default());
+
+        let first = s.tick();
+        assert_eq!(first.viewers, 1, "the viewer is served");
+        assert_eq!(first.subs_changed, 1, "its first subscription is a change from none");
+
+        let cell = s.config().cell_size().floor_meters();
+        let mut crossings = 0;
+        for _ in 0..cell {
+            crossings += s.tick().subs_changed;
+        }
+        assert!(
+            crossings > 0 && crossings <= 2,
+            "walking {cell} m at a meter a tick leaves a {cell} m cell once, not {crossings} times"
+        );
     }
 
     #[test]

@@ -1841,6 +1841,46 @@ Percentiles come from quarter-octave buckets, so each is the upper edge of the
 bucket holding it rather than an interpolated value. The 14.34 against 16.38 row
 is one bucket apart and may be no difference at all.
 
+### A game on top, measured
+
+`herd`, the companion load generator, is the first consumer to drive umwelt
+through its public API, and the first thing outside a unit test to despawn
+anything. What it runs is movement toward attractors with a dwell, a gather and
+disperse cycle, crowding damage, a lifespan, and a spawner.
+
+50,000 entities, 8,192 clients, paced at 20 Hz by `run`, one minute:
+
+| | |
+|---|---|
+| tick work | p50 16.38 ms, p99 20.48 ms, worst 39.22 ms of 50 ms |
+| ticks over budget | 0 of 1,200 |
+| ticks started late | 0 of 1,200 |
+| duty | 33% |
+| candidates per viewer | 290 |
+| records per packet | 97.8 of 98 |
+| despawn records per packet | 1.1 to 1.5 |
+| subscriptions changed | 0.23% of viewers served, about 18 a tick |
+| deaths | 21.5 a second, population held at 50,000 |
+| fullest cell | 3,157 at its peak |
+
+The figures a consumer sees agree with the ones the benchmarks report against
+hand-built fixtures: 290 candidates against 268 for the clustered fixture and
+323 for the town square, and 97.8 records against 98.0.
+
+**The despawn path carries load for the first time.** Between one and one and a
+half despawn records ride every packet, from ghosts aging out of a set and from
+entities dying.
+
+**Subscription churn is small**: 18 of 8,192 viewers cross a cell boundary in a
+tick. Most viewers are residents standing in a crowd, and a cell is 128 m
+across, so only the fast classes cross often. Whatever an edge-side or
+cross-region subscription protocol has to carry, it is not a flood.
+
+**Slots ever allocated reach 51,290 after one minute** and climb at the death
+rate, which at these settings is about 75,000 an hour on top of the 50,000 the
+region started with. Every tick walks all of them. That is the open item about
+slot reuse, with a number.
+
 ### Moving viewers, measured
 
 What a viewer's own motion costs the tick. Every other row in this file stands
@@ -2062,10 +2102,14 @@ arrivals and departures are visible.
 
 Per-client bytes per tick is covered too, now that payloads are assembled.
 
-~~Left: subscription churn rate and p99 tick duration.~~ Tick duration is
-covered: `run` times every tick and hands it to the loop's observer in a
+~~Left: subscription churn rate and p99 tick duration.~~ Both are covered. Tick
+duration: `run` times every tick and hands it to the loop's observer in a
 `TickReport`, and percentiles are the caller's since holding a histogram is a
-presentation decision. Left: subscription churn rate.
+presentation decision. Subscription churn: `TickStats::subs_changed` counts the
+viewers whose box moved, which is the viewers that crossed a cell boundary,
+since a box is defined by the cell its viewer is in.
+
+Nothing on this list is left.
 
 ### Not yet benchmarked
 
@@ -2231,6 +2275,19 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 
 ## Open items
 
+- **`Step::positions_mut` borrows the whole `Step`**, so nothing else on it is
+  reachable while the position slices are held. A game that reads liveness while
+  moving entities has to clone the `LiveSet` first, which `herd` does every
+  tick. Handing back the liveness reference alongside the slices would fix it.
+- **`WorldSimulation` reports `entity_count`, which is live entities, and has no
+  accessor for slots ever allocated.** That is the number the slot reuse item
+  above is about, and a consumer currently measures it from the length of its
+  own parallel arrays.
+- **`TickStats::merge` is private**, so a consumer accumulating across ticks
+  writes the summation again. It should be `AddAssign` and `Sum`: summing worker
+  stats within a tick and summing tick stats across a run are the same
+  operation. `sink_nanos` is not an obstacle, since it is already a sum across
+  workers and its doc comment already says to divide by the worker count.
 - **A comfortable concurrent-player count per cell has to be published, and is
   not.** A consumer sizing a region, a cell, or a shard has no number from this
   library to plan against, and today the only way to get one is to read the

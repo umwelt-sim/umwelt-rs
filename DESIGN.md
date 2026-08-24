@@ -1108,11 +1108,21 @@ oversubscribed the ghost set is.** See §Quality harness, measured.
 
 ### What the accumulator does not fix
 
-It caps what is sent, not what is examined. If 5,000 entities pile into one cell,
-every nearby viewer still touches all 5,000 to decide which ~58 fit. Gather cost
-remains unbounded under crowding. If the benchmark shows that is fatal, the
-answer is hierarchical: an aggregate representation per cell so a distant crowd
-costs one record instead of thousands.
+It caps what is sent, not what is examined. ~~If 5,000 entities pile into one
+cell, every nearby viewer still touches all 5,000 to decide which ~58 fit.
+Gather cost remains unbounded under crowding.~~ The walk cap fixes that, and it
+is a separate mechanism from the accumulator: the gather stops after `walk_cap`
+candidates, checked at cell boundaries, so the overshoot is bounded by the
+subdivision threshold rather than by the size of the crowd. **Measured: 8,192
+entities in one cell deliver 322.8 candidates to a viewer, not 8,192.** See
+§Walk cap and sub-cell subdivision.
+
+What remains unfixed is a different thing, and it is about what a client is
+shown rather than what a tick costs. Every entity inside the cap is an
+individual record, so a viewer facing a crowd larger than its ghost set is told
+about the nearest few hundred and nothing about the rest. The answer to that is
+hierarchical, an aggregate representation per cell so a distant crowd costs one
+record instead of thousands, and it is not built.
 
 ---
 
@@ -1122,6 +1132,13 @@ costs one record instead of thousands.
 table gives no percentage, divide. Several tables below are over budget on
 purpose, because a cap or a crowd size is being pushed until it breaks; a table
 that is over budget by accident is a bug in the table.
+
+**Every figure here was taken on a working desktop, not a quiet machine.** The
+same laptop is running chat clients, browser windows and terminal sessions while
+it measures. Medians and the shape of a curve survive that; a lone outlier
+usually belongs to the machine rather than to the code, and no figure here is a
+clean-room number. A server-class result needs a server with nothing else on it,
+which nothing here has been run on.
 
 **Whole-tick figures taken before payload assembly understate a tick.** A tick
 now encodes ~98 records per viewer and hands them to a sink, work that did not
@@ -1806,9 +1823,16 @@ Cold memory is ruled out by the population control above; frequency ramp and cor
 choice are not separated, and doing so needs affinity tooling this project does
 not have.
 
+**Confirmed under load.** With 8,192 viewers registered, which is 33% duty, the
+same three modes measure p50 12.29 ms free-running, 14.34 ms holding the core
+and 16.38 ms sleeping. The penalty falls from 4x to 1.3x, which is what the duty
+table above predicts, and holding the core recovers only half of it: `Wait::Hold`
+holds the thread that runs the loop, and a busy tick's work is done by scoped
+workers that are new every tick and start as cold as the schedule left them.
+
 Two things follow. Under the load a region is meant to carry the effect is
-already gone by 29% duty, and 8,192 viewers is around a quarter of a tick, so
-this is a lightly-loaded-server problem rather than a tick problem. And it
+mostly gone, so this is a lightly-loaded-server problem rather than a tick
+problem. And it
 settles how to read every other table here: criterion runs iterations back to
 back at full duty, so these figures are the busy case, which is the right case
 for capacity planning and the wrong one for guessing what an idle region costs.
@@ -2038,7 +2062,10 @@ arrivals and departures are visible.
 
 Per-client bytes per tick is covered too, now that payloads are assembled.
 
-Left: subscription churn rate and p99 tick duration.
+~~Left: subscription churn rate and p99 tick duration.~~ Tick duration is
+covered: `run` times every tick and hands it to the loop's observer in a
+`TickReport`, and percentiles are the caller's since holding a histogram is a
+presentation decision. Left: subscription churn rate.
 
 ### Not yet benchmarked
 

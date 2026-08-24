@@ -32,9 +32,15 @@ pub enum Wait {
     Sleep,
     /// Hold the core for the whole interval.
     ///
-    /// Costs a core and buys back what idling takes from one. Measured at 4x on
-    /// an idle region and nothing on a busy one, so this is for a consumer that
-    /// has measured that it needs it.
+    /// Costs a core and buys back some of what idling takes from one. Measured
+    /// at 4x on an idle region and 1.3x on a busy one, so this is for a
+    /// consumer that has measured that it needs it.
+    ///
+    /// It holds the thread that runs the loop, and that is the only one it
+    /// holds. Workers are scoped to a tick, so a busy region's replication
+    /// threads are new each time and start as cold as the schedule left them:
+    /// measured under load, holding recovers about half of what sleeping gives
+    /// away.
     Hold,
     /// Do not wait. Ticks run back to back, which is throughput rather than a
     /// schedule.

@@ -1073,6 +1073,20 @@ costs one record instead of thousands.
 
 ## Benchmark results
 
+**Read every tick figure here against the 50 ms a 20 Hz tick has.** Where a
+table gives no percentage, divide. Several tables below are over budget on
+purpose, because a cap or a crowd size is being pushed until it breaks; a table
+that is over budget by accident is a bug in the table.
+
+**Whole-tick figures taken before payload assembly understate a tick.** A tick
+now encodes ~98 records per viewer and hands them to a sink, work that did not
+exist when the earliest pipeline tables were taken. Measured against a rerun of
+the same scenarios, the gap is 0.39 µs per viewer on the uniform region and 0.27
+on the town square. §Thread scaling, measured has been rerun and carries the
+current numbers; §Whole-pipeline benchmark and §Ghost cap and walk cap have not,
+and their absolute figures are low by about that much. Their shapes are
+unaffected, which is what those two tables are for.
+
 Core i7-6700 (4 cores / 8 threads, Skylake, 8 MB L3), 64 GB. Single-threaded.
 Per-viewer figures are median time divided by N. Columns are cumulative.
 Measured.
@@ -1678,6 +1692,69 @@ Every earlier figure for this pipeline was assembled by adding separately
 measured stages, two of them by subtraction. Those estimates were 55% optimiztic
 uniform and, before the fix below, wrong by 4.2x crowded.
 
+### Moving viewers, measured
+
+What a viewer's own motion costs the tick. Every other row in this file stands
+its viewers still, oscillating them by a meter, so a ghost set holds and nothing
+churns.
+
+50,000 entities spread evenly, **8,192 viewers**, walk cap and ghost cap at the
+defaults. A uniform population holds candidate counts constant at ~280 across
+every row, so what changes between rows is which entities are in a set rather
+than how many. **The `crowd` rows are the control**: they travel the same number
+of entities at the same speed, drawn disjoint from the viewers, so the world
+carries the same motion while every viewer stands still.
+
+At the default thread count, which is the configuration that has to fit a 50 ms
+tick and does:
+
+| row | first sightings per viewer | records per packet | tick | of a tick | per viewer | vs still |
+|---|---|---|---|---|---|---|
+| still | 0.00 | 98.0 | 14.03 ms | 28% | 1.71 µs | |
+| viewers at 2 m/s | 0.18 | 97.9 | 14.26 ms | 29% | 1.74 µs | +1.7% |
+| viewers at 6 m/s | 0.57 | 97.9 | 14.20 ms | 28% | 1.73 µs | +1.3% |
+| viewers at 30 m/s | 1.92 | 97.5 | 14.34 ms | 29% | 1.75 µs | +2.2% |
+| viewers at 60 m/s | 4.25 | 96.9 | 14.42 ms | 29% | 1.76 µs | +2.8% |
+| crowd at 30 m/s | 0.45 | 98.0 | 14.15 ms | 28% | 1.73 µs | +0.9% |
+| crowd at 60 m/s | 0.86 | 97.9 | 14.28 ms | 29% | 1.74 µs | +1.8% |
+
+Confidence intervals here are 1.2 to 2.1% wide, which is the same size as the
+differences between neighboring rows. The same sweep on one thread resolves them
+four times more finely, at the cost of being over budget: **8,192 viewers on
+this population do not fit a tick on one core, which is what the threads are
+for.**
+
+| row | tick | of a tick | per viewer | vs still |
+|---|---|---|---|---|
+| still | 54.49 ms | 109% | 6.65 µs | |
+| viewers at 2 m/s | 55.28 ms | 111% | 6.75 µs | +1.4% |
+| viewers at 6 m/s | 55.82 ms | 112% | 6.81 µs | +2.4% |
+| viewers at 30 m/s | 56.64 ms | 113% | 6.91 µs | +3.9% |
+| viewers at 60 m/s | 57.46 ms | 115% | 7.01 µs | +5.4% |
+| crowd at 30 m/s | 55.88 ms | 112% | 6.82 µs | +2.5% |
+| crowd at 60 m/s | 55.93 ms | 112% | 6.83 µs | +2.6% |
+
+**A viewer crossing a crowd at 30 m/s costs 2.2% of a tick at the default thread
+count, and most of that is not the viewer.** The control puts 0.9 points of it
+on the world's extra motion, leaving 1.3 for the viewer's own. One thread agrees
+within noise: 3.9% total against a 2.5% control, leaving 1.4. **Two configurations
+that differ four-fold in absolute cost agree on the viewer's own share to within
+a tenth of a point**, which is the reason to trust it.
+
+Against the churn it buys, on one thread, that share is 63 ns per extra first
+sighting and departure at 30 m/s and 55 ns at 60. The marginal cost falls as
+churn rises, so part of it is a fixed cost of the subscription box moving rather
+than a per-ghost one.
+
+**Churn is not only the viewer's doing.** A viewer standing perfectly still in a
+world where one entity in six travels at 30 m/s still takes 0.45 first sightings
+per packet. It is entities crossing its ghost set's edge either way, and the
+accumulator cannot tell which side moved.
+
+The bandwidth cost is visible in the same table: records per packet fall from
+98.0 to 96.9 as departures take despawn bytes out of the payload. Four
+departures is 16 bytes, which is 1.3 records at the default codec.
+
 ### Measured: choosing the ghost set by staleness churns it
 
 The first whole-pipeline run found the ghost set thrashing wherever the cap
@@ -1740,16 +1817,31 @@ because the right number is not obvious.
 
 Apple M1, four performance and four efficiency cores, 8,192 viewers:
 
-| threads | uniform | speedup | town square | speedup |
-|---|---|---|---|---|
-| 1 | 21.83 ms | 1.00x | 52.19 ms | 1.00x |
-| 2 | 11.43 ms | 1.91x | 28.71 ms | 1.82x |
-| 4 | 6.31 ms | 3.46x | 14.42 ms | 3.62x |
-| 8 | 5.23 ms | 4.17x | 13.03 ms | 4.01x |
+| threads | uniform | of a tick | speedup | town square | of a tick | speedup |
+|---|---|---|---|---|---|---|
+| 1 | 25.05 ms | 50% | 1.00x | 54.44 ms | 109% | 1.00x |
+| 2 | 13.12 ms | 26% | 1.91x | 28.28 ms | 57% | 1.93x |
+| 4 | 7.08 ms | 14% | 3.54x | 15.48 ms | 31% | 3.52x |
+| 8 | 6.15 ms | 12% | 4.07x | 13.36 ms | 27% | 4.08x |
 
-The town square goes from 104% of a 50 ms tick to 26%. Four to eight threads
-buys 17% to 21%, which is what heterogeneous cores predict and why the count is
+The town square goes from 109% of a 50 ms tick to 27%. Four to eight threads
+buys 13% to 16%, which is what heterogeneous cores predict and why the count is
 configurable.
+
+**Corrected: this table used to read 21.83 and 52.19 ms at one thread and 5.23
+and 13.03 at eight.** Rerun, the same scenarios measure **0.39 µs per viewer
+more on the uniform region and 0.27 more on the town square**, or 3.22 and
+2.25 ms at one thread.
+
+That gap is measured; what it is spent on is inferred. The work that landed
+between the two runs is payload assembly and the sink call, which a tick did not
+do when the old rows were taken, and ~98 record encodes plus a dispatch per
+viewer is the right size for it. Corroborating rather than isolating: the
+figures elsewhere in this document taken *after* assembly agree with the rows
+above, 6.02 ms against 6.15 for the uniform eight-thread case; see §Payloads
+leave through a sink. **Nothing regressed between those two measurements**, and
+an A/B rules out this tuning as a cause: at a grace of 3 rather than 1 the same
+rows measure 25.04, 13.14, 7.09 and 6.08 ms, which is no change at all.
 
 The whole pipeline scales as well as the gather alone did at 3.53x and 4.32x on
 this machine, so the earlier practice of extrapolating the gather's figure to
@@ -1832,10 +1924,11 @@ band. It holds no ghost at all for 1.5% of its ghost-set-tick pairs, against
 0.2% for a walking viewer.
 That is the case `grace` exists for, and it is the one with an interior optimum.
 
-What remains unmeasured is the *cost* of that churn. The pipeline benchmark
-oscillates entities in place so a population shape survives thousands of
-iterations, which holds distances nearly constant, and its viewers do not move at
-all. Nothing puts a moving viewer on the tick-cost path.
+~~What remains unmeasured is the *cost* of that churn.~~ Measured, and small:
+2.2% of a tick at 30 m/s and 8,192 viewers, of which 0.9 points is the world's
+extra motion rather than the viewer's. See §Moving viewers, measured. The other pipeline rows still
+oscillate entities in place and stand their viewers still, which is what makes
+them stationary enough to compare across sessions.
 
 **A whole tick over a populated region.** ~~Every benchmark so far measures one
 population shape in isolation.~~ Built and measured: see the clustered rows of
@@ -1977,6 +2070,27 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 ---
 
 ## Open items
+
+- **A comfortable concurrent-player count per cell has to be published, and is
+  not.** A consumer sizing a region, a cell, or a shard has no number from this
+  library to plan against, and today the only way to get one is to read the
+  benchmark tables and do the arithmetic. That is the wrong thing to ask of
+  anyone.
+
+  It is not one number. What a cell can comfortably hold depends on how many
+  viewers are within view of it, the ghost cap, the packet budget, the tick rate
+  and the worker count, and the honest form is a small table or a formula over
+  those rather than a scalar. The pieces exist: per-viewer cost is roughly linear
+  in candidates gathered, the walk cap bounds candidates whatever the crowd does,
+  and §Whole-pipeline and §Ghost cap between them give the slope.
+
+  What is measured today is a data point, not guidance: the town square carries
+  8,192 entities in one cell with every one of them a viewer, at 27% of a 50 ms
+  tick on eight cores of an M1. **Guidance needs the curve either side of that,
+  on hardware a consumer might actually rent**, and it needs to say what
+  "comfortable" means, which is a headroom decision rather than a measurement.
+  Until then any number quoted from here is a benchmark result being mistaken
+  for a capacity limit.
 
 - **Decided: liveness mask.** `LiveSet` is a bitset parallel to the position
   arrays, one bit per slot. `CellSnapshot::update` consults it in both passes, so

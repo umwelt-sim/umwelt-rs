@@ -85,6 +85,68 @@ impl Game for Scenario {
     }
 }
 
+/// An oscillating population with a chosen few walking across it.
+///
+/// Every other scenario in this file stands its viewers still: they oscillate
+/// by a meter, so a ghost set holds from tick to tick and nothing churns. Here
+/// the entities that are viewers travel, each in its own direction, bouncing
+/// off the region edge. Their ghost sets turn over as they go, which is the
+/// cost this measures.
+struct Travelers {
+    inner: Scenario,
+    movers: Vec<u32>,
+    /// Per mover, `+1` or `-1` along y. Randomized, so movers move relative to
+    /// each other and not only relative to the crowd.
+    dir: Vec<i32>,
+    per_tick: i32,
+    lo: i32,
+    hi: i32,
+}
+
+impl Travelers {
+    fn new(
+        cfg: &WorldConfig,
+        positions: Vec<Pos3>,
+        step_m: i32,
+        movers: &[u32],
+        speed_m_per_sec: i32,
+        seed: u64,
+    ) -> Travelers {
+        let mut rng = Rng::new(seed);
+        let margin = Fixed::from_meters(8).raw();
+        Travelers {
+            inner: Scenario::new(positions, step_m),
+            movers: movers.to_vec(),
+            dir: movers.iter().map(|_| if rng.next_u64() & 1 == 0 { 1 } else { -1 }).collect(),
+            per_tick: Fixed::from_meters(speed_m_per_sec).raw() / cfg.tick_hz() as i32,
+            lo: margin,
+            hi: cfg.region_size().raw() - margin,
+        }
+    }
+}
+
+impl Game for Travelers {
+    fn step(&mut self, w: &mut Step<'_>) {
+        self.inner.step(w);
+        // Walked even at zero speed, so the still row pays the same scattered
+        // writes as a moving one and the difference between rows is motion
+        // rather than this loop.
+        let (_, ys, _) = w.positions_mut();
+        for (k, &e) in self.movers.iter().enumerate() {
+            let i = e as usize;
+            let mut y = ys[i].raw() + self.dir[k] * self.per_tick;
+            if y >= self.hi {
+                y = self.hi;
+                self.dir[k] = -1;
+            } else if y <= self.lo {
+                y = self.lo;
+                self.dir[k] = 1;
+            }
+            ys[i] = Fixed::from_raw(y);
+        }
+    }
+}
+
 /// Positions at least `margin` meters inside the region, so a meter of
 /// oscillation never leaves it.
 fn inside(cfg: &WorldConfig, rng: &mut Rng, margin: i32) -> Pos3 {
@@ -176,22 +238,45 @@ fn build(
     ghost_cap: usize,
     seed: u64,
 ) -> WorldSimulation<Scenario> {
-    let cfg = WorldConfig::default();
     let n = positions.len();
-    let mut sim =
-        WorldSimulation::with_replication(cfg, Scenario::new(positions, step_m), walk_cap, policy(ghost_cap));
+    let chosen = viewer_ids(n, viewers, seed);
+    build_with(Scenario::new(positions, step_m), n, &chosen, walk_cap, ghost_cap)
+}
 
-    // First tick spawns. Ids are assigned in order, so they are 0..n.
-    sim.tick();
-    assert_eq!(sim.entity_count(), n);
-
+/// The entity ids `build` registers, drawn before the game is constructed so a
+/// game that has to move the viewers can be told which ones they are. Taking a
+/// later slice of the same shuffle gives a disjoint set of the same size.
+fn shuffled_ids(n: usize, seed: u64) -> Vec<u32> {
     let mut rng = Rng::new(seed);
     let mut chosen: Vec<u32> = (0..n as u32).collect();
     for i in (1..chosen.len()).rev() {
         let j = (rng.next_u64() % (i as u64 + 1)) as usize;
         chosen.swap(i, j);
     }
-    for &e in chosen.iter().take(viewers) {
+    chosen
+}
+
+fn viewer_ids(n: usize, viewers: usize, seed: u64) -> Vec<u32> {
+    let mut chosen = shuffled_ids(n, seed);
+    chosen.truncate(viewers);
+    chosen
+}
+
+fn build_with<G: Game>(
+    game: G,
+    n: usize,
+    chosen: &[u32],
+    walk_cap: usize,
+    ghost_cap: usize,
+) -> WorldSimulation<G> {
+    let cfg = WorldConfig::default();
+    let mut sim = WorldSimulation::with_replication(cfg, game, walk_cap, policy(ghost_cap));
+
+    // First tick spawns. Ids are assigned in order, so they are 0..n.
+    sim.tick();
+    assert_eq!(sim.entity_count(), n);
+
+    for &e in chosen {
         sim.register_viewer(EntityId::from_raw(e), ClientLimits::default());
     }
 
@@ -202,7 +287,7 @@ fn build(
 }
 
 /// Prints what a scenario actually produces, so the timings can be read.
-fn describe(label: &str, sim: &mut WorldSimulation<Scenario>) {
+fn describe<G: Game>(label: &str, sim: &mut WorldSimulation<G>) {
     let s = sim.tick();
     let per = |x: u64| if s.viewers == 0 { 0.0 } else { x as f64 / s.viewers as f64 };
     println!(
@@ -311,6 +396,71 @@ fn bench_clustered(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(viewers), &viewers, |b, _| {
             b.iter(|| black_box(sim.tick()))
         });
+    }
+    group.finish();
+}
+
+/// What a viewer's own motion costs.
+///
+/// Every other row in this file measures a viewer standing still, where the
+/// ghost set holds and nothing churns. Here the entities that are viewers
+/// travel, so their sets turn over as they go.
+///
+/// 8,192 viewers, the count the rest of this file treats as the load a region
+/// has to carry. Run at both thread counts, because one thread is the precise
+/// instrument for an effect this size and the default is the configuration that
+/// has to fit a 50 ms tick.
+///
+/// The population is uniform on purpose: candidate counts hold constant across
+/// the rows, so what changes is which entities are in a set rather than how
+/// many. The `crowd` rows are the control. They move the same number of
+/// entities at the same speed, drawn disjoint from the viewers, so the world
+/// carries the same motion while every viewer stands still. What separates them
+/// from the `viewers` rows at the same speed is the viewer's own movement and
+/// nothing else.
+///
+/// `describe` prints first sightings and departures per viewer beside each row,
+/// which is the churn the timing should be read against.
+fn bench_viewer_speed(c: &mut Criterion) {
+    let cfg = WorldConfig::default();
+    let mut group = c.benchmark_group("pipeline/viewer_speed");
+    // The effect is a few percent, so this group buys resolution with samples
+    // rather than reading noise as a result.
+    group.sample_size(50);
+    group.measurement_time(std::time::Duration::from_secs(15));
+
+    const ENTITIES: usize = 50_000;
+    const VIEWERS: usize = 8_192;
+
+    let shuffled = shuffled_ids(ENTITIES, 0xF00D);
+    let viewers = &shuffled[..VIEWERS];
+    let crowd = &shuffled[VIEWERS..2 * VIEWERS];
+
+    let rows: [(&str, &[u32], i32); 7] = [
+        ("still", viewers, 0),
+        ("viewers/2", viewers, 2),
+        ("viewers/6", viewers, 6),
+        ("viewers/30", viewers, 30),
+        ("viewers/60", viewers, 60),
+        ("crowd/30", crowd, 30),
+        ("crowd/60", crowd, 60),
+    ];
+
+    let default_threads =
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    for &threads in &[1usize, default_threads] {
+        for &(label, movers, speed) in &rows {
+            let game =
+                Travelers::new(&cfg, uniform(&cfg, ENTITIES, 0xA11CE), 1, movers, speed, 0x5EED);
+            let mut sim = build_with(game, ENTITIES, viewers, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP);
+            sim.set_thread_count(threads);
+            let id = format!("{threads}t/{label}");
+            describe(&format!("viewer_speed/{id}"), &mut sim);
+            group.throughput(Throughput::Elements(VIEWERS as u64));
+            group.bench_with_input(BenchmarkId::from_parameter(&id), &id, |b, _| {
+                b.iter(|| black_box(sim.tick()))
+            });
+        }
     }
     group.finish();
 }
@@ -460,6 +610,7 @@ criterion_group!(
     bench_still_versus_moving,
     bench_town_square,
     bench_clustered,
+    bench_viewer_speed,
     bench_ghost_cap,
     bench_walk_cap,
     bench_threads,

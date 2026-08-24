@@ -154,6 +154,50 @@ achievable:
 Recording this now so nobody later promises preemptive cancellation the language
 cannot deliver.
 
+### Pacing the loop
+
+A `WorldConfig` carries `tick_hz`, so the library knows the rate and the library
+paces it. `run` is not built; this is what it has to do, written down before the
+code exists because a consumer already wrote the loop by hand and measuring it
+turned up something that changes the design. See §Idle costs speed, measured.
+
+**An absolute schedule against a monotonic clock.** The next deadline is
+`start + n * period`, never `now + period`. A relative sleep accumulates its own
+overshoot and the clock drifts; an absolute one does not.
+
+**Sleep short, then hold the core for the last stretch.** No timer is exact.
+Every platform's sleep overshoots by roughly its granularity, which is why game
+and audio loops sleep to within about a millisecond of the deadline and busy-wait
+the rest. This is a fix for timer granularity and nothing else; it does not
+address the state the core is in, which is a separate problem below.
+
+**Clamped catch-up.** A tick that overruns must not be made up by running extra
+ticks. That is the spiral of death: the loop falls behind, runs more steps to
+catch up, takes longer, falls further behind. The shipped options are to drop
+simulated ticks and say so, or to let simulated time dilate, which is what Eve
+Online does under fleet-fight load so that a tick keeps its shape rather than
+degrading unpredictably. Either is defensible; silently running extra ticks is
+not.
+
+**Report the schedule, not just the work.** How long a tick took and how late it
+started are different questions, and only the second says whether the machine is
+keeping up. Tick duration percentiles are also one of the two items §Still to
+instrument still lists, and they cannot live anywhere but the loop.
+
+**A hold-the-core mode, off by default.** Never yielding the core is what
+low-latency messaging does and it costs a full core per loop. It belongs behind a
+switch for someone who has measured that they need it, not in the default path.
+
+**What stays out of the crate.** Thread pinning, scheduling class, CPU governor,
+C-state limits and quality-of-service hints are per-deployment, are mostly kernel
+flags on Linux, and would need FFI here since there is no `unsafe` and no
+dependency in `src`. They belong in an operations note.
+
+**The real answer to an idle server is not to have one.** A host running one
+region at one percent duty is a misconfigured host. Operators pack zones per
+machine until the cores are busy, which is also what makes the measured idle
+penalty disappear.
+
 ### What umwelt stores
 
 **Rule: umwelt stores only what umwelt's own code reads.**
@@ -920,7 +964,8 @@ Viewers are partitioned across `thread_count` workers with scoped threads, and
 each worker holds its own gather, selection and packet buffers, so the only
 thing they share for writing is the cache line at a chunk boundary.
 
-Not built: `run` and its clock, and events.
+Not built: `run` and its clock, and events. §Pacing the loop is what the first
+of those has to do.
 
 ---
 
@@ -1711,6 +1756,67 @@ Every earlier figure for this pipeline was assembled by adding separately
 measured stages, two of them by subtraction. Those estimates were 55% optimiztic
 uniform and, before the fix below, wrong by 4.2x crowded.
 
+### Idle costs speed, measured
+
+Apple M1, macOS. `herd-sim` at 50,000 entities and no viewers, which is the
+per-tick floor: the game step, the odometer and the snapshot rebuild, on one
+thread, since umwelt spawns no workers when no viewer is registered. 200 ticks
+at 20 Hz. "Tick work" is time inside `tick`, excluding whatever the loop does
+between ticks.
+
+| how the loop waits | p50 | p99 | worst |
+|---|---|---|---|
+| no clock, back to back | 0.64 ms | 1.54 ms | 2.79 ms |
+| sleeps to the deadline | 2.56 ms | 4.10 ms | 4.71 ms |
+| holds the core to the deadline | 0.64 ms | 0.77 ms | 2.71 ms |
+| sleeps, then holds it for 3 ms | 2.56 ms | 4.10 ms | 15.49 ms |
+
+**The same work costs four times more when the loop sleeps between ticks.**
+Holding the core recovers it exactly. This is a property of the machine, not of
+the tick.
+
+It is not the working set going cold. Shrinking the population tenfold, to
+5,000 entities and a working set around 140 KB, leaves the ratio at 4.4x. What
+does move it is how busy each tick is:
+
+| entities | back to back | sleeping | ratio | share of a 50 ms tick worked |
+|---|---|---|---|---|
+| 50,000 | 0.64 ms | 2.56 ms | 4.0x | 1.3% |
+| 200,000 | 2.56 ms | 8.19 ms | 3.2x | 5% |
+| 500,000 | 7.17 ms | 14.34 ms | 2.0x | 14% |
+| 1,000,000 | 14.34 ms | 16.38 ms | ~1.1x | 29% |
+
+And a spin before the deadline only helps once it is a large fraction of the
+period, which is the signature of sustained utilization rather than of a warm-up
+that finishes quickly:
+
+| core held before the deadline | p50 |
+|---|---|
+| 0 ms | 2.56 ms |
+| 3 ms | 2.56 ms |
+| 10 ms | 2.05 ms |
+| 25 ms | 0.77 ms |
+| 45 ms | 0.64 ms |
+
+**Measured: the penalty is a function of duty cycle.** A thread awake one
+percent of the time is treated as one that does not need a fast core, and this
+machine has four performance cores and four efficiency ones for the scheduler to
+choose between. **Unverified: that the mechanism is specifically core placement.**
+Cold memory is ruled out by the population control above; frequency ramp and core
+choice are not separated, and doing so needs affinity tooling this project does
+not have.
+
+Two things follow. Under the load a region is meant to carry the effect is
+already gone by 29% duty, and 8,192 viewers is around a quarter of a tick, so
+this is a lightly-loaded-server problem rather than a tick problem. And it
+settles how to read every other table here: criterion runs iterations back to
+back at full duty, so these figures are the busy case, which is the right case
+for capacity planning and the wrong one for guessing what an idle region costs.
+
+Percentiles come from quarter-octave buckets, so each is the upper edge of the
+bucket holding it rather than an interpolated value. The 14.34 against 16.38 row
+is one bucket apart and may be no difference at all.
+
 ### Moving viewers, measured
 
 What a viewer's own motion costs the tick. Every other row in this file stands
@@ -2151,8 +2257,10 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 - Viewers are not padded to a cache line, so two workers share the line at each
   chunk boundary. A viewer is written twice per tick, so the contention is
   2(N-1) lines against ~10,000 writes. Not measured.
-- `WorldSimulation` has no `run`. The clock and the pinned thread belong with
-  the edge work.
+- `WorldSimulation` has no `run`, so a consumer writes the loop. What `run` has
+  to do is settled and recorded in §Pacing the loop, and the measurement that
+  shaped it is §Idle costs speed. Building it waits on the edge work only because
+  the thread that owns the clock is the one the edge will want.
 - **`grace` is in ticks but is only evaluated when a viewer is served**, since
   that is when its ghosts are stamped and aged. A grace below a client's send
   period therefore behaves as zero. Measured as harmless: per tick, the churn at
@@ -2193,5 +2301,11 @@ Do not cite these as fact.
   measurements.
 - That the accumulator mechanism belongs to the Torque/TNL lineage. Recollection
   only; that source has not been read.
+
+- What other engines do about tick pacing, in §Pacing the loop: the clamped
+  accumulator, Eve Online dilating simulated time under load, servers dropping
+  ticks and saying so. Recollection, not read back against a source. The
+  mechanisms are sound whether or not the attributions are exact, but do not
+  cite the attributions.
 - Whether rebuild or incremental maintenance of the cell ordering is faster under
   this load.

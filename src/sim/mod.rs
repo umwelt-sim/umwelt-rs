@@ -9,5 +9,5 @@ mod world;
 
 pub use viewer::{ClientLimits, ViewerId};
 pub use world::{
-    DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP, Game, Step, TickStats, WorldSimulation,
+    DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP, Game, Outbound, Step, TickStats, WorldSimulation,
 };

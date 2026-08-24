@@ -31,10 +31,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use umwelt::select::{BANDS, Policy, Weights};
-use umwelt::sim::{ClientLimits, DEFAULT_GRACE, Game, Step, WorldSimulation};
-use umwelt::{
-    DiscoveredEntities, EntityId, Fixed, Pos3, Selection, ViewerId, WorldConfig,
-};
+use umwelt::sim::{ClientLimits, DEFAULT_GRACE, Game, Outbound, Step, WorldSimulation};
+use umwelt::{EntityId, Fixed, Pos3, WorldConfig};
 
 /// Dense enough that a viewer's candidate set exceeds a packet, or there is no
 /// selection pressure and every curve behaves identically.
@@ -208,6 +206,7 @@ struct Observed {
     departed: Vec<EntityId>,
     /// Records for entities the client did not already hold.
     arrivals: u64,
+    bytes: u64,
 }
 
 /// Coarse separation bands for the per-distance report, in meters.
@@ -252,6 +251,7 @@ struct Metrics {
     sent_by_band: [u64; 4],
     records: u64,
     arrivals: u64,
+    bytes: u64,
     departures: u64,
     served: u64,
     never_told: u64,
@@ -320,6 +320,7 @@ impl Default for Metrics {
             sent_by_band: [0; 4],
             records: 0,
             arrivals: 0,
+            bytes: 0,
             departures: 0,
             served: 0,
             never_told: 0,
@@ -392,17 +393,20 @@ fn run(label: &'static str, weights: Weights, ghost_cap: usize) -> Run {
             o.sent.clear();
             o.departed.clear();
             o.arrivals = 0;
+            o.bytes = 0;
         }
 
-        let capture = |v: ViewerId, sel: &Selection, found: &DiscoveredEntities| {
-            let mut o = obs[v.index()].lock().unwrap();
-            o.candidates.extend(found.as_slice().iter().map(|e| e.id));
-            o.sent.extend(sel.records().iter().map(|r| {
-                let e = found.as_slice()[r.index()];
+        let capture = |out: Outbound<'_>| {
+            let cands = out.candidates.as_slice();
+            let mut o = obs[out.viewer.index()].lock().unwrap();
+            o.candidates.extend(cands.iter().map(|e| e.id));
+            o.sent.extend(out.selection.records().iter().map(|r| {
+                let e = cands[r.index()];
                 (e.id, band_of(isqrt(e.dist_sq.raw())))
             }));
-            o.departed.extend(sel.departed().iter().copied());
-            o.arrivals = sel.records().iter().filter(|r| r.is_new()).count() as u64;
+            o.departed.extend(out.selection.departed().iter().copied());
+            o.arrivals = out.selection.records().iter().filter(|r| r.is_new()).count() as u64;
+            o.bytes = out.bytes.len() as u64;
         };
         sim.tick_with(&capture);
 
@@ -421,6 +425,7 @@ fn run(label: &'static str, weights: Weights, ghost_cap: usize) -> Run {
                 m.served += 1;
                 m.records += o.sent.len() as u64;
                 m.arrivals += o.arrivals;
+                m.bytes += o.bytes;
                 m.departures += o.departed.len() as u64;
 
                 let avatar = sim.avatar_of(viewers[vi]).expect("registered");

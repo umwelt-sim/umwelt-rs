@@ -19,6 +19,7 @@ use crate::fixed::Fixed;
 use crate::gather::DiscoveredEntities;
 use crate::ghost::GhostTable;
 use crate::odometer::Odometer;
+use crate::packet::{DESPAWN_BYTES, PacketWriter};
 use crate::pos::Pos3;
 use crate::select::{Policy, Selection, select};
 use crate::sim::viewer::{ClientLimits, Viewer, ViewerId};
@@ -118,6 +119,10 @@ pub struct TickStats {
     pub new_ghosts: u64,
     /// Ghosts clients were told to drop.
     pub departed: u64,
+    /// Despawn records actually written, which lag departures by a tick.
+    pub despawns_sent: u64,
+    /// Payload bytes assembled.
+    pub bytes: u64,
 }
 
 impl TickStats {
@@ -132,6 +137,8 @@ impl TickStats {
         self.records += o.records;
         self.new_ghosts += o.new_ghosts;
         self.departed += o.departed;
+        self.despawns_sent += o.despawns_sent;
+        self.bytes += o.bytes;
     }
 }
 
@@ -143,6 +150,9 @@ impl TickStats {
 struct Scratch {
     found: DiscoveredEntities,
     selection: Selection,
+    writer: PacketWriter,
+    /// Despawns drained from a viewer's queue for this packet.
+    despawns: Vec<EntityId>,
     stats: TickStats,
 }
 
@@ -161,8 +171,8 @@ struct Frame<'a> {
     walk_cap: usize,
 }
 
-/// Subscribes, gathers, scores and selects for one viewer. Returns whether it
-/// was served.
+/// Subscribes, gathers, scores, selects and assembles for one viewer. Returns
+/// whether it was served, leaving the payload in `w.writer`.
 fn serve(f: &Frame<'_>, id: ViewerId, v: &mut Viewer, w: &mut Scratch) -> bool {
     if !v.registered || !v.due(id, f.tick) {
         return false;
@@ -184,15 +194,52 @@ fn serve(f: &Frame<'_>, id: ViewerId, v: &mut Viewer, w: &mut Scratch) -> bool {
     f.snap.gather_into_capped(at, sub, f.walk_cap, &mut w.found);
 
     // No event queue exists yet, so nothing is held back for one.
-    let slots = v.budget.slots(0);
-    select(f.tick, &w.found, f.odo, f.policy, slots, &mut v.ghosts, &mut w.selection);
+    let state = v.budget.state_bytes_available(0);
+    // Despawns go first but take at most half the payload, so a viewer whose
+    // ghost set turned over cannot spend a whole packet forgetting things.
+    let room = (state / 2) / DESPAWN_BYTES;
+    let taking = v.pending_despawns.len().min(room);
+    w.despawns.clear();
+    w.despawns.extend(v.pending_despawns.drain(..taking));
+    let slots = state.saturating_sub(taking * DESPAWN_BYTES) / v.budget.record_bytes();
 
-    w.stats.viewers += 1;
-    w.stats.candidates += w.found.len() as u64;
-    w.stats.records += w.selection.records().len() as u64;
-    w.stats.new_ghosts += w.selection.records().iter().filter(|r| r.is_new()).count() as u64;
-    w.stats.departed += w.selection.departed().len() as u64;
+    let Scratch { found, selection, writer, despawns, stats } = w;
+    select(f.tick, found, f.odo, f.policy, slots, &mut v.ghosts, selection);
+
+    v.sequence = v.sequence.wrapping_add(1);
+    let cands = found.as_slice();
+    let snap = f.snap;
+    writer.build(
+        f.tick,
+        v.sequence,
+        despawns,
+        selection.records().iter().map(|r| {
+            let e = cands[r.index()];
+            (e.id, snap.pos_at(e.snapshot_index as usize))
+        }),
+    );
+
+    // Departures are found by the eviction inside `select`, after this tick's
+    // records were chosen, so they ride the next packet.
+    v.pending_despawns.extend_from_slice(selection.departed());
+
+    stats.viewers += 1;
+    stats.candidates += found.len() as u64;
+    stats.records += selection.records().len() as u64;
+    stats.new_ghosts += selection.records().iter().filter(|r| r.is_new()).count() as u64;
+    stats.departed += selection.departed().len() as u64;
+    stats.bytes += writer.payload().len() as u64;
+    stats.despawns_sent += despawns.len() as u64;
     true
+}
+
+/// One viewer's finished work for a tick.
+pub struct Outbound<'a> {
+    pub viewer: ViewerId,
+    /// The assembled payload. Scratch that the next viewer overwrites.
+    pub bytes: &'a [u8],
+    pub selection: &'a Selection,
+    pub candidates: &'a DiscoveredEntities,
 }
 
 /// One region's simulation.
@@ -291,9 +338,13 @@ impl<G: Game> WorldSimulation<G> {
         let overshoot = self.snap.sub_threshold() as usize;
         let cap = self.walk_cap + overshoot;
         let ghosts = self.policy.ghost_cap;
+        let codec = self.codec.clone();
+        let payload = crate::budget::DEFAULT_PAYLOAD_BYTES as usize;
         self.workers.resize_with(self.threads, || Scratch {
             found: DiscoveredEntities::with_capacity(cap),
             selection: Selection::with_capacity(ghosts),
+            writer: PacketWriter::new(codec.clone(), payload),
+            despawns: Vec::with_capacity(ghosts),
             stats: TickStats::default(),
         });
     }
@@ -379,6 +430,8 @@ impl<G: Game> WorldSimulation<G> {
             sub: None,
             ghosts: GhostTable::with_capacity(self.policy.ghost_cap),
             budget,
+            pending_despawns: Vec::new(),
+            sequence: 0,
             send_period: limits.send_period.max(1),
             registered: true,
         });
@@ -394,6 +447,7 @@ impl<G: Game> WorldSimulation<G> {
         }
         viewer.registered = false;
         viewer.sub = None;
+        viewer.pending_despawns.clear();
         // Retains the table's allocation for whoever takes the slot next.
         viewer.ghosts.clear();
         self.free.push(v);
@@ -401,7 +455,7 @@ impl<G: Game> WorldSimulation<G> {
 
     /// Advances one tick, discarding the per-viewer selections.
     pub fn tick(&mut self) -> TickStats {
-        self.tick_with(&|_, _, _| {})
+        self.tick_with(&|_| {})
     }
 
     /// Advances one tick, handing each served viewer's selection to `on_viewer`
@@ -416,7 +470,7 @@ impl<G: Game> WorldSimulation<G> {
     /// be `Sync`.
     pub fn tick_with(
         &mut self,
-        on_viewer: &(impl Fn(ViewerId, &Selection, &DiscoveredEntities) + Sync),
+        on_viewer: &(impl Fn(Outbound<'_>) + Sync),
     ) -> TickStats {
         self.tick = self.tick.wrapping_add(1);
 
@@ -465,7 +519,12 @@ impl<G: Game> WorldSimulation<G> {
             for (k, v) in viewers.iter_mut().enumerate() {
                 let id = ViewerId::from_raw(k as u32);
                 if serve(&frame, id, v, w) {
-                    on_viewer(id, &w.selection, &w.found);
+                    on_viewer(Outbound {
+                        viewer: id,
+                        bytes: w.writer.payload(),
+                        selection: &w.selection,
+                        candidates: &w.found,
+                    });
                 }
             }
             return w.stats;
@@ -480,7 +539,12 @@ impl<G: Game> WorldSimulation<G> {
                     for (k, v) in vs.iter_mut().enumerate() {
                         let id = ViewerId::from_raw((base + k) as u32);
                         if serve(frame, id, v, w) {
-                            on_viewer(id, &w.selection, &w.found);
+                            on_viewer(Outbound {
+                                viewer: id,
+                                bytes: w.writer.payload(),
+                                selection: &w.selection,
+                                candidates: &w.found,
+                            });
                         }
                     }
                 });
@@ -498,6 +562,7 @@ impl<G: Game> WorldSimulation<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Every entity walks along x, wrapping inside the region so nothing ever
@@ -652,8 +717,9 @@ mod tests {
 
         let still = ids[1];
         let hit = AtomicBool::new(false);
-        let watch = |_: ViewerId, sel: &Selection, found: &DiscoveredEntities| {
-            if sel.records().iter().any(|r| found.as_slice()[r.index()].id == still) {
+        let watch = |o: Outbound<'_>| {
+            if o.selection.records().iter().any(|r| o.candidates.as_slice()[r.index()].id == still)
+            {
                 hit.store(true, Ordering::Relaxed);
             }
         };
@@ -730,6 +796,78 @@ mod tests {
         let stats = s.tick();
         assert_eq!(stats.records, 1, "a newcomer is a status change");
         assert_eq!(stats.new_ghosts, 1);
+    }
+
+    #[test]
+    fn a_payload_carries_exactly_what_was_selected() {
+        use crate::packet::PacketReader;
+        let mut s = sim(Walk::new(1));
+        let ids = populate(&mut s, 400);
+        s.set_thread_count(1);
+        s.register_viewer(ids[0], ClientLimits::default());
+        for _ in 0..8 {
+            s.tick();
+        }
+
+        let codec = RecordCodec::new(&WorldConfig::default());
+        let checked = AtomicBool::new(false);
+        s.tick_with(&|o: Outbound<'_>| {
+            let r = PacketReader::new(&codec, o.bytes).expect("well formed payload");
+            let want: Vec<EntityId> = o
+                .selection
+                .records()
+                .iter()
+                .map(|k| o.candidates.as_slice()[k.index()].id)
+                .collect();
+            let got: Vec<EntityId> = r.updates().map(|(id, _)| id).collect();
+            assert_eq!(got, want, "a payload must carry the selection, in order");
+            assert_eq!(r.header().updates as usize, want.len());
+            assert!(!want.is_empty());
+            checked.store(true, Ordering::Relaxed);
+        });
+        assert!(checked.load(Ordering::Relaxed), "the viewer must have been served");
+    }
+
+    #[test]
+    fn a_payload_never_exceeds_the_declared_payload_size() {
+        let mut s = sim(Walk::new(2));
+        let ids = populate(&mut s, 800);
+        for id in ids.iter().take(30) {
+            s.register_viewer(*id, ClientLimits::default());
+        }
+        for _ in 0..12 {
+            let over = AtomicBool::new(false);
+            s.tick_with(&|o: Outbound<'_>| {
+                if o.bytes.len() > crate::budget::DEFAULT_PAYLOAD_BYTES as usize {
+                    over.store(true, Ordering::Relaxed);
+                }
+            });
+            assert!(!over.load(Ordering::Relaxed), "a payload overran its budget");
+        }
+    }
+
+    #[test]
+    fn quantized_positions_survive_the_round_trip() {
+        use crate::packet::PacketReader;
+        let mut s = sim(Walk::new(1));
+        let ids = populate(&mut s, 60);
+        s.set_thread_count(1);
+        s.register_viewer(ids[0], ClientLimits::default());
+        for _ in 0..4 {
+            s.tick();
+        }
+
+        let codec = RecordCodec::new(&WorldConfig::default());
+        let seen: Mutex<Vec<(EntityId, Pos3)>> = Mutex::new(Vec::new());
+        s.tick_with(&|o: Outbound<'_>| {
+            let r = PacketReader::new(&codec, o.bytes).expect("well formed");
+            *seen.lock().unwrap() = r.updates().collect();
+        });
+        let seen = seen.into_inner().unwrap();
+        assert!(!seen.is_empty());
+        for (id, pos) in seen {
+            assert_eq!(Some(pos), s.position(id), "the wire is lossless at this config");
+        }
     }
 
     #[test]

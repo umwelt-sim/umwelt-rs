@@ -508,8 +508,10 @@ Of the remaining inputs, `payload_bytes` at 1200 is well founded: Ethernet MTU i
 VPNs, and PPPoE without fragmenting, which is what QUIC mandates as its minimum
 datagram size.
 
-`header_bytes` at 16 is still a guess. No packet format is designed. It would
-hold a sequence number, an ack or ack bitfield, a tick identifier, and flags.
+`header_bytes` at 16 is no longer a guess. `PacketHeader` is exactly that: a
+tick identifier, a per-client sequence number, an ack and a 32-bit ack bitfield,
+and the two record counts. The acknowledgment fields are carried but unpopulated
+until there is a transport to acknowledge over.
 
 `event_reserve_bytes` at 256 is still a guess. Without a reserve a dense crowd's
 position updates fill every packet and a client can stand in a mob without
@@ -765,6 +767,28 @@ The event reserve is a floor rather than a subtraction:
 config, 98 records fit an idle packet and 77 under a backlog at or past the
 reserve.
 
+### Payload assembly
+
+A payload is a header, then despawns, then state records. `PacketWriter` builds
+it into a buffer it keeps, so a worker allocates once; `PacketReader` reads it
+back, which is what a client does and what makes the format testable by round
+trip.
+
+A despawn is four bytes, an `EntityId` alone: a client already holds the
+position it is being told to forget. There is no separate spawn record. An
+update for an entity a client does not hold is how it learns of one, and
+anything a spawn would carry beyond position is the consumer's opaque payload,
+which is not built.
+
+Despawns are written first, capped at half the payload, so a viewer whose ghost
+set turned over cannot spend a whole packet forgetting things. They also lag by
+a tick: departures are found by the eviction at the end of `select`, after that
+tick's records were already chosen, so they ride the next packet from a
+per-viewer queue.
+
+This is bytes in a buffer and nothing else. No socket, no framing to an edge, no
+transport.
+
 ### Simulation and viewers
 
 `WorldSimulation` owns positions, liveness, the odometer, the snapshot and
@@ -778,7 +802,8 @@ recycled viewer is a different client with an empty ghost set and there is
 nothing for a stale reference to alias.
 
 `TickStats` counts viewers served, candidates gathered, records sent, first
-sightings and departures, which covers part of §Still to instrument.
+sightings, departures, despawn records written and payload bytes assembled,
+which covers all but two items of §Still to instrument.
 
 Not built: `run` and its clock, threading, packet assembly, events.
 
@@ -1531,8 +1556,9 @@ below the threshold is walked whole. A gather buffer must be sized
 sightings and departures per tick, so entities dropped by budget is covered and
 arrivals and departures are visible.
 
-Left: per-client bytes per tick, subscription churn rate, p99 tick duration, and
-`DiscoveredEntities::capacity()` after warmup.
+Per-client bytes per tick is covered too, now that payloads are assembled.
+
+Left: subscription churn rate and p99 tick duration.
 
 ### Not yet benchmarked
 

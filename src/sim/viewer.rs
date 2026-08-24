@@ -75,6 +75,10 @@ pub(crate) struct Viewer {
     pub sub: Option<Subscription>,
     pub ghosts: GhostTable,
     pub budget: PacketBudget,
+    /// Ghosts this client has not yet been told to drop. Departures are found
+    /// after the tick's records are chosen, so they go out in the next packet.
+    pub pending_despawns: Vec<EntityId>,
+    pub sequence: u16,
     pub send_period: u8,
     pub registered: bool,
 }
@@ -84,6 +88,8 @@ impl Viewer {
         self.avatar = avatar;
         self.sub = None;
         self.ghosts.clear();
+        self.pending_despawns.clear();
+        self.sequence = 0;
         self.budget = budget;
         self.send_period = send_period.max(1);
         self.registered = true;

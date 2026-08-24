@@ -175,7 +175,7 @@ mod tests {
         }
     }
 
-    /// A reading equivalent to `m` metres of path.
+    /// A reading equivalent to `m` meters of path.
     fn meters(m: i32) -> u32 {
         Fixed::from_meters(m).raw() as u32
     }

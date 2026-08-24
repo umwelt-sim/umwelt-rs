@@ -702,7 +702,7 @@ mod tests {
 
     // -- subdivision ---------------------------------------------------
 
-    /// `n` entities scattered inside the single cell containing `m` metres.
+    /// `n` entities scattered inside the single cell containing `m` meters.
     fn crowd_in_one_cell(cfg: &WorldConfig, n: usize, m: i32, seed: u64) -> Vec<Pos3> {
         let cell = cfg.cell_size().raw() as u32;
         let origin = (Fixed::from_meters(m).raw() as u32) & !(cell - 1);

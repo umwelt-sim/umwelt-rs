@@ -11,7 +11,7 @@
 //!
 //! The odometer is shared by every viewer, unlike a ghost table, so after the
 //! first viewer of a tick it stays resident. Measuring it hot is the realistic
-//! case, not an optimistic one.
+//! case, not an optimiztic one.
 //!
 //! Two ways of reaching a candidate's reading are measured. **by_id** indexes
 //! the odometer by entity id, which is how it is stored, and which a cell-walk
@@ -78,7 +78,7 @@ struct Scored {
 }
 
 /// `n` candidates with ids scattered across the region, as a cell walk yields
-/// them. `snapshot_index` runs 0..n, modelling one contiguous run, which is
+/// them. `snapshot_index` runs 0..n, modeling one contiguous run, which is
 /// what a crowded cell produces.
 fn candidates(n: usize, seed: u64) -> Vec<DiscoveredEntity> {
     let mut rng = Rng::new(seed);

@@ -454,7 +454,7 @@ from `radius / 2`, which bounds `cell_radius` at 4. Neither needs checking.
 Wire precision is lossless, so `horizontal_bits` is `log2(region_raw)`,
 `vertical_bits` is `log2(vertical_raw)`, and both quantization shifts are zero.
 A single global precision has to serve the nearest entity, and at arm's length
-sub-pixel error is sub-millimetre, so there is nothing to trade away. The cost
+sub-pixel error is sub-millimeter, so there is nothing to trade away. The cost
 is bounded: a record is 12 bytes at the default region and 16 at the largest one
 `Fixed` can express.
 
@@ -570,7 +570,7 @@ cells, so at most one boundary per axis per tick. `build()` rejects configs wher
 this fails. Verified by test across a snake path covering all 1024 cells: bounds
 shift by at most 1 per axis.
 
-**Strip delta: cancelled.** Rebuilding a box measured 1.5 ns. A strip version
+**Strip delta: canceled.** Rebuilding a box measured 1.5 ns. A strip version
 might reach 0.5 ns, saving ~10 microseconds per tick at 10k viewers, 0.02% of
 budget, against two edge cases and an oracle test suite. The delta *function* is
 still required, since entered and exited cells drive client spawn and despawn.
@@ -743,7 +743,7 @@ fixes.
 
 An entity the client has never seen scores as a ghost that has drifted by
 `unseen_drift`, defaulting to the view radius, on the same scale as any other
-score. A near stranger still beats a barely stale neighbour; a distant stranger
+score. A near stranger still beats a barely stale neighbor; a distant stranger
 loses to a badly stale one.
 
 An update that scored zero consumes no slot. That is the whole point of scoring
@@ -870,7 +870,21 @@ unverified, idle entities would then take slots in proportion to their share of
 the candidate set. Rejected also because the growth curve would be tuned against
 a proxy with no error signal feeding back. See §Odometer.
 
-The weight table itself is not decided; that is open question 2.
+### Decided provisionally: weight proportional to 1/d
+
+`Weights::inverse_distance` halves the weight at twice the separation, anchored
+at a one-meter separation. How wrong an entity looks falls off with distance,
+since a meter of error subtends a smaller angle the further away it is, so a
+packet is better spent on what is close.
+
+Measured by the quality harness. **The population it ran against is invented
+rather than taken from a real game**, so this settles open question 2 only
+provisionally.
+
+Computed: a `[u16; BANDS]` table spans 4096 to 1, and the default 256 m view
+radius is eight doublings of distance from one meter, so the steepest curve it
+can express across the whole view is about `d^-1.5`. Anything steeper flattens
+partway out, which is why `d^-4` measured identically to flat weighting.
 
 ### Open questions
 
@@ -957,7 +971,7 @@ apiece, so roughly four cache-line fetches per eight entities, with the prefetch
 never picking up a stride.
 
 The earlier estimate in this document of "near 0.5 ns, gather under 2 ms" was
-about 5x optimistic. The mechanism was right; the assumption that the walk is one
+about 5x optimiztic. The mechanism was right; the assumption that the walk is one
 long sequential stream was not. Run length is the variable.
 
 **Hot cell scaling.** Linear per viewer, quadratic per tick. Cost scales
@@ -1270,6 +1284,55 @@ Correctness at a ragged population is tested rather than assumed: cell size,
 `sub_axis`, and `cell_shift` are all powers of two, so a 10,000 crowd exercises
 partial sub-cells, uneven thread chunking, and caps that do not divide evenly.
 
+### Quality harness, measured
+
+Every other measurement here answers how long a tick takes. This one answers
+whether what the tick sent was worth sending. `examples/harness.rs` models each
+client's belief, comparing the position it was last told against the truth at
+the moment the next packet is decided.
+
+60,000 entities, 200 viewers, 400 ticks at 20 Hz with the first 40 discarded.
+The population is mixed on purpose: 35% props that never move, 25% idlers, 25%
+walkers at 1.5 m/s, 10% sprinters at 6 m/s and 5% vehicles at 30 m/s. **The mix
+is chosen, not measured against any real game.** A population moving at one
+speed cannot distinguish scoring on displacement from scoring on elapsed time,
+which is the reason the odometer exists.
+
+Errors are angular, in milliradians, because a mean over meters cannot compare a
+near entity against a far one and is minimized by weighting everything equally.
+
+Mean angular error within 32 m, at a ghost cap of 512:
+
+| curve | walkers only | with 5% vehicles |
+|---|---|---|
+| flat | 4.31 | 14.78 |
+| 1/sqrt(d) | 2.81 | 10.35 |
+| **1/d** | **2.51** | **9.71** |
+| 1/d^2 | 2.44 | 9.46 |
+| 1/d^4 | 3.93 | 13.72 |
+
+One entity in twenty at vehicle speed roughly triples the error. Below that the
+curve is cosmetic: every option leaves error small enough that no one would see
+it. Above it the curve is worth 34%.
+
+`1/d^2` is marginally better within 32 m and worse from 64 to 128 m. `1/d^4`
+matches flat because the table cannot express it.
+
+**Starvation is solved.** Entities that were candidates for a viewer and never
+once sent: 2.9% at a ghost cap of 512 and 8.5% at 256, against the 66.5% the
+static-priority scratch simulation starved. Candidate-ticks where the client
+held no ghost at all: 3.5% and 11.1%.
+
+**What the curve does not fix.** The 99th-percentile error is 2.0 m in every
+configuration measured. That is the vehicles, and no weighting touches it. The
+levers there are a larger packet or a higher send rate, not the curve.
+
+Caveats. The harness is newer and less trusted than the library: four bugs were
+found in it during its first run, each surfacing as an implausible number rather
+than a failing test. Only one density and one motion mix have been run, and
+viewers are all drawn from the walkers, so a viewer traveling at vehicle speed
+is unmeasured and the grace period is barely exercised.
+
 ### Odometer benchmark, measured
 
 Apple M1, 8 cores, single-threaded. **Not the machine the figures above were
@@ -1344,7 +1407,7 @@ cost 13.20 ms when nothing moves against 20.55 ms when everything does, and the
 still case sends no records at all.
 
 Every earlier figure for this pipeline was assembled by adding separately
-measured stages, two of them by subtraction. Those estimates were 55% optimistic
+measured stages, two of them by subtraction. Those estimates were 55% optimiztic
 uniform and, before the fix below, wrong by 4.2x crowded.
 
 ### Measured: choosing the ghost set by staleness churns it
@@ -1488,7 +1551,7 @@ would exercise `grace`, and nothing does yet.
 **A whole tick over a populated region.** ~~Every benchmark so far measures one
 population shape in isolation.~~ Built and measured: see the clustered rows of
 §Whole-pipeline benchmark. What follows in this section is the reasoning that
-motivated it, kept because the question it asks about cache behaviour is still
+motivated it, kept because the question it asks about cache behavior is still
 open.
 
 The world is sharded, one sim process per region, so this is a smaller question

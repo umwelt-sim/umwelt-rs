@@ -28,6 +28,16 @@ pub const BANDS: usize = 64;
 /// cost of refreshing known entities less often.
 pub const DEFAULT_UNSEEN_DRIFT: u32 = 262_144;
 
+/// Band of a one-meter separation, which is where a weight table is anchored.
+/// A band is `ilog2` of a squared separation, so it is twice the fixed-point
+/// shift.
+///
+/// Computed: a table spans 4096 to 1, and the default 256 m view radius is
+/// eight doublings of distance from one meter, so the steepest curve it can
+/// express across the whole view is about `d^-1.5`. Anything steeper flattens
+/// partway out.
+pub const NEAR_BAND: usize = 2 * crate::fixed::FIXED_SHIFT as usize;
+
 /// Marks a ranked entry as one the client holds no ghost of. Candidate lists
 /// are bounded by the walk cap, so the top bit of an index is free.
 const NEW_BIT: u32 = 1 << 31;
@@ -51,18 +61,26 @@ impl Weights {
         Weights(table)
     }
 
-    /// Halves every four bands. A band is `ilog2` of a squared separation, so
-    /// it is half a doubling of distance, which makes this proportional to
-    /// `d^-0.5` rather than to `d^-1`.
+    /// Weight proportional to `1/d`: half the weight at twice the separation.
     ///
-    /// A placeholder until measurement picks a curve; see open question 2 in
-    /// the design document. Note that it is indexed from band 0 while anything
-    /// inside a 256 m view radius falls between bands 20 and 35, so only that
-    /// upper stretch of the table is ever read.
-    pub fn placeholder() -> Weights {
+    /// How wrong an entity looks falls off with distance, since a meter of
+    /// error subtends a smaller angle the further away it is, so a packet is
+    /// better spent on what is close. This curve matches that fall-off.
+    ///
+    /// Anchored at [`NEAR_BAND`]. A band is `ilog2` of a squared separation, so
+    /// one band is half a doubling of distance and a shift of one half per band
+    /// is `1/d`. A table indexed from band 0 would be constant across
+    /// everything inside a view radius and would weight nothing at all.
+    ///
+    /// Chosen by the quality harness, which measured it as 34% better than flat
+    /// weighting for angular error within 32 m under a population containing
+    /// fast movers. **That population is invented rather than taken from a real
+    /// game**, so this answers open question 2 provisionally.
+    pub fn inverse_distance() -> Weights {
         let mut t = [0u16; BANDS];
         for (b, slot) in t.iter_mut().enumerate() {
-            *slot = 1u16 << (12 - (b / 4).min(12));
+            let over = b.saturating_sub(NEAR_BAND);
+            *slot = 1u16 << 12usize.saturating_sub(over / 2);
         }
         Weights::new(t)
     }
@@ -75,7 +93,7 @@ impl Weights {
 
 impl Default for Weights {
     fn default() -> Weights {
-        Weights::placeholder()
+        Weights::inverse_distance()
     }
 }
 
@@ -104,7 +122,7 @@ impl Default for Policy {
             ghost_cap: 0,
             grace: 0,
             unseen_drift: DEFAULT_UNSEEN_DRIFT,
-            weights: Weights::placeholder(),
+            weights: Weights::inverse_distance(),
         }
     }
 }
@@ -310,7 +328,7 @@ mod tests {
         }
     }
 
-    /// Candidates as `(entity id, separation in metres)`, in walk order.
+    /// Candidates as `(entity id, separation in meters)`, in walk order.
     fn candidates(items: &[(u32, i32)]) -> DiscoveredEntities {
         let mut d = DiscoveredEntities::new();
         for (k, &(id, m)) in items.iter().enumerate() {
@@ -323,7 +341,7 @@ mod tests {
         d
     }
 
-    /// One candidate per entity, entity `i` at `1 + i` metres, so entity 0 is
+    /// One candidate per entity, entity `i` at `1 + i` meters, so entity 0 is
     /// nearest and wins the first slot.
     fn ladder(n: usize) -> DiscoveredEntities {
         let items: Vec<(u32, i32)> = (0..n).map(|i| (i as u32, 1 + i as i32)).collect();
@@ -390,7 +408,7 @@ mod tests {
     // -- ordering -----------------------------------------------------------
 
     #[test]
-    fn a_near_stranger_outranks_a_slightly_stale_neighbour() {
+    fn a_near_stranger_outranks_a_slightly_stale_neighbor() {
         let mut w = World::new(2);
         let mut ghosts = GhostTable::new();
         let mut sel = Selection::new();
@@ -404,12 +422,12 @@ mod tests {
         let both = candidates(&[(0, 5), (1, 5)]);
         select(2, &both, &w.odo, &p, 98, &mut ghosts, &mut sel);
         let first = sel.ranked()[0];
-        assert!(first.is_new(), "an unseen neighbour beats a barely stale one");
+        assert!(first.is_new(), "an unseen neighbor beats a barely stale one");
         assert_eq!(id_at(&both, &first), 1);
     }
 
     #[test]
-    fn a_distant_stranger_loses_to_a_badly_stale_neighbour() {
+    fn a_distant_stranger_loses_to_a_badly_stale_neighbor() {
         // The half of the fix that stops the ghost set churning: an entity the
         // client has never seen no longer outranks everything unconditionally.
         let mut w = World::new(2);
@@ -425,7 +443,7 @@ mod tests {
         let both = candidates(&[(0, 5), (1, 250)]);
         select(2, &both, &w.odo, &p, 98, &mut ghosts, &mut sel);
         let first = sel.ranked()[0];
-        assert!(!first.is_new(), "a badly stale neighbour beats a distant stranger");
+        assert!(!first.is_new(), "a badly stale neighbor beats a distant stranger");
         assert_eq!(id_at(&both, &first), 0);
     }
 
@@ -462,7 +480,7 @@ mod tests {
 
     #[test]
     fn an_unseen_entity_scores_like_a_ghost_that_drifted_the_view_radius() {
-        let w = Weights::placeholder();
+        let w = Weights::inverse_distance();
         let near = DistSq::from_radius(Fixed::from_meters(5));
         assert_eq!(
             score_of(DEFAULT_UNSEEN_DRIFT, near, &w),

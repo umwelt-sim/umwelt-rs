@@ -50,9 +50,22 @@ const WARMUP: u32 = 40;
 
 const RAW_PER_M: i64 = 1 << 10;
 
-/// Motion classes and their share of the population. Chosen, not measured.
-const MIX: [(f64, f64); 4] =
-    [(0.40, 0.0), (0.30, 0.2), (0.25, 1.5), (0.05, 6.0)];
+/// Motion classes as (share, meters per second) and their names. Chosen, not
+/// measured against any real game.
+///
+/// The fast class is the one that decides whether the growth curve is cosmetic.
+/// Walkers accumulate so little drift between packets that every curve keeps
+/// them accurate; something crossing the view radius in eight seconds does not.
+const MIX: [(f64, f64, &str); 5] = [
+    (0.35, 0.0, "props"),
+    (0.25, 0.2, "idlers"),
+    (0.25, 1.5, "walkers"),
+    (0.10, 6.0, "sprinters"),
+    (0.05, 30.0, "vehicles"),
+];
+
+/// Index into `MIX` of the class viewers are drawn from.
+const VIEWER_CLASS: usize = 2;
 
 struct Rng(u64);
 
@@ -143,9 +156,9 @@ fn crowd(cfg: &WorldConfig, seed: u64) -> (Crowd, Vec<u32>) {
     let mut walkers = Vec::new();
 
     // Cumulative shares, so a single draw picks a class.
-    let mut cuts = [0.0f64; 4];
+    let mut cuts = [0.0f64; MIX.len()];
     let mut acc = 0.0;
-    for (k, (share, _)) in MIX.iter().enumerate() {
+    for (k, (share, _, _)) in MIX.iter().enumerate() {
         acc += share;
         cuts[k] = acc;
     }
@@ -157,12 +170,12 @@ fn crowd(cfg: &WorldConfig, seed: u64) -> (Crowd, Vec<u32>) {
             Fixed::ZERO,
         ));
         let roll = rng.below(10_000) as f64 / 10_000.0;
-        let class = cuts.iter().position(|&c| roll < c).unwrap_or(3);
+        let class = cuts.iter().position(|&c| roll < c).unwrap_or(MIX.len() - 1);
         let per_tick = (MIX[class].1 / tick_hz * RAW_PER_M as f64).round() as i32;
         let (dx, dy) = rng.heading(per_tick);
         vx.push(dx);
         vy.push(dy);
-        if class == 2 {
+        if class == VIEWER_CLASS {
             walkers.push(i as u32);
         }
     }
@@ -197,7 +210,7 @@ struct Observed {
     arrivals: u64,
 }
 
-/// Coarse separation bands for the per-distance report, in metres.
+/// Coarse separation bands for the per-distance report, in meters.
 const BAND_EDGES: [i32; 3] = [32, 64, 128];
 const BAND_NAMES: [&str; 4] = ["0-32 m", "32-64 m", "64-128 m", "128 m+"];
 
@@ -228,8 +241,8 @@ struct Metrics {
     hist: [[u64; 128]; 4],
     err_sum: [u128; 4],
     /// Error over separation, in milliradians. What a viewer perceives is
-    /// angular: a metre of error five metres away is not a metre of error two
-    /// hundred metres away, and a mean over raw metres cannot tell them apart.
+    /// angular: a meter of error five meters away is not a meter of error two
+    /// hundred meters away, and a mean over raw meters cannot tell them apart.
     ang_sum: [u128; 4],
     represented: [u64; 4],
     unrepresented: u64,
@@ -250,7 +263,7 @@ impl Metrics {
         let b = band_of(sep_raw);
         self.represented[b] += 1;
         self.err_sum[b] += err_raw as u128;
-        // Floored at a metre: closer than that, angular error is dominated by
+        // Floored at a meter: closer than that, angular error is dominated by
         // the divisor and says nothing about what a viewer perceives.
         self.ang_sum[b] += (err_raw as u128 * 1000) / (sep_raw.max(RAW_PER_M) as u128);
         self.hist[b][bucket_of(err_raw)] += 1;
@@ -276,7 +289,7 @@ impl Metrics {
         if n == 0 { 0.0 } else { sum as f64 / n as f64 / RAW_PER_M as f64 }
     }
 
-    /// Upper edge of the bucket holding the `q` quantile, in metres. Log-spaced
+    /// Upper edge of the bucket holding the `q` quantile, in meters. Log-spaced
     /// buckets, so this is a bound rather than an interpolation.
     fn quantile_m(&self, q: f64) -> f64 {
         let total = self.total_represented();
@@ -325,7 +338,7 @@ struct Run {
 ///
 /// A band is `ilog2` of a squared separation, so it is half a doubling of
 /// distance and the shift per band is `k/2`. Bands must be anchored at the near
-/// end of what is actually in view: a one-metre separation is band 20 and the
+/// end of what is actually in view: a one-meter separation is band 20 and the
 /// default view radius is band 35, so a table indexed from band 0 is constant
 /// across the entire range that matters and sweeps nothing.
 fn curve(k: f64) -> Weights {
@@ -470,13 +483,11 @@ fn main() {
         "{ENTITIES} entities, {VIEWERS} viewers drawn from the walkers, {TICKS} ticks at 20 Hz, \
          first {WARMUP} discarded."
     );
-    println!(
-        "mix: {:.0}% props, {:.0}% idlers, {:.0}% walkers, {:.0}% sprinters (chosen, not measured)\n",
-        MIX[0].0 * 100.0,
-        MIX[1].0 * 100.0,
-        MIX[2].0 * 100.0,
-        MIX[3].0 * 100.0
-    );
+    print!("mix (chosen, not measured):");
+    for (share, speed, name) in MIX {
+        print!(" {:.0}% {name} at {speed} m/s,", share * 100.0);
+    }
+    println!("\n");
 
     let cfg = WorldConfig::default();
     let curves: [(&'static str, f64); 5] =
@@ -545,7 +556,7 @@ fn main() {
         println!();
     }
 
-    println!("\nmean error by separation, metres");
+    println!("\nmean error by separation, meters");
     print!("{:<10} {:>4}", "curve", "cap");
     for n in BAND_NAMES {
         print!(" {n:>10}");

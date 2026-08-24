@@ -11,8 +11,8 @@
 //! A baseline registers no viewers, so subtracting it leaves the per-viewer
 //! replication cost with the per-tick work removed.
 //!
-//! Entities oscillate by a metre rather than travelling, so a population shape
-//! holds for arbitrarily many iterations and a crowd stays a crowd. Neighbours
+//! Entities oscillate by a meter rather than traveling, so a population shape
+//! holds for arbitrarily many iterations and a crowd stays a crowd. Neighbors
 //! move in opposite directions, so candidate sets churn rather than drifting in
 //! lockstep.
 
@@ -84,7 +84,7 @@ impl Game for Scenario {
     }
 }
 
-/// Positions at least `margin` metres inside the region, so a metre of
+/// Positions at least `margin` meters inside the region, so a meter of
 /// oscillation never leaves it.
 fn inside(cfg: &WorldConfig, rng: &mut Rng, margin: i32) -> Pos3 {
     let m = Fixed::from_meters(margin).raw() as u32;
@@ -136,7 +136,7 @@ fn clustered(
     let vertical = cfg.vertical_extent().raw() as u32;
 
     // Cluster cells kept off the region edge so oscillation stays inside.
-    let centres: Vec<(u32, u32)> = (0..clusters)
+    let centers: Vec<(u32, u32)> = (0..clusters)
         .map(|_| {
             (
                 (1 + rng.below(per_axis - 2)) * cell,
@@ -148,7 +148,7 @@ fn clustered(
     let dense = (n as f64 * dense_share) as usize;
     let mut v: Vec<Pos3> = (0..dense)
         .map(|k| {
-            let (cx, cy) = centres[k % centres.len()];
+            let (cx, cy) = centers[k % centers.len()];
             Pos3::new(
                 Fixed::from_raw((cx + rng.below(cell)) as i32),
                 Fixed::from_raw((cy + rng.below(cell)) as i32),
@@ -161,7 +161,7 @@ fn clustered(
 }
 
 fn policy(ghost_cap: usize) -> Policy {
-    Policy { ghost_cap, grace: DEFAULT_GRACE, weights: Weights::placeholder(), ..Policy::default() }
+    Policy { ghost_cap, grace: DEFAULT_GRACE, weights: Weights::inverse_distance(), ..Policy::default() }
 }
 
 /// Builds a simulation, spawns `positions`, registers `viewers` of them as

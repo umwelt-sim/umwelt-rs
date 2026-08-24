@@ -319,7 +319,7 @@ mod tests {
 
     // -- ordered walk and cap -------------------------------------------
 
-    /// `n` entities scattered inside the cell containing `m` metres.
+    /// `n` entities scattered inside the cell containing `m` meters.
     fn crowd(cfg: &WorldConfig, n: usize, m: i32, seed: u64) -> Vec<Pos3> {
         let cell = cfg.cell_size().raw() as u32;
         let origin = (crate::fixed::Fixed::from_meters(m).raw() as u32) & !(cell - 1);

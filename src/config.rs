@@ -225,7 +225,7 @@ impl WorldConfig {
     pub const fn cells_per_region(&self) -> u32 {
         self.cells_per_region
     }
-    /// Cells from centre to edge of a subscription.
+    /// Cells from center to edge of a subscription.
     pub const fn cell_radius(&self) -> u32 {
         self.cell_radius
     }
@@ -252,7 +252,7 @@ impl WorldConfig {
     /// Worst-case horizontal wire error.
     ///
     /// May be finer than requested: bit counts are whole numbers, so the
-    /// derived width rounds in your favour.
+    /// derived width rounds in your favor.
     pub const fn horizontal_precision(&self) -> Fixed {
         self.horizontal_precision
     }
@@ -515,14 +515,14 @@ pub struct WorldConfigBuilder {
 }
 
 impl WorldConfigBuilder {
-    /// Region edge length in whole metres. Must be a power of two in fixed
-    /// point, which for whole metres means a power of two in metres.
+    /// Region edge length in whole meters. Must be a power of two in fixed
+    /// point, which for whole meters means a power of two in meters.
     pub fn region_size_m(mut self, m: i32) -> Self {
         self.region_size = Some(Fixed::from_meters(m));
         self
     }
 
-    /// Vertical range in whole metres. Also power-of-two constrained.
+    /// Vertical range in whole meters. Also power-of-two constrained.
     pub fn vertical_extent_m(mut self, m: i32) -> Self {
         self.vertical_extent = Some(Fixed::from_meters(m));
         self
@@ -608,7 +608,7 @@ impl WorldConfigBuilder {
         // Wire widths. Precision is lossless, so a position keeps every bit the
         // simulation computed with and the quantization shift is zero. A single
         // global precision has to serve the nearest entity, and at arm's length
-        // sub-pixel error is sub-millimetre, so there is nothing to trade away.
+        // sub-pixel error is sub-millimeter, so there is nothing to trade away.
         let horizontal_bits = region_raw.trailing_zeros();
         let horizontal_quant_shift = 0;
         let horizontal_precision = Fixed::from_raw(1);

@@ -233,7 +233,7 @@ impl<G: Game> WorldSimulation<G> {
                 // A client told nothing about an entity could be wrong about it
                 // by up to the whole view radius.
                 unseen_drift: cfg.horizontal_view_radius().raw() as u32,
-                weights: crate::select::Weights::placeholder(),
+                weights: crate::select::Weights::inverse_distance(),
             },
         )
     }
@@ -579,7 +579,7 @@ mod tests {
 
         let stats = s.tick();
         assert_eq!(stats.viewers, 1);
-        assert!(stats.candidates > 0, "the viewer should see its neighbours");
+        assert!(stats.candidates > 0, "the viewer should see its neighbors");
         assert!(stats.records > 0);
         assert_eq!(stats.records, stats.new_ghosts, "every record is a first sighting");
     }

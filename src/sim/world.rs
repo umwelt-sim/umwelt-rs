@@ -8,8 +8,13 @@
 //! went, the snapshot is rebuilt in cell order, and then every due viewer is
 //! subscribed, gathered, scored and selected against that snapshot.
 //!
-//! Packet assembly and transport are not here. A tick stops at a [`Selection`]
-//! per viewer, which [`tick_with`](WorldSimulation::tick_with) hands out.
+//! Each served viewer's [`Selection`] is then assembled into a payload and
+//! handed to the [`PayloadSink`] the consumer attached, after
+//! [`tick_with`](WorldSimulation::tick_with) shows both to its observer. Viewers
+//! are partitioned across worker threads.
+//!
+//! Not here: the clock that drives the tick, events, and any transport past the
+//! sink.
 
 use crate::budget::PacketBudget;
 use crate::codec::RecordCodec;

@@ -159,10 +159,9 @@ cannot deliver.
 **Rule: umwelt stores only what umwelt's own code reads.**
 
 Position is stored because the gather reads it. Liveness is stored because the
-sort needs it. Accumulated displacement is stored for priority scoring, which is
-not built, so it is the one field currently admitted on intent rather than on an
-existing caller; see §Odometer. Health, inventory, and AI state never enter,
-because nothing in the replication pipeline reads them.
+sort needs it. Accumulated displacement is stored because priority scoring reads
+it, which `select` does; see §Odometer. Health, inventory, and AI state never
+enter, because nothing in the replication pipeline reads them.
 
 The rule is testable against any proposed field: name the umwelt code that reads
 it, or it belongs to the consumer.
@@ -197,9 +196,9 @@ entity slot, plus the previous positions the accumulation is computed from. That
 is the second per-entity field the list above flags, recorded here as the rule
 requires.
 
-- Priority scoring is the only thing that will read it, which is the test in
-  §What umwelt stores. Scoring is not built, so this field currently passes that
-  test on intent rather than on a caller.
+- Priority scoring is the only thing that reads it, which is the test in §What
+  umwelt stores. `select` is that caller, so the field passes on an existing
+  reader rather than on intent.
 - It is derived from positions umwelt already owns. Nothing the consumer writes
   reaches it, and nothing can be attached beside it. The type is public, as
   `CellSnapshot` and `Subscription` are, so the piece stays benchmarkable; no
@@ -479,9 +478,11 @@ The record is **12 bytes**, measured rather than assumed: 4 for an `EntityId`
 and 8 for a position packed at 22, 22, and 20 bits. `RecordCodec::record_bytes`
 computes it from config.
 
-The packet figures below use constants that no longer live anywhere, since they
-were on `ViewConfig`. They belong to packet assembly, which is not built. They
-are kept here as the arithmetic, not as an API reference.
+The packet figures below were computed against constants that were on
+`ViewConfig`. They live on `PacketBudget` now, as `DEFAULT_PAYLOAD_BYTES`,
+`DEFAULT_HEADER_BYTES` and `DEFAULT_EVENT_RESERVE_BYTES`, and a connection's
+actual payload size arrives with `ClientLimits`. What follows is the arithmetic;
+`PacketBudget` is the API.
 
 The event reserve is a floor for events, not a subtraction from every packet, so
 there are two figures:
@@ -550,12 +551,17 @@ authored. Everything else in this table derives from those five.
 ## What is built
 
 `fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
-`odometer`, `ghost`, `select`, `budget`, `sim`. 170 library tests pass.
+`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`. 204 library
+tests pass.
 
 A tick runs end to end: the game moves entities, the odometer observes how far
 they went, the snapshot is rebuilt in cell order, and every due viewer is
-subscribed, gathered, scored and selected against it. It stops at a `Selection`
-per viewer. Packet assembly, events and transport are not built.
+subscribed, gathered, scored and selected against it, then handed a payload
+assembled from that selection and passed to its sink. Viewers are partitioned
+across worker threads.
+
+Not built: the clock that drives the tick, events, and any transport past the
+sink.
 
 ### Subscription
 
@@ -907,7 +913,11 @@ nothing for a stale reference to alias.
 sightings, departures, despawn records written and payload bytes assembled,
 which covers all but two items of §Still to instrument.
 
-Not built: `run` and its clock, threading, packet assembly, events.
+Viewers are partitioned across `thread_count` workers with scoped threads, and
+each worker holds its own gather, selection and packet buffers, so the only
+thing they share for writing is the cache line at a chunk boundary.
+
+Not built: `run` and its clock, and events.
 
 ---
 
@@ -981,14 +991,15 @@ other said 74 and 58 slots, which are 16-byte-record figures against a measured
 
 ### Decided: the score is accumulated position error
 
-Not built. This records the decision and the shape intended, not an
+Built as `select::score_of`. This records the decision; `select.rs` is the
 implementation.
 
 Score is `drift x weight(distance band)`, where `drift` is the odometer
 difference since this client was last told about the entity and `weight` is a
 table indexed by `dist_sq.raw().ilog2()`. One multiply, no divide, no square
-root, integer throughout, so replay stays bit-identical. Ties break on
-`EntityId`.
+root, integer throughout, so replay stays bit-identical. Ties break on candidate
+index rather than on `EntityId`, since the distance-ordered walk fixes that
+order: a replay ranks identically, and the nearer of two tied entities wins.
 
 The alternative was elapsed time since last send, which needs no per-entity
 storage. Rejected because a still entity's score grows without bound under it.
@@ -1306,10 +1317,11 @@ function, but the report also attributes some samples to
 error, and source columns show codegen unit names rather than file and line.
 Adding `[profile.release] debug = 1` would give line-level attribution.
 
-The library itself contains no threading. `CellSnapshot` and `CellOccupants` are
-`Sync + Send`, asserted by test, and `gather_into` takes a caller-supplied
-buffer, which is all a caller needs to fan out. The replication phase that spends
-those threads belongs to `WorldSimulation` and is not built.
+The library contained no threading when this was measured, so the fan-out was
+the benchmark's own. `CellSnapshot` and `CellOccupants` are `Sync + Send`,
+asserted by test, and `gather_into` takes a caller-supplied buffer, which is all
+a caller needs to fan out. `WorldSimulation::tick_with` now spends those threads
+itself; §Thread scaling, measured is that measurement.
 
 ### Walk cap and sub-cell subdivision, measured
 

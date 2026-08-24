@@ -89,8 +89,9 @@ impl PacketWriter {
     /// Assembles one payload and returns it.
     ///
     /// `despawns` and `updates` are written in full: a caller is responsible
-    /// for having sized them against [`state_bytes`], and doing otherwise is a
-    /// programmer error rather than a runtime one.
+    /// for having sized them against
+    /// [`state_bytes_available`](crate::budget::PacketBudget::state_bytes_available),
+    /// and doing otherwise is a programmer error rather than a runtime one.
     ///
     /// The returned slice borrows this writer's buffer, so the next call
     /// overwrites it.

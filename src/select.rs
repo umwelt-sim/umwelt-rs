@@ -51,9 +51,14 @@ impl Weights {
         Weights(table)
     }
 
-    /// Halves every four bands, which is a factor of two per doubling of
-    /// separation. A placeholder until measurement picks a curve; see open
-    /// question 2 in the design document.
+    /// Halves every four bands. A band is `ilog2` of a squared separation, so
+    /// it is half a doubling of distance, which makes this proportional to
+    /// `d^-0.5` rather than to `d^-1`.
+    ///
+    /// A placeholder until measurement picks a curve; see open question 2 in
+    /// the design document. Note that it is indexed from band 0 while anything
+    /// inside a 256 m view radius falls between bands 20 and 35, so only that
+    /// upper stretch of the table is ever read.
     pub fn placeholder() -> Weights {
         let mut t = [0u16; BANDS];
         for (b, slot) in t.iter_mut().enumerate() {

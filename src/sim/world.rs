@@ -329,10 +329,33 @@ impl<G: Game> WorldSimulation<G> {
         self.live.live()
     }
 
+    /// Where one entity is, or `None` if it is not live.
+    ///
+    /// Positions are stored by entity id, so this is a direct index. It answers
+    /// "where is entity N" for the simulation's own arrays; the snapshot, which
+    /// is ordered by cell, still cannot.
+    #[inline(always)]
+    pub fn position(&self, id: EntityId) -> Option<Pos3> {
+        if !self.live.contains(id) {
+            return None;
+        }
+        let i = id.index();
+        Some(Pos3::new(self.xs[i], self.ys[i], self.zs[i]))
+    }
+
     /// Viewer slots ever allocated, registered or not.
     #[inline(always)]
     pub fn viewer_slots(&self) -> usize {
         self.viewers.len()
+    }
+
+    /// The entity a viewer controls, or `None` if the id is not registered.
+    ///
+    /// Exists so a caller never has to reconstruct the mapping itself, which
+    /// invites laundering a `ViewerId` through a raw `u32` into an `EntityId`.
+    pub fn avatar_of(&self, v: ViewerId) -> Option<EntityId> {
+        let viewer = self.viewers.get(v.index())?;
+        viewer.registered.then_some(viewer.avatar)
     }
 
     /// Ghosts one viewer's client currently holds.
@@ -707,6 +730,17 @@ mod tests {
         let stats = s.tick();
         assert_eq!(stats.records, 1, "a newcomer is a status change");
         assert_eq!(stats.new_ghosts, 1);
+    }
+
+    #[test]
+    fn a_viewer_reports_the_entity_it_controls() {
+        let mut s = sim(Walk::still());
+        let ids = populate(&mut s, 10);
+        let v = s.register_viewer(ids[4], ClientLimits::default());
+        assert_eq!(s.avatar_of(v), Some(ids[4]));
+        s.unregister_viewer(v);
+        assert_eq!(s.avatar_of(v), None, "an unregistered viewer controls nothing");
+        assert_eq!(s.avatar_of(ViewerId::from_raw(99)), None);
     }
 
     #[test]

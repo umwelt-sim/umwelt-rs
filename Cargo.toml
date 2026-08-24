@@ -29,3 +29,19 @@ harness = false
 [[bench]]
 name = "gather"
 harness = false
+
+[[bench]]
+name = "odometer"
+harness = false
+
+[[bench]]
+name = "ghost"
+harness = false
+
+[[bench]]
+name = "select"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false

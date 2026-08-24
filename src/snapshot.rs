@@ -36,6 +36,8 @@ pub struct CellOccupants<'a> {
     pub xs: &'a [Fixed],
     pub ys: &'a [Fixed],
     pub zs: &'a [Fixed],
+    /// Index of `ids[0]` within the snapshot's entity arrays.
+    base: u32,
 }
 
 impl<'a> CellOccupants<'a> {
@@ -59,6 +61,16 @@ impl<'a> CellOccupants<'a> {
     #[inline(always)]
     pub fn horizontal(&self, i: usize) -> Pos2 {
         Pos2::new(self.xs[i], self.ys[i])
+    }
+
+    /// The index of the entity at `i` within the snapshot's entity arrays.
+    ///
+    /// Valid only for the snapshot this run came from, and only until its next
+    /// [`CellSnapshot::update`].
+    #[inline(always)]
+    pub fn snapshot_index(&self, i: usize) -> u32 {
+        debug_assert!(i < self.len());
+        self.base + i as u32
     }
 }
 
@@ -135,6 +147,7 @@ impl<'a> SubCells<'a> {
             xs: &self.xs[lo..hi],
             ys: &self.ys[lo..hi],
             zs: &self.zs[lo..hi],
+            base: lo as u32,
         }
     }
 
@@ -149,6 +162,7 @@ impl<'a> SubCells<'a> {
             xs: &self.xs[lo..hi],
             ys: &self.ys[lo..hi],
             zs: &self.zs[lo..hi],
+            base: lo as u32,
         }
     }
 
@@ -329,7 +343,22 @@ impl CellSnapshot {
             xs: &self.xs[lo..hi],
             ys: &self.ys[lo..hi],
             zs: &self.zs[lo..hi],
+            base: lo as u32,
         }
+    }
+
+    /// The id at `i` in the snapshot's entity arrays, as yielded by
+    /// [`CellOccupants::snapshot_index`].
+    #[inline(always)]
+    pub fn id_at(&self, i: usize) -> EntityId {
+        self.ids[i]
+    }
+
+    /// The position at `i` in the snapshot's entity arrays, as yielded by
+    /// [`CellOccupants::snapshot_index`].
+    #[inline(always)]
+    pub fn pos_at(&self, i: usize) -> Pos3 {
+        Pos3::new(self.xs[i], self.ys[i], self.zs[i])
     }
 
     /// How many entities occupy one cell.
@@ -673,7 +702,7 @@ mod tests {
 
     // -- subdivision ---------------------------------------------------
 
-    /// `n` entities scattered inside the single cell containing `m` metres.
+    /// `n` entities scattered inside the single cell containing `m` meters.
     fn crowd_in_one_cell(cfg: &WorldConfig, n: usize, m: i32, seed: u64) -> Vec<Pos3> {
         let cell = cfg.cell_size().raw() as u32;
         let origin = (Fixed::from_meters(m).raw() as u32) & !(cell - 1);

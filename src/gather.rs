@@ -18,13 +18,17 @@ use crate::subscription::Subscription;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DiscoveredEntity {
     pub id: EntityId,
+    /// Index into the entity arrays of the snapshot this was gathered from.
+    /// Reading the position needs no id lookup. Invalidated by the next
+    /// [`CellSnapshot::update`].
+    pub snapshot_index: u32,
     pub dist_sq: DistSq,
 }
 
 impl DiscoveredEntity {
     #[inline(always)]
-    pub const fn new(id: EntityId, dist_sq: DistSq) -> DiscoveredEntity {
-        DiscoveredEntity { id, dist_sq }
+    pub const fn new(id: EntityId, snapshot_index: u32, dist_sq: DistSq) -> DiscoveredEntity {
+        DiscoveredEntity { id, snapshot_index, dist_sq }
     }
 }
 
@@ -196,6 +200,7 @@ fn take(
         }
         out.push(DiscoveredEntity::new(
             entities.ids[i],
+            entities.snapshot_index(i),
             viewer.dist_sq(entities.pos(i)),
         ));
     }
@@ -208,14 +213,15 @@ mod tests {
     fn found(id: u32, radius_m: i32) -> DiscoveredEntity {
         DiscoveredEntity::new(
             EntityId::from_raw(id),
+            0,
             DistSq::from_radius(crate::fixed::Fixed::from_meters(radius_m)),
         )
     }
 
     #[test]
     fn record_is_sixteen_bytes() {
-        // 4 bytes of id and 8 of squared distance, padded to DistSq's
-        // 8-byte alignment.
+        // 4 bytes of id, 4 of snapshot index, 8 of squared distance. The index
+        // occupies padding that DistSq's 8-byte alignment already required.
         assert_eq!(size_of::<DiscoveredEntity>(), 16);
     }
 
@@ -313,7 +319,7 @@ mod tests {
 
     // -- ordered walk and cap -------------------------------------------
 
-    /// `n` entities scattered inside the cell containing `m` metres.
+    /// `n` entities scattered inside the cell containing `m` meters.
     fn crowd(cfg: &WorldConfig, n: usize, m: i32, seed: u64) -> Vec<Pos3> {
         let cell = cfg.cell_size().raw() as u32;
         let origin = (crate::fixed::Fixed::from_meters(m).raw() as u32) & !(cell - 1);
@@ -435,6 +441,56 @@ mod tests {
             out.len() - first < 600,
             "a call starting over the cap should stop almost immediately"
         );
+    }
+
+    #[test]
+    fn snapshot_index_resolves_in_an_undivided_cell() {
+        let cfg = WorldConfig::default();
+        let viewer = Pos3::from_meters(2048, 2048, 0);
+        let pts: Vec<Pos3> =
+            (0..40).map(|i| Pos3::from_meters(2048 + i * 5, 2048 + i * 3, i)).collect();
+        let snap = snapshot_of(&cfg, &pts);
+        let sub = Subscription::at_center(&cfg, cfg.cell_of(viewer.horizontal()));
+        let mut out = DiscoveredEntities::new();
+        snap.gather_into(viewer, sub, &mut out);
+
+        assert!(!out.is_empty());
+        for e in out.iter() {
+            let i = e.snapshot_index as usize;
+            assert_eq!(snap.id_at(i), e.id, "index must name the entity it was found with");
+            assert_eq!(
+                snap.pos_at(i),
+                pts[e.id.index()],
+                "index must reach that entity's position"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_index_resolves_in_a_subdivided_cell() {
+        let cfg = WorldConfig::default();
+        let pts = crowd(&cfg, 3000, 2048, 0x6666);
+        let viewer = pts[0];
+        let snap = snapshot_of(&cfg, &pts);
+        let sub = Subscription::at_center(&cfg, cfg.cell_of(viewer.horizontal()));
+        assert!(
+            snap.sub_cells(cfg.cell_id(cfg.cell_of(viewer.horizontal()))).is_some(),
+            "test is meaningless unless the cell is subdivided"
+        );
+
+        let mut out = DiscoveredEntities::new();
+        snap.gather_into(viewer, sub, &mut out);
+
+        assert!(!out.is_empty());
+        for e in out.iter() {
+            let i = e.snapshot_index as usize;
+            assert_eq!(snap.id_at(i), e.id, "index must name the entity it was found with");
+            assert_eq!(
+                snap.pos_at(i),
+                pts[e.id.index()],
+                "index must reach that entity's position"
+            );
+        }
     }
 
     #[test]

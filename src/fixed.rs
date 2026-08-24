@@ -1,6 +1,6 @@
 //! Fixed-point scalar arithmetic.
 //!
-//! A [`Fixed`] is an `i32` with 10 fractional bits: one metre is 1024, and the
+//! A [`Fixed`] is an `i32` with 10 fractional bits: one meter is 1024, and the
 //! smallest representable step is 1/1024 m (~0.98 mm). Range is roughly
 //! ±2,097,152 m. This is like a distance version of managing money in terms of
 //! cents rather than fractional dollars.
@@ -19,7 +19,7 @@ use core::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 /// do simulation calculations with cheap and fast integer math.
 pub const FIXED_SHIFT: u32 = 10;
 
-/// One metre in raw units.
+/// One meter in raw units.
 pub const FIXED_ONE: i32 = 1 << FIXED_SHIFT;
 
 /// A scalar distance or coordinate.
@@ -40,13 +40,13 @@ impl Fixed {
     /// Smallest representable step: 1/1024 m.
     pub const EPSILON: Fixed = Fixed(1);
 
-    /// From whole metres.
+    /// From whole meters.
     #[inline(always)]
     pub const fn from_meters(m: i32) -> Fixed {
         Fixed(m * FIXED_ONE)
     }
 
-    /// From metres and thousandths, e.g. `from_millis(3, 500)` is 3.5 m.
+    /// From meters and thousandths, e.g. `from_millis(3, 500)` is 3.5 m.
     /// Rounds toward zero; 1/1000 is not exactly representable in binary.
     #[inline(always)]
     pub const fn from_millis(m: i32, milli: i32) -> Fixed {
@@ -65,7 +65,7 @@ impl Fixed {
         self.0
     }
 
-    /// Whole metres, truncated toward negative infinity.
+    /// Whole meters, truncated toward negative infinity.
     #[inline(always)]
     pub const fn floor_meters(self) -> i32 {
         self.0 >> FIXED_SHIFT
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(three * 2, Fixed::from_meters(6));
         assert_eq!(three * Fixed::from_meters(2), Fixed::from_meters(6));
         // Same answer here, but only because 2 m and the count 2 coincide.
-        // Half a metre shows the difference.
+        // Half a meter shows the difference.
         let half = Fixed::from_millis(0, 500);
         assert_eq!(three * half, Fixed::from_millis(1, 500));
     }

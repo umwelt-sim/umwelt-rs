@@ -815,6 +815,30 @@ the simulation rather than the transport wants. `RecordingSink` keeps the latest
 payload per viewer for tests and examples; it allocates and locks, so it is not
 a production path.
 
+**A sink is the one part of a tick the library does not control**, and
+`DESIGN.md`'s own note on owning the loop applies: safe Rust cannot preempt a
+synchronous callback, so a sink that blocks cannot be cancelled. What is done
+instead:
+
+- **Attributed.** `TickStats::sink_nanos` reports time spent inside `send`,
+  summed across workers. Measured, the timing costs about 1% of a tick, so it is
+  always on rather than sampled. Divide by the worker count for what it cost in
+  wall clock.
+- **Loud on panic.** A panicking sink propagates out of `tick` rather than being
+  swallowed. Viewers served before it keep their advanced state, which is safe
+  because per-viewer state is independent, and a test pins the behavior.
+
+Measured, why this matters: 8,192 viewers on an evenly spread region take
+6.02 ms with `NullSink` and 10.22 ms with `RecordingSink`, which allocates and
+takes one lock per send. **A sink that merely copies its payload under a shared
+mutex is 70% of the tick**, at 513 ns per send, and before `sink_nanos` existed
+nothing would have said so.
+
+Not built: a watchdog that fails the process loudly when a sink hangs rather
+than silently missing every subsequent tick. That is a process-level policy and
+belongs with `run`, which is also not built. Nothing currently defends against a
+sink that blocks forever.
+
 Not built: the shipped implementation that speaks the sim-to-edge protocol,
 which is the one that would hand off to an I/O thread and drop rather than
 queue.

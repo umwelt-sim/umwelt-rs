@@ -22,7 +22,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use umwelt::select::{Policy, Weights};
 use umwelt::sim::{DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP};
 use umwelt::{
-    ClientLimits, EntityId, Fixed, Game, Pos3, Step, WorldConfig, WorldSimulation,
+    ClientLimits, EntityId, Fixed, Game, Pos3, RecordingSink, Step, WorldConfig,
+    WorldSimulation,
 };
 
 /// Ticks run before timing, so ghost tables reach a steady size and no timed
@@ -411,6 +412,30 @@ fn bench_threads(c: &mut Criterion) {
     }
 }
 
+/// What a sink costs the tick. NullSink discards; RecordingSink allocates and
+/// takes a lock per send, which is roughly the floor for a sink that does
+/// anything at all. The difference is what a badly behaved one buys you.
+fn bench_sink(c: &mut Criterion) {
+    let cfg = WorldConfig::default();
+    let mut group = c.benchmark_group("pipeline/sink");
+    group.sample_size(30);
+
+    let positions = uniform(&cfg, 8_192, 0xA11CE);
+
+    let mut null = build(positions.clone(), 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF);
+    group.throughput(Throughput::Elements(8_192));
+    group.bench_function("null", |b| b.iter(|| black_box(null.tick())));
+    drop(null);
+
+    let mut recording = build(positions, 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF)
+        .with_sink(RecordingSink::new());
+    for _ in 0..10 {
+        recording.tick();
+    }
+    group.bench_function("recording", |b| b.iter(|| black_box(recording.tick())));
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_uniform,
@@ -419,6 +444,7 @@ criterion_group!(
     bench_clustered,
     bench_ghost_cap,
     bench_walk_cap,
-    bench_threads
+    bench_threads,
+    bench_sink
 );
 criterion_main!(benches);

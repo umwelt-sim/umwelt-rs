@@ -107,7 +107,11 @@ impl Step<'_> {
 }
 
 /// What one tick did, for instrumentation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Deliberately not `PartialEq`: `sink_nanos` is a wall-clock measurement, so
+/// two runs of identical work do not produce equal stats and comparing them
+/// would look meaningful while never being true.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TickStats {
     /// Viewers served. Excludes those not due this tick and those whose avatar
     /// is dead or outside the region.
@@ -124,6 +128,16 @@ pub struct TickStats {
     pub despawns_sent: u64,
     /// Payload bytes assembled.
     pub bytes: u64,
+    /// Nanoseconds spent inside [`PayloadSink::send`], summed across workers.
+    ///
+    /// Wall clock, so it is the one field here that does not reproduce.
+    ///
+    /// Summed, not wall clock: divide by
+    /// [`thread_count`](WorldSimulation::thread_count) for what it cost the
+    /// tick. A sink is the one part of a tick the library does not control, and
+    /// safe Rust cannot preempt one that blocks, so the most that can be done
+    /// is to say plainly how much of the tick it took.
+    pub sink_nanos: u64,
 }
 
 impl TickStats {
@@ -140,6 +154,7 @@ impl TickStats {
         self.departed += o.departed;
         self.despawns_sent += o.despawns_sent;
         self.bytes += o.bytes;
+        self.sink_nanos += o.sink_nanos;
     }
 }
 
@@ -221,7 +236,9 @@ fn serve<S: PayloadSink>(f: &Frame<'_, S>, id: ViewerId, v: &mut Viewer, w: &mut
         }),
     );
 
+    let handoff = std::time::Instant::now();
     f.sink.send(id, writer.payload());
+    stats.sink_nanos += handoff.elapsed().as_nanos() as u64;
 
     // Departures are found by the eviction inside `select`, after this tick's
     // records were chosen, so they ride the next packet.
@@ -973,6 +990,67 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_sink_is_not_swallowed() {
+        struct Boom;
+        impl crate::sim::sink::PayloadSink for Boom {
+            fn send(&self, _v: ViewerId, _p: &[u8]) {
+                panic!("sink exploded");
+            }
+        }
+        let mut s = sim(Walk::new(1)).with_sink(Boom);
+        let ids = populate(&mut s, 60);
+        s.register_viewer(ids[0], ClientLimits::default());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.tick()));
+        assert!(r.is_err(), "a panicking sink must surface, not be swallowed");
+    }
+
+    #[test]
+    fn a_slow_sink_delays_the_tick_but_is_attributed() {
+        struct Slow;
+        impl crate::sim::sink::PayloadSink for Slow {
+            fn send(&self, _v: ViewerId, _p: &[u8]) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        let mut s = sim(Walk::new(1)).with_sink(Slow);
+        let ids = populate(&mut s, 40);
+        for id in ids.iter().take(20) {
+            s.register_viewer(*id, ClientLimits::default());
+        }
+        let t = std::time::Instant::now();
+        let stats = s.tick();
+        let took = t.elapsed();
+        assert_eq!(stats.viewers, 20);
+        assert!(
+            took.as_micros() >= 200,
+            "the tick absorbs the sink's cost, since it cannot be preempted: {took:?}"
+        );
+        // Nothing can stop it, but nobody has to guess where the time went.
+        assert!(
+            stats.sink_nanos >= 20 * 200_000,
+            "the sink's cost must be attributable, got {} ns across 20 sends",
+            stats.sink_nanos
+        );
+    }
+
+    #[test]
+    fn a_quick_sink_barely_registers() {
+        let mut s = sim(Walk::new(1)).with_sink(RecordingSink::new());
+        let ids = populate(&mut s, 200);
+        for id in ids.iter().take(20) {
+            s.register_viewer(*id, ClientLimits::default());
+        }
+        s.tick();
+        let stats = s.tick();
+        assert_eq!(stats.viewers, 20);
+        assert!(stats.sink_nanos > 0, "a sink that does anything is measurable");
+        assert!(
+            stats.sink_nanos < 20 * 200_000,
+            "a sink that copies a payload is nothing like one that sleeps"
+        );
+    }
+
+    #[test]
     fn the_default_sink_is_free_to_hold() {
         assert_eq!(size_of::<NullSink>(), 0);
     }
@@ -1017,7 +1095,13 @@ mod tests {
             for id in ids.iter().take(50) {
                 s.register_viewer(*id, ClientLimits::default());
             }
-            let stats: Vec<TickStats> = (0..12).map(|_| s.tick()).collect();
+            // Everything but the timing, which is wall clock and reproduces
+            // for nobody.
+            let counts = |t: TickStats| {
+                [t.viewers, t.candidates, t.records, t.new_ghosts, t.departed,
+                 t.despawns_sent, t.bytes]
+            };
+            let stats: Vec<[u64; 7]> = (0..12).map(|_| counts(s.tick())).collect();
             let ghosts: Vec<usize> =
                 (0..50).map(|i| s.ghost_count(ViewerId::from_raw(i))).collect();
             (stats, ghosts)

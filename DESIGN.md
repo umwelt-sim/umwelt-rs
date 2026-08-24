@@ -1082,10 +1082,11 @@ that is over budget by accident is a bug in the table.
 now encodes ~98 records per viewer and hands them to a sink, work that did not
 exist when the earliest pipeline tables were taken. Measured against a rerun of
 the same scenarios, the gap is 0.39 µs per viewer on the uniform region and 0.27
-on the town square. §Thread scaling, measured has been rerun and carries the
-current numbers; §Whole-pipeline benchmark and §Ghost cap and walk cap have not,
-and their absolute figures are low by about that much. Their shapes are
-unaffected, which is what those two tables are for.
+on the town square. §Thread scaling, §Whole-pipeline benchmark and §Ghost cap
+and walk cap have all been rerun and carry current numbers, with the
+pre-assembly figures kept beside them. **The scenario groups pin one thread**,
+because what they compare is per-viewer cost between populations; §Thread
+scaling carries the speedups to divide by.
 
 Core i7-6700 (4 cores / 8 threads, Skylake, 8 MB L3), 64 GB. Single-threaded.
 Per-viewer figures are median time divided by N. Columns are cumulative.
@@ -1666,18 +1667,27 @@ grow, since only the gather scales with viewer count.
 Apple M1, 8 cores, single-threaded, against a 50 ms tick. **Not the machine the
 subscription and gather figures were taken on.**
 
-The per-tick work every row also pays, with no viewers registered, is 60 µs at
+The per-tick work every row also pays, with no viewers registered, is 59 µs at
 8,192 entities: 0.12% of a tick. Essentially all cost is per-viewer.
 
-| scenario | viewers | tick | of a tick | per viewer |
-|---|---|---|---|---|
-| uniform | 1,000 | 2.51 ms | 5% | 2.45 µs |
-| uniform | 8,192 | 20.55 ms | 41% | 2.50 µs |
-| same world, nothing moving | 8,192 | 13.20 ms | 26% | 1.60 µs |
-| clustered region | 1,000 | 6.81 ms | 14% | 6.75 µs |
-| clustered region | 10,000 | 65.44 ms | 131% | 6.54 µs |
-| town square | 2,048 | 11.23 ms | 22% | 5.45 µs |
-| town square | 8,192 | 49.73 ms | 99% | 6.06 µs |
+**Rerun after payload assembly.** The rows this table used to carry were taken
+before a tick encoded anything, and are kept in the last column so the cost of
+that work is visible rather than lost.
+
+| scenario | viewers | tick | of a tick | per viewer | before assembly |
+|---|---|---|---|---|---|
+| uniform | 1,000 | 2.97 ms | 6% | 2.97 µs | 2.45 µs |
+| uniform | 8,192 | 24.31 ms | 49% | 2.97 µs | 2.50 µs |
+| same world, nothing moving | 8,192 | 13.93 ms | 28% | 1.70 µs | 1.60 µs |
+| clustered region | 1,000 | 6.95 ms | 14% | 6.95 µs | 6.75 µs |
+| clustered region | 10,000 | 69.69 ms | 139% | 6.97 µs | 6.54 µs |
+| town square | 2,048 | 12.60 ms | 25% | 6.15 µs | 5.45 µs |
+| town square | 8,192 | 54.22 ms | 108% | 6.62 µs | 6.06 µs |
+
+One thread. Divide by the speedups in §Thread scaling for what these cost on all
+cores: the town square's 108% becomes 27% at eight threads, measured, and the
+clustered row's 139% becomes about 34%, computed from the town square's 4.08x
+rather than measured.
 
 The clustered rows are the region-in-use case §Not yet benchmarked asked for:
 50,000 entities, most cells sparse and eight dense ones holding sixty percent,
@@ -1685,8 +1695,17 @@ viewers drawn from the population so they land where the density is. It behaves
 like a mild town square rather than like the uniform case.
 
 **What the accumulator saves**, measured: the same world and the same viewers
-cost 13.20 ms when nothing moves against 20.55 ms when everything does, and the
+cost 13.93 ms when nothing moves against 24.44 ms when everything does, and the
 still case sends no records at all.
+
+**What assembly costs, from the same pair.** The still row sends nothing, so it
+pays a header and a sink dispatch per viewer and no record encoding; the moving
+row encodes 91.7 records per viewer. The gap between them was 0.90 µs per viewer
+before assembly existed and is 1.28 µs now, and the whole of that 0.39 µs
+increase is record encoding: **4.2 ns per record**. The still row's own increase,
+just under 0.1 µs per viewer, is the header, the sink call and the timing around
+it. Both pairs were measured within one session, so between-session drift
+largely cancels out of the difference.
 
 Every earlier figure for this pipeline was assembled by adding separately
 measured stages, two of them by subtraction. Those estimates were 55% optimiztic
@@ -1796,6 +1815,10 @@ arrivals and no departures at steady state, and the crowded cases run 1.7x to
 
 Uniform is unchanged because the cap never bound there.
 
+Both columns predate payload assembly and neither has been rerun, since the
+"before" one would mean putting the bug back. They are a ratio measured within
+one session and should not be compared against the refreshed tables above.
+
 **This is the failure §Not yet benchmarked predicted**: "An entity that drops out
 and returns looks maximally stale and wins a slot immediately, so the least
 useful part of the visible set could generate the most updates." Nothing short
@@ -1833,15 +1856,17 @@ and 13.03 at eight.** Rerun, the same scenarios measure **0.39 µs per viewer
 more on the uniform region and 0.27 more on the town square**, or 3.22 and
 2.25 ms at one thread.
 
-That gap is measured; what it is spent on is inferred. The work that landed
-between the two runs is payload assembly and the sink call, which a tick did not
-do when the old rows were taken, and ~98 record encodes plus a dispatch per
-viewer is the right size for it. Corroborating rather than isolating: the
-figures elsewhere in this document taken *after* assembly agree with the rows
-above, 6.02 ms against 6.15 for the uniform eight-thread case; see §Payloads
-leave through a sink. **Nothing regressed between those two measurements**, and
-an A/B rules out this tuning as a cause: at a grace of 3 rather than 1 the same
-rows measure 25.04, 13.14, 7.09 and 6.08 ms, which is no change at all.
+The work that landed between the two runs is payload assembly and the sink call,
+which a tick did not do when the old rows were taken. §Whole-pipeline isolates
+that against its own still-versus-moving pair: 4.2 ns per record encoded, plus
+just under 0.1 µs per viewer for the header and the dispatch, which is the right
+size for what is missing here. Corroborating: the figures elsewhere in this
+document taken *after* assembly agree with the rows above, 6.02 ms against 6.15
+for the uniform eight-thread case; see §Payloads leave through a sink.
+
+**Nothing regressed between those two measurements**, and an A/B rules out the
+accumulator tuning as a cause: at a grace of 3 rather than 1 the same rows
+measure 25.04, 13.14, 7.09 and 6.08 ms, which is no change at all.
 
 The whole pipeline scales as well as the gather alone did at 3.53x and 4.32x on
 this machine, so the earlier practice of extrapolating the gather's figure to
@@ -1858,38 +1883,40 @@ remove it and needs either a dependency or channels and parking.
 Both sweeps are the town square at 8,192 viewers, after the fix, with the gather
 sized to the ghost cap.
 
-| ghost cap | tick | per viewer |
-|---|---|---|
-| 64 | 17.74 ms | 2.16 µs |
-| 128 | 28.27 ms | 3.44 µs |
-| 256 | 48.21 ms | 5.88 µs |
-| 512 | 96.26 ms | 11.75 µs |
+Rerun after payload assembly, one thread, and extended to a cap of 1,024:
+
+| ghost cap | tick | of a tick | per viewer | records sent | before assembly |
+|---|---|---|---|---|---|
+| 64 | 15.75 ms | 32% | 1.92 µs | 64.0 | 2.16 µs |
+| 128 | 29.59 ms | 59% | 3.61 µs | 98.0 | 3.44 µs |
+| 256 | 54.31 ms | 109% | 6.63 µs | 98.0 | 5.88 µs |
+| 512 | 103.42 ms | 207% | 12.62 µs | 98.0 | 11.75 µs |
+| 1,024 | 203.45 ms | 407% | 24.83 µs | 98.0 | |
 
 Monotone and close to linear in the cap, which it was not before the fix. The
-cap is a dial between cost and how many entities a client can see.
+cap is a dial between cost and how many entities a client can see. Every row
+from 256 up is over a tick on one thread; at eight the default cap is 27%.
 
-These rows are single-threaded, which the benchmark no longer is by default:
-`WorldSimulation` gained threads after they were taken, and running the same
-sweep today spends `available_parallelism` unless a caller says otherwise. It
-was rerun both ways during tuning, extended to a cap of 1,024, and paired with
-what each cap costs in accuracy; see §Quality harness, measured. **The rerun is
-8 to 12% slower than this table at one thread**, in the direction of the
-between-session drift already documented, with the same shape.
+The cap of 64 is the one row that got *cheaper* than its pre-assembly figure,
+and the records column says why: it fills only 64 of the 98 slots a packet
+holds, so it encodes a third fewer records than any row below it. That is the
+same finding the quality harness reports as a packet that does not fill.
 
 What the cap should be is no longer open. 256, because below about 160 a
 client's packet does not fill and above 256 accuracy falls in every band while
-cost keeps rising linearly.
+cost keeps rising linearly. See §Quality harness, measured, which pairs each cap
+here with what it costs in accuracy.
 
 Selection keeps the nearest `ghost_cap` candidates and discards the rest
 unscored, so a walk cap above the ghost cap is waste. At a ghost cap of 256:
 
-| walk cap | candidates gathered | tick |
-|---|---|---|
-| 256 | 322.8 | 44.54 ms |
-| 512 | 581.3 | 48.29 ms |
-| 1,024 | 1,094.0 | 57.22 ms |
+| walk cap | candidates gathered | tick | before assembly |
+|---|---|---|---|
+| 256 | 322.8 | 54.41 ms | 44.54 ms |
+| 512 | 581.3 | 58.41 ms | 48.29 ms |
+| 1,024 | 1,094.0 | 67.02 ms | 57.22 ms |
 
-7.8% for matching them, and one fewer parameter. Safe because the cap is checked
+6.9% for matching them, and one fewer parameter. Safe because the cap is checked
 at cell boundaries, so a walk cap of 256 still delivers ~323 candidates and
 fills the set. `DEFAULT_WALK_CAP` is now `DEFAULT_GHOST_CAP`.
 

@@ -11,6 +11,12 @@
 //! A baseline registers no viewers, so subtracting it leaves the per-viewer
 //! replication cost with the per-tick work removed.
 //!
+//! The scenario groups pin one thread. What they compare is per-viewer cost
+//! between populations, and a worker count in the middle of that is noise with
+//! a heterogeneous core count. `pipeline/threads` is where scaling is measured,
+//! and `pipeline/viewer_speed` runs both. Divide a scenario row by the speedup
+//! in `pipeline/threads` for what it costs on all cores.
+//!
 //! Entities oscillate by a meter rather than traveling, so a population shape
 //! holds for arbitrarily many iterations and a crowd stays a crowd. Neighbors
 //! move in opposite directions, so candidate sets churn rather than drifting in
@@ -316,6 +322,7 @@ fn bench_uniform(c: &mut Criterion) {
             DEFAULT_GHOST_CAP,
             0xBEEF,
         );
+        sim.set_thread_count(1);
         describe(&format!("uniform/{viewers}"), &mut sim);
         group.throughput(Throughput::Elements(viewers.max(1) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(viewers), &viewers, |b, _| {
@@ -341,6 +348,7 @@ fn bench_still_versus_moving(c: &mut Criterion) {
             DEFAULT_GHOST_CAP,
             0xBEEF,
         );
+        sim.set_thread_count(1);
         describe(&format!("motion/{label}"), &mut sim);
         group.throughput(Throughput::Elements(10_000));
         group.bench_with_input(BenchmarkId::from_parameter(label), &label, |b, _| {
@@ -365,6 +373,7 @@ fn bench_town_square(c: &mut Criterion) {
             DEFAULT_GHOST_CAP,
             0xD00D,
         );
+        sim.set_thread_count(1);
         describe(&format!("town_square/{crowd}"), &mut sim);
         group.throughput(Throughput::Elements(crowd as u64));
         group.bench_with_input(BenchmarkId::from_parameter(crowd), &crowd, |b, _| {
@@ -391,6 +400,7 @@ fn bench_clustered(c: &mut Criterion) {
             DEFAULT_GHOST_CAP,
             0xF00D,
         );
+        sim.set_thread_count(1);
         describe(&format!("clustered/{viewers}"), &mut sim);
         group.throughput(Throughput::Elements(viewers as u64));
         group.bench_with_input(BenchmarkId::from_parameter(viewers), &viewers, |b, _| {
@@ -480,6 +490,7 @@ fn bench_ghost_cap(c: &mut Criterion) {
             cap,
             0xD00D,
         );
+        sim.set_thread_count(1);
         describe(&format!("ghost_cap/{cap}"), &mut sim);
         group.throughput(Throughput::Elements(8_192));
         group.bench_with_input(BenchmarkId::from_parameter(cap), &cap, |b, _| {
@@ -506,6 +517,7 @@ fn bench_walk_cap(c: &mut Criterion) {
             DEFAULT_GHOST_CAP,
             0xD00D,
         );
+        sim.set_thread_count(1);
         describe(&format!("walk_cap/{walk}"), &mut sim);
         group.throughput(Throughput::Elements(8_192));
         group.bench_with_input(BenchmarkId::from_parameter(walk), &walk, |b, _| {

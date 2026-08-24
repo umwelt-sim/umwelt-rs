@@ -125,6 +125,74 @@ impl TickStats {
     pub fn dropped_by_budget(&self) -> u64 {
         self.candidates.saturating_sub(self.records)
     }
+
+    fn merge(&mut self, o: TickStats) {
+        self.viewers += o.viewers;
+        self.candidates += o.candidates;
+        self.records += o.records;
+        self.new_ghosts += o.new_ghosts;
+        self.departed += o.departed;
+    }
+}
+
+/// One worker thread's scratch.
+///
+/// `DiscoveredEntities` and `Selection` are each 128-byte aligned, so adjacent
+/// workers cannot share a cache line however these are stored.
+#[derive(Debug)]
+struct Scratch {
+    found: DiscoveredEntities,
+    selection: Selection,
+    stats: TickStats,
+}
+
+/// Everything a worker reads and nothing it writes, so it is shared across
+/// threads by reference.
+struct Frame<'a> {
+    tick: u32,
+    cfg: &'a WorldConfig,
+    snap: &'a CellSnapshot,
+    odo: &'a Odometer,
+    live: &'a LiveSet,
+    xs: &'a [Fixed],
+    ys: &'a [Fixed],
+    zs: &'a [Fixed],
+    policy: &'a Policy,
+    walk_cap: usize,
+}
+
+/// Subscribes, gathers, scores and selects for one viewer. Returns whether it
+/// was served.
+fn serve(f: &Frame<'_>, id: ViewerId, v: &mut Viewer, w: &mut Scratch) -> bool {
+    if !v.registered || !v.due(id, f.tick) {
+        return false;
+    }
+    let avatar = v.avatar;
+    if !f.live.contains(avatar) {
+        return false;
+    }
+    let i = avatar.index();
+    let at = Pos3::new(f.xs[i], f.ys[i], f.zs[i]);
+    if !f.cfg.contains(at) {
+        return false;
+    }
+
+    let sub = Subscription::at_center(f.cfg, f.cfg.cell_of(at.horizontal()));
+    v.sub = Some(sub);
+
+    w.found.clear();
+    f.snap.gather_into_capped(at, sub, f.walk_cap, &mut w.found);
+
+    // No event queue exists yet, so nothing is held back for one.
+    let slots = v.budget.slots(0);
+    select(f.tick, &w.found, f.odo, f.policy, slots, &mut v.ghosts, &mut w.selection);
+
+    w.stats.viewers += 1;
+    w.stats.candidates += w.found.len() as u64;
+    w.stats.records += w.selection.records().len() as u64;
+    w.stats.new_ghosts += w.selection.records().iter().filter(|r| r.is_new()).count() as u64;
+    w.stats.departed += w.selection.departed().len() as u64;
+    true
 }
 
 /// One region's simulation.
@@ -143,9 +211,9 @@ pub struct WorldSimulation<G: Game> {
     viewers: Vec<Viewer>,
     free: Vec<ViewerId>,
 
-    /// Per-worker scratch. Single-threaded for now, so there is one of each.
-    found: DiscoveredEntities,
-    selection: Selection,
+    /// One per worker thread.
+    workers: Vec<Scratch>,
+    threads: usize,
 
     walk_cap: usize,
     policy: Policy,
@@ -179,8 +247,8 @@ impl<G: Game> WorldSimulation<G> {
     ) -> WorldSimulation<G> {
         let codec = RecordCodec::new(&cfg);
         let snap = CellSnapshot::new(&cfg);
-        let overshoot = snap.sub_threshold() as usize;
-        WorldSimulation {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut sim = WorldSimulation {
             cfg,
             game,
             xs: Vec::new(),
@@ -191,17 +259,43 @@ impl<G: Game> WorldSimulation<G> {
             snap,
             viewers: Vec::new(),
             free: Vec::new(),
-            // Sized so a tick does not grow them. The gather checks its cap at
-            // cell boundaries and a cell below the subdivision threshold is
-            // walked whole, so the overshoot is bounded by that threshold
-            // rather than by a sub-cell.
-            found: DiscoveredEntities::with_capacity(walk_cap + overshoot),
-            selection: Selection::with_capacity(policy.ghost_cap),
+            workers: Vec::new(),
+            threads: 1,
             walk_cap,
             policy,
             codec,
             tick: 0,
-        }
+        };
+        sim.set_thread_count(threads);
+        sim
+    }
+
+    /// Worker threads used for per-viewer replication.
+    ///
+    /// Defaults to [`std::thread::available_parallelism`]. It is configurable
+    /// because the right number is not obvious: hyperthreading or efficiency
+    /// cores help an evenly spread region and hurt a crowded one.
+    #[inline(always)]
+    pub fn thread_count(&self) -> usize {
+        self.threads
+    }
+
+    /// Allocates scratch for `n` workers. Clamped to at least one.
+    ///
+    /// Each worker's buffers are sized so a tick does not grow them. The gather
+    /// checks its cap at cell boundaries and a cell below the subdivision
+    /// threshold is walked whole, so the overshoot is bounded by that threshold
+    /// rather than by a sub-cell.
+    pub fn set_thread_count(&mut self, n: usize) {
+        self.threads = n.max(1);
+        let overshoot = self.snap.sub_threshold() as usize;
+        let cap = self.walk_cap + overshoot;
+        let ghosts = self.policy.ghost_cap;
+        self.workers.resize_with(self.threads, || Scratch {
+            found: DiscoveredEntities::with_capacity(cap),
+            selection: Selection::with_capacity(ghosts),
+            stats: TickStats::default(),
+        });
     }
 
     #[inline(always)]
@@ -284,7 +378,7 @@ impl<G: Game> WorldSimulation<G> {
 
     /// Advances one tick, discarding the per-viewer selections.
     pub fn tick(&mut self) -> TickStats {
-        self.tick_with(|_, _, _| {})
+        self.tick_with(&|_, _, _| {})
     }
 
     /// Advances one tick, handing each served viewer's selection to `on_viewer`
@@ -293,9 +387,13 @@ impl<G: Game> WorldSimulation<G> {
     /// The [`Selection`] and [`DiscoveredEntities`] passed in are scratch that
     /// the next viewer overwrites, so anything worth keeping must be copied.
     /// Packet assembly attaches here.
+    ///
+    /// Viewers are partitioned across [`thread_count`](Self::thread_count)
+    /// workers, so `on_viewer` is called from several threads at once and must
+    /// be `Sync`.
     pub fn tick_with(
         &mut self,
-        mut on_viewer: impl FnMut(ViewerId, &Selection, &DiscoveredEntities),
+        on_viewer: &(impl Fn(ViewerId, &Selection, &DiscoveredEntities) + Sync),
     ) -> TickStats {
         self.tick = self.tick.wrapping_add(1);
 
@@ -314,64 +412,70 @@ impl<G: Game> WorldSimulation<G> {
         self.odo.accumulate(&self.xs, &self.ys, &self.zs, &self.live);
         self.snap.update(&self.xs, &self.ys, &self.zs, &self.live);
 
-        let mut stats = TickStats::default();
-        for i in 0..self.viewers.len() {
-            let id = ViewerId::from_raw(i as u32);
-            if !self.serve(id, &mut stats) {
-                continue;
+        let frame = Frame {
+            tick: self.tick,
+            cfg: &self.cfg,
+            snap: &self.snap,
+            odo: &self.odo,
+            live: &self.live,
+            xs: &self.xs,
+            ys: &self.ys,
+            zs: &self.zs,
+            policy: &self.policy,
+            walk_cap: self.walk_cap,
+        };
+
+        let viewers = &mut self.viewers;
+        let workers = &mut self.workers;
+        for w in workers.iter_mut() {
+            w.stats = TickStats::default();
+        }
+        if viewers.is_empty() {
+            return TickStats::default();
+        }
+
+        // One worker is the common case in tests and the cheap case for a small
+        // region, and scoped threads cost a spawn each per tick.
+        let threads = self.threads.min(viewers.len());
+        if threads <= 1 {
+            let w = &mut workers[0];
+            for (k, v) in viewers.iter_mut().enumerate() {
+                let id = ViewerId::from_raw(k as u32);
+                if serve(&frame, id, v, w) {
+                    on_viewer(id, &w.selection, &w.found);
+                }
             }
-            on_viewer(id, &self.selection, &self.found);
+            return w.stats;
+        }
+
+        let chunk = viewers.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (c, (vs, w)) in viewers.chunks_mut(chunk).zip(workers.iter_mut()).enumerate() {
+                let frame = &frame;
+                let base = c * chunk;
+                scope.spawn(move || {
+                    for (k, v) in vs.iter_mut().enumerate() {
+                        let id = ViewerId::from_raw((base + k) as u32);
+                        if serve(frame, id, v, w) {
+                            on_viewer(id, &w.selection, &w.found);
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut stats = TickStats::default();
+        for w in workers.iter() {
+            stats.merge(w.stats);
         }
         stats
-    }
-
-    /// Subscribes, gathers, scores and selects for one viewer. Returns whether
-    /// it was served.
-    fn serve(&mut self, id: ViewerId, stats: &mut TickStats) -> bool {
-        let i = id.index();
-        if !self.viewers[i].registered || !self.viewers[i].due(id, self.tick) {
-            return false;
-        }
-
-        let avatar = self.viewers[i].avatar;
-        if !self.live.contains(avatar) {
-            return false;
-        }
-        let at = Pos3::new(self.xs[avatar.index()], self.ys[avatar.index()], self.zs[avatar.index()]);
-        if !self.cfg.contains(at) {
-            return false;
-        }
-
-        let sub = Subscription::at_center(&self.cfg, self.cfg.cell_of(at.horizontal()));
-        self.viewers[i].sub = Some(sub);
-
-        self.found.clear();
-        self.snap.gather_into_capped(at, sub, self.walk_cap, &mut self.found);
-
-        // No event queue exists yet, so nothing is held back for one.
-        let slots = self.viewers[i].budget.slots(0);
-        select(
-            self.tick,
-            &self.found,
-            &self.odo,
-            &self.policy,
-            slots,
-            &mut self.viewers[i].ghosts,
-            &mut self.selection,
-        );
-
-        stats.viewers += 1;
-        stats.candidates += self.found.len() as u64;
-        stats.records += self.selection.records().len() as u64;
-        stats.new_ghosts += self.selection.records().iter().filter(|r| r.is_new()).count() as u64;
-        stats.departed += self.selection.departed().len() as u64;
-        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Every entity walks along x, wrapping inside the region so nothing ever
     /// leaves it.
@@ -524,22 +628,29 @@ mod tests {
         let v = s.register_viewer(ids[0], ClientLimits::default());
 
         let still = ids[1];
-        let mut ever_sent = false;
+        let hit = AtomicBool::new(false);
+        let watch = |_: ViewerId, sel: &Selection, found: &DiscoveredEntities| {
+            if sel.records().iter().any(|r| found.as_slice()[r.index()].id == still) {
+                hit.store(true, Ordering::Relaxed);
+            }
+        };
+
         for _ in 0..10 {
-            s.tick_with(|_, sel, found| {
-                ever_sent |=
-                    sel.records().iter().any(|r| found.as_slice()[r.index()].id == still);
-            });
+            s.tick_with(&watch);
         }
         assert!(s.ghost_count(v) > 0);
-        assert!(ever_sent, "the still entity must become a ghost, or the rest proves nothing");
+        assert!(
+            hit.load(Ordering::Relaxed),
+            "the still entity must become a ghost, or the rest proves nothing"
+        );
 
-        for _ in 0..15 {
-            let mut seen = false;
-            s.tick_with(|_, sel, found| {
-                seen = sel.records().iter().any(|r| found.as_slice()[r.index()].id == still);
-            });
-            assert!(!seen, "a still entity must not take a slot once its client copy is right");
+        for tick in 0..15 {
+            hit.store(false, Ordering::Relaxed);
+            s.tick_with(&watch);
+            assert!(
+                !hit.load(Ordering::Relaxed),
+                "tick {tick}: a still entity must not take a slot once its copy is right"
+            );
         }
     }
 
@@ -616,6 +727,40 @@ mod tests {
     }
 
     #[test]
+    fn thread_count_does_not_change_the_outcome() {
+        // Replication is read-only against the snapshot and each viewer owns
+        // its own ghosts, so partitioning viewers across threads must not
+        // change a single record.
+        let run = |threads: usize| {
+            let mut s = sim(Walk::new(1));
+            let ids = populate(&mut s, 400);
+            s.set_thread_count(threads);
+            for id in ids.iter().take(50) {
+                s.register_viewer(*id, ClientLimits::default());
+            }
+            let stats: Vec<TickStats> = (0..12).map(|_| s.tick()).collect();
+            let ghosts: Vec<usize> =
+                (0..50).map(|i| s.ghost_count(ViewerId::from_raw(i))).collect();
+            (stats, ghosts)
+        };
+        let one = run(1);
+        assert_eq!(one, run(2));
+        assert_eq!(one, run(3), "a partition that does not divide evenly");
+        assert_eq!(one, run(8));
+        assert_eq!(one, run(64), "more workers than a chunk can use");
+    }
+
+    #[test]
+    fn a_thread_count_below_one_is_clamped() {
+        let mut s = sim(Walk::still());
+        s.set_thread_count(0);
+        assert_eq!(s.thread_count(), 1);
+        assert_eq!(s.workers.len(), 1);
+        s.set_thread_count(6);
+        assert_eq!(s.workers.len(), 6);
+    }
+
+    #[test]
     fn ticks_stop_allocating_once_the_world_is_steady() {
         let mut s = sim(Walk::new(1));
         let ids = populate(&mut s, 600);
@@ -625,7 +770,7 @@ mod tests {
         for _ in 0..20 {
             s.tick();
         }
-        let found = s.found.capacity();
+        let found = s.workers[0].found.capacity();
         let snap = s.snapshot().len();
         let ghosts: Vec<usize> =
             (0..20).map(|i| s.viewers[i].ghosts.slots()).collect();
@@ -633,7 +778,7 @@ mod tests {
         for _ in 0..50 {
             s.tick();
         }
-        assert_eq!(s.found.capacity(), found, "the gather buffer must not grow");
+        assert_eq!(s.workers[0].found.capacity(), found, "the gather buffer must not grow");
         assert_eq!(s.snapshot().len(), snap);
         let after: Vec<usize> = (0..20).map(|i| s.viewers[i].ghosts.slots()).collect();
         assert_eq!(after, ghosts, "ghost tables must reach a steady size");

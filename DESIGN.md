@@ -1396,6 +1396,40 @@ measured a table at rest, and under the bug it was never at rest, so that
 benchmark's conclusion that a cap of 256 beat 512 by 2.5x was an artifact of a
 state the real pipeline never reached.
 
+### Thread scaling, measured
+
+Viewers partition across workers by contiguous range. The snapshot, the
+odometer and the position arrays are read-only during replication and each
+viewer owns its own ghosts, so nothing is shared for writing except the cache
+lines at chunk boundaries. Per-worker scratch is separated by construction:
+`DiscoveredEntities` and `Selection` are each 128-byte aligned.
+
+Worker count defaults to `std::thread::available_parallelism` and is settable,
+because the right number is not obvious.
+
+Apple M1, four performance and four efficiency cores, 8,192 viewers:
+
+| threads | uniform | speedup | town square | speedup |
+|---|---|---|---|---|
+| 1 | 21.83 ms | 1.00x | 52.19 ms | 1.00x |
+| 2 | 11.43 ms | 1.91x | 28.71 ms | 1.82x |
+| 4 | 6.31 ms | 3.46x | 14.42 ms | 3.62x |
+| 8 | 5.23 ms | 4.17x | 13.03 ms | 4.01x |
+
+The town square goes from 104% of a 50 ms tick to 26%. Four to eight threads
+buys 17% to 21%, which is what heterogeneous cores predict and why the count is
+configurable.
+
+The whole pipeline scales as well as the gather alone did at 3.53x and 4.32x on
+this machine, so the earlier practice of extrapolating the gather's figure to
+the rest was sound.
+
+Threads are scoped and spawned per tick, so a tick pays one spawn per worker.
+The one-thread row takes a serial path with no spawn at all. How much of the
+gap between two threads and perfect halving is spawn cost rather than imbalance
+or efficiency cores is **not separately measured**. A persistent pool would
+remove it and needs either a dependency or channels and parking.
+
 ### Ghost cap and walk cap, measured
 
 Both sweeps are the town square at 8,192 viewers, after the fix, with the gather
@@ -1535,7 +1569,9 @@ A standby simulation cannot be fed by the client stream. Two designs:
 - `WorldSimulation`'s tick loop runs on a dedicated pinned OS thread, not Tokio.
   Tokio belongs in `SimulatorEdge`, where the work is connection-shaped.
 - Per-client work parallelizes across threads reading the published snapshot.
-  Measured at 3.6x on 4 physical cores. Hyperthreading past that helps the
+  Built, with `std::thread::scope` and no dependency. Measured at 3.6x on 4
+  physical cores for the gather alone and 3.5x to 3.6x for the whole pipeline.
+  Hyperthreading past that helps the
   uniform case and hurts the crowded one, so thread count should be
   configurable.
 - Any per-worker mutable state must be separated onto its own cache line.
@@ -1619,9 +1655,9 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   packet leaves a client's copy of a since-idle entity permanently wrong. There
   is no protocol to acknowledge against yet. Fixing it needs a pending mark
   beside the acknowledged one, growing a ghost record from 12 bytes to 16.
-- Per-viewer work is single-threaded. The loop is shaped for chunking, and
-  viewers are not padded to a cache line, so a partition must be cut on a
-  boundary that keeps two threads off one line.
+- Viewers are not padded to a cache line, so two workers share the line at each
+  chunk boundary. A viewer is written twice per tick, so the contention is
+  2(N-1) lines against ~10,000 writes. Not measured.
 - `WorldSimulation` has no `run`. The clock and the pinned thread belong with
   the edge work.
 - `Mul`/`Div` rounding disagree for negative values.

@@ -364,6 +364,53 @@ fn bench_walk_cap(c: &mut Criterion) {
     group.finish();
 }
 
+/// Thread scaling. Viewers partition across workers by contiguous range; the
+/// snapshot and odometer are read-only and each viewer owns its own ghosts, so
+/// nothing is shared for writing except the chunk-boundary cache lines.
+///
+/// Scoped threads are spawned per tick, so a low viewer count pays that cost
+/// against less work. The one-thread row takes a serial path with no spawn at
+/// all, which is what makes the spawn overhead visible.
+fn bench_threads(c: &mut Criterion) {
+    let cfg = WorldConfig::default();
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut counts: Vec<usize> = Vec::new();
+    let mut t = 1;
+    while t < cores {
+        counts.push(t);
+        t *= 2;
+    }
+    counts.push(cores);
+    println!("threads: available_parallelism reports {cores}, sweeping {counts:?}");
+
+    for (label, positions, viewers) in [
+        ("uniform", uniform(&cfg, 8_192, 0xA11CE), 8_192usize),
+        ("town_square", hot_cell(&cfg, 8_192, 8_192, 0xC0FFEE), 8_192),
+    ] {
+        let mut group = c.benchmark_group(format!("pipeline/threads/{label}"));
+        group.sample_size(20);
+        for &n in &counts {
+            let mut sim = build(
+                positions.clone(),
+                viewers,
+                1,
+                DEFAULT_WALK_CAP,
+                DEFAULT_GHOST_CAP,
+                0xBEEF,
+            );
+            sim.set_thread_count(n);
+            for _ in 0..10 {
+                sim.tick();
+            }
+            group.throughput(Throughput::Elements(viewers as u64));
+            group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+                b.iter(|| black_box(sim.tick()))
+            });
+        }
+        group.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_uniform,
@@ -371,6 +418,7 @@ criterion_group!(
     bench_town_square,
     bench_clustered,
     bench_ghost_cap,
-    bench_walk_cap
+    bench_walk_cap,
+    bench_threads
 );
 criterion_main!(benches);

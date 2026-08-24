@@ -4,10 +4,12 @@
 //! state, runs the tick loop, and does all per-client replication work against
 //! the snapshot it publishes to itself.
 
+mod handoff;
 mod sink;
 mod viewer;
 mod world;
 
+pub use handoff::Handoff;
 pub use sink::{NullSink, PayloadSink, RecordingSink};
 pub use viewer::{ClientLimits, ViewerId};
 pub use world::{

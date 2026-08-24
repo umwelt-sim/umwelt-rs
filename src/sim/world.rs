@@ -190,7 +190,13 @@ struct Frame<'a, S: PayloadSink> {
 
 /// Subscribes, gathers, scores, selects and assembles for one viewer. Returns
 /// whether it was served, leaving the payload in `w.writer`.
-fn serve<S: PayloadSink>(f: &Frame<'_, S>, id: ViewerId, v: &mut Viewer, w: &mut Scratch) -> bool {
+fn serve<S: PayloadSink>(
+    f: &Frame<'_, S>,
+    id: ViewerId,
+    v: &mut Viewer,
+    w: &mut Scratch,
+    on_viewer: &(impl Fn(Outbound<'_>) + Sync),
+) -> bool {
     if !v.registered || !v.due(id, f.tick) {
         return false;
     }
@@ -236,9 +242,23 @@ fn serve<S: PayloadSink>(f: &Frame<'_, S>, id: ViewerId, v: &mut Viewer, w: &mut
         }),
     );
 
+    stats.bytes += writer.payload().len() as u64;
+
+    // Observers see the payload before it changes hands, since after the
+    // handoff the writer holds a spare and not this payload.
+    on_viewer(Outbound {
+        viewer: id,
+        bytes: writer.payload(),
+        selection,
+        candidates: found,
+    });
+
     let handoff = std::time::Instant::now();
-    f.sink.send(id, writer.payload());
+    // The buffer changes hands rather than being copied, and one comes back to
+    // build the next payload in.
+    let spare = f.sink.send(id, writer.take());
     stats.sink_nanos += handoff.elapsed().as_nanos() as u64;
+    writer.restore(spare);
 
     // Departures are found by the eviction inside `select`, after this tick's
     // records were chosen, so they ride the next packet.
@@ -249,7 +269,6 @@ fn serve<S: PayloadSink>(f: &Frame<'_, S>, id: ViewerId, v: &mut Viewer, w: &mut
     stats.records += selection.records().len() as u64;
     stats.new_ghosts += selection.records().iter().filter(|r| r.is_new()).count() as u64;
     stats.departed += selection.departed().len() as u64;
-    stats.bytes += writer.payload().len() as u64;
     stats.despawns_sent += despawns.len() as u64;
     true
 }
@@ -581,15 +600,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         if threads <= 1 {
             let w = &mut workers[0];
             for (k, v) in viewers.iter_mut().enumerate() {
-                let id = ViewerId::from_raw(k as u32);
-                if serve(&frame, id, v, w) {
-                    on_viewer(Outbound {
-                        viewer: id,
-                        bytes: w.writer.payload(),
-                        selection: &w.selection,
-                        candidates: &w.found,
-                    });
-                }
+                serve(&frame, ViewerId::from_raw(k as u32), v, w, on_viewer);
             }
             return w.stats;
         }
@@ -601,15 +612,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
                 let base = c * chunk;
                 scope.spawn(move || {
                     for (k, v) in vs.iter_mut().enumerate() {
-                        let id = ViewerId::from_raw((base + k) as u32);
-                        if serve(frame, id, v, w) {
-                            on_viewer(Outbound {
-                                viewer: id,
-                                bytes: w.writer.payload(),
-                                selection: &w.selection,
-                                candidates: &w.found,
-                            });
-                        }
+                        serve(frame, ViewerId::from_raw((base + k) as u32), v, w, on_viewer);
                     }
                 });
             }
@@ -993,7 +996,7 @@ mod tests {
     fn a_panicking_sink_is_not_swallowed() {
         struct Boom;
         impl crate::sim::sink::PayloadSink for Boom {
-            fn send(&self, _v: ViewerId, _p: &[u8]) {
+            fn send(&self, _v: ViewerId, _p: Vec<u8>) -> Vec<u8> {
                 panic!("sink exploded");
             }
         }
@@ -1008,8 +1011,9 @@ mod tests {
     fn a_slow_sink_delays_the_tick_but_is_attributed() {
         struct Slow;
         impl crate::sim::sink::PayloadSink for Slow {
-            fn send(&self, _v: ViewerId, _p: &[u8]) {
+            fn send(&self, _v: ViewerId, p: Vec<u8>) -> Vec<u8> {
                 std::thread::sleep(std::time::Duration::from_micros(200));
+                p
             }
         }
         let mut s = sim(Walk::new(1)).with_sink(Slow);

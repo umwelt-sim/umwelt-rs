@@ -20,10 +20,17 @@ use crate::sim::viewer::ViewerId;
 /// The intended shape is to hand off to an I/O thread and drop rather than
 /// queue, since payloads are latest-only and a stale one has no value.
 ///
-/// `payload` borrows a worker's buffer and is overwritten by the next viewer,
-/// so anything kept must be copied.
+/// Takes ownership of the payload and hands back a buffer for the next one.
+///
+/// Ownership rather than a borrow so nothing has to copy. A sink that only
+/// reads the bytes returns the same buffer it was given; one that keeps them
+/// returns whatever it is replacing. Either way the buffers cycle and a tick
+/// allocates nothing.
+///
+/// The returned buffer's contents are ignored, but its capacity is reused, so
+/// handing back an empty `Vec` costs the next payload an allocation.
 pub trait PayloadSink: Sync {
-    fn send(&self, viewer: ViewerId, payload: &[u8]);
+    fn send(&self, viewer: ViewerId, payload: Vec<u8>) -> Vec<u8>;
 }
 
 /// Discards every payload.
@@ -35,7 +42,9 @@ pub struct NullSink;
 
 impl PayloadSink for NullSink {
     #[inline(always)]
-    fn send(&self, _viewer: ViewerId, _payload: &[u8]) {}
+    fn send(&self, _viewer: ViewerId, payload: Vec<u8>) -> Vec<u8> {
+        payload
+    }
 }
 
 /// Keeps the most recent payload per viewer.
@@ -76,15 +85,14 @@ impl RecordingSink {
 }
 
 impl PayloadSink for RecordingSink {
-    fn send(&self, viewer: ViewerId, payload: &[u8]) {
+    fn send(&self, viewer: ViewerId, payload: Vec<u8>) -> Vec<u8> {
         let mut held = self.latest.lock().expect("not poisoned");
         if held.len() <= viewer.index() {
             held.resize(viewer.index() + 1, Vec::new());
         }
-        let slot = &mut held[viewer.index()];
-        slot.clear();
-        slot.extend_from_slice(payload);
         self.sends.fetch_add(1, Ordering::Relaxed);
+        // The one being replaced goes back into circulation.
+        std::mem::replace(&mut held[viewer.index()], payload)
     }
 }
 
@@ -99,16 +107,18 @@ mod tests {
     #[test]
     fn a_null_sink_keeps_nothing() {
         let s = NullSink;
-        s.send(v(0), b"discarded");
+        let back = s.send(v(0), b"discarded".to_vec());
+        assert_eq!(back, b"discarded", "a sink that reads returns what it was given");
         assert_eq!(size_of::<NullSink>(), 0, "the default costs nothing to hold");
     }
 
     #[test]
     fn a_recording_sink_keeps_the_latest_per_viewer() {
         let s = RecordingSink::new();
-        s.send(v(0), b"first");
-        s.send(v(3), b"other");
-        s.send(v(0), b"second");
+        s.send(v(0), b"first".to_vec());
+        s.send(v(3), b"other".to_vec());
+        let displaced = s.send(v(0), b"second".to_vec());
+        assert_eq!(displaced, b"first", "the payload it replaced comes back");
 
         assert_eq!(s.latest(v(0)).as_deref(), Some(&b"second"[..]));
         assert_eq!(s.latest(v(3)).as_deref(), Some(&b"other"[..]));
@@ -125,7 +135,7 @@ mod tests {
                 let s = &s;
                 scope.spawn(move || {
                     for _ in 0..100 {
-                        s.send(v(t), &[t as u8; 16]);
+                        s.send(v(t), vec![t as u8; 16]);
                     }
                 });
             }
@@ -139,7 +149,7 @@ mod tests {
     #[test]
     fn clearing_forgets_everything() {
         let s = RecordingSink::new();
-        s.send(v(2), b"x");
+        s.send(v(2), b"x".to_vec());
         s.clear();
         assert_eq!(s.sends(), 0);
         assert_eq!(s.latest(v(2)), None);

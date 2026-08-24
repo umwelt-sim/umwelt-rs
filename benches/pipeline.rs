@@ -22,8 +22,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use umwelt::select::{Policy, Weights};
 use umwelt::sim::{DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP};
 use umwelt::{
-    ClientLimits, EntityId, Fixed, Game, Pos3, RecordingSink, Step, WorldConfig,
-    WorldSimulation,
+    ClientLimits, EntityId, Fixed, Game, Handoff, NullSink, Pos3, RecordingSink, Step,
+    WorldConfig, WorldSimulation,
 };
 
 /// Ticks run before timing, so ghost tables reach a steady size and no timed
@@ -433,6 +433,24 @@ fn bench_sink(c: &mut Criterion) {
         recording.tick();
     }
     group.bench_function("recording", |b| b.iter(|| black_box(recording.tick())));
+    drop(recording);
+
+    // The same recording sink, reached through the handoff. If the locks cost
+    // anything, this is where it shows.
+    let mut handed = build(uniform(&cfg, 8_192, 0xA11CE), 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF)
+        .with_sink(Handoff::new(RecordingSink::new()));
+    for _ in 0..10 {
+        handed.tick();
+    }
+    group.bench_function("handoff_recording", |b| b.iter(|| black_box(handed.tick())));
+    drop(handed);
+
+    let mut null_handed = build(uniform(&cfg, 8_192, 0xA11CE), 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF)
+        .with_sink(Handoff::new(NullSink));
+    for _ in 0..10 {
+        null_handed.tick();
+    }
+    group.bench_function("handoff_null", |b| b.iter(|| black_box(null_handed.tick())));
     group.finish();
 }
 

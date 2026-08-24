@@ -834,6 +834,54 @@ takes one lock per send. **A sink that merely copies its payload under a shared
 mutex is 70% of the tick**, at 513 ns per send, and before `sink_nanos` existed
 nothing would have said so.
 
+### Handoff
+
+`Handoff` wraps any sink so that sending from a tick cannot wait on it. One slot
+per viewer, an I/O thread draining them, and **the worst a wrapped sink can do
+is cost a client one frame.**
+
+One slot per viewer rather than one shared queue. A queue delivers stale frames
+when the consumer falls behind, which is wrong for latest-only payloads, and a
+bounded one drops whatever arrives after it fills, which is the tail of each
+worker's chunk and so the same viewers every tick. Per-slot supersedes instead,
+and degrades evenly.
+
+**`PayloadSink::send` takes an owned `Vec<u8>` and returns one.** Ownership
+rather than a borrow so nothing copies: a sink that reads the bytes returns the
+buffer it was given, one that keeps them returns whatever it displaced, and the
+buffers cycle so a tick allocates nothing. The lock a slot holds is then held
+for a pointer swap rather than for a payload-sized copy.
+
+Measured, 8,192 viewers, against the copying version it replaced:
+
+| | copying | ownership |
+|---|---|---|
+| `NullSink` direct | 6.07 ms | 6.10 ms |
+| `RecordingSink` direct | 10.15 ms | 7.55 ms |
+| `Handoff(NullSink)` | 7.03 ms | 6.60 ms |
+| `Handoff(RecordingSink)` | 7.35 ms | 6.75 ms |
+
+The handoff costs 61 ns per send, down from 117. `RecordingSink` got a quarter
+faster without being touched, because a sink that keeps payloads now swaps
+rather than copies. A handoff around a contending sink is **faster than calling
+that sink directly**, since the tick stops paying its lock.
+
+Two mistakes worth recording, both found by tests rather than by reading:
+
+- The drain held the `slots` read lock across the call into the wrapped sink, so
+  a viewer served for the first time waited on that sink from the tick thread to
+  take the write lock and grow. Neither lock may be held across the inner call.
+- The fill state was an atomic outside the slot's mutex. A producer stashing
+  between the drain's scan and its swap left it set after the payload was gone,
+  so the next drain shipped an empty spare as a frame. State describing a buffer
+  belongs under the same lock as the buffer.
+
+**Not lock-free.** A fully lock-free version means triple buffering with
+`UnsafeCell`, and there is no `unsafe` anywhere in `src`. Estimated, not
+measured: it would remove the slot's `try_lock` and the `slots` read lock,
+around two of the four atomics left, so roughly 0.2 ms of a 6.6 ms tick.
+Three percent is not worth the crate's first `unsafe`.
+
 Not built: a watchdog that fails the process loudly when a sink hangs rather
 than silently missing every subsequent tick. That is a process-level policy and
 belongs with `run`, which is also not built. Nothing currently defends against a

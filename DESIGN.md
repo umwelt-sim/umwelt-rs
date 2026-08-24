@@ -1871,6 +1871,30 @@ hand-built fixtures: 290 candidates against 268 for the clustered fixture and
 half despawn records ride every packet, from ghosts aging out of a set and from
 entities dying.
 
+**Adversarial patterns, measured.** `herd` doubles as the bot harness of build
+order item 7: the same binary with its movement replaced by something hostile.
+Each pattern targets one mechanism. 8,192 clients, paced, one minute each.
+
+| pattern | targets | what it reached | tick p50 | over budget |
+|---|---|---|---|---|
+| the plausible world | | 3,157 in the fullest cell | 16.38 ms | 0 of 1,200 |
+| flash | the walk cap and the gather | 8,576 in one cell | 16.38 ms | 0 |
+| flap | subscription churn | 100% of viewers a tick | 16.38 ms | 0 |
+| thrash | `grace` and the departure queue | 1.05% of viewers a tick | 16.38 ms | 0 |
+| teleport | the accumulator | 50 jumps a tick | 16.38 ms | 0 |
+| cull | the despawn queue | 26,238 deaths | 14.34 ms | 0 |
+
+**Nothing missed a deadline under any of them**, and the two that reached
+furthest say why. Flap drives subscription churn from 0.14% of viewers a tick to
+100%, seven hundred times, and the tick does not move: a box is four `i32` and
+recomputing it is four comparisons. Flash puts 8,576 in a single cell, more than
+the town square fixture's 8,192, and candidates per viewer rise only from 290 to
+333, which is the walk cap declining to look at a crowd it cannot send.
+
+Cull is the one that found something, in `herd` rather than in umwelt: a quarter
+of the population dying at once takes 195 ticks to replace, because the spawner
+is capped at 64 a tick, so the region runs 12,000 short for ten seconds.
+
 **Subscription churn is small**: 18 of 8,192 viewers cross a cell boundary in a
 tick. Most viewers are residents standing in a crowd, and a cell is 128 m
 across, so only the fast classes cross often. Whatever an edge-side or

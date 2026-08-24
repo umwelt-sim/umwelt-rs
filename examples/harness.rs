@@ -10,12 +10,14 @@
 //!
 //! - mean and 99th-percentile client-side position error
 //! - the same, split by how far the entity is from the viewer
-//! - **never updated**: entities that were candidates for a viewer and were
+//! - **never updated**: entities that were in a viewer's ghost set and were
 //!   never once sent to it, which is the starvation question the 133 of 200 in
-//!   the design document asked. Entities beyond the walk cap are not counted,
-//!   since the cap declines to replicate them by design rather than starving
-//!   them.
-//! - **unrepresented**: candidate-tick pairs where the client held no ghost
+//!   the design document asked. Starvation and coverage are counted over the
+//!   ghost set, since a candidate past it is one the cap declines to replicate
+//!   by design rather than one being starved. Error is counted over every ghost
+//!   the client holds, in the set or not, because a stale ghost is rendered
+//!   either way and that is what `grace` costs.
+//! - **unrepresented**: ghost-set-tick pairs where the client held no ghost
 //! - records per viewer per tick, and ghost arrivals plus departures
 //!
 //! The population is deliberately mixed. Props never move, idlers shuffle,
@@ -30,8 +32,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use umwelt::select::{BANDS, Policy, Weights};
-use umwelt::sim::{ClientLimits, DEFAULT_GRACE, Game, Outbound, Step, WorldSimulation};
+use umwelt::select::{NEAR_BAND, Policy, Weights};
+use umwelt::sim::{
+    ClientLimits, DEFAULT_GHOST_CAP, DEFAULT_GRACE, Game, Outbound, Step, WorldSimulation,
+};
 use umwelt::{EntityId, Fixed, Pos3, WorldConfig};
 
 /// Dense enough that a viewer's candidate set exceeds a packet, or there is no
@@ -62,8 +66,12 @@ const MIX: [(f64, f64, &str); 5] = [
     (0.05, 30.0, "vehicles"),
 ];
 
-/// Index into `MIX` of the class viewers are drawn from.
-const VIEWER_CLASS: usize = 2;
+/// Index into `MIX` of the class most sweeps draw viewers from.
+const WALKING_VIEWERS: usize = 2;
+
+/// Vehicles. A viewer crossing a crowd rather than standing in one, which is
+/// the case `grace` exists for.
+const DRIVING_VIEWERS: usize = 4;
 
 struct Rng(u64);
 
@@ -141,9 +149,9 @@ impl Game for Crowd {
     }
 }
 
-/// Builds the population and returns it alongside which entities walk, since
-/// viewers are drawn from those.
-fn crowd(cfg: &WorldConfig, seed: u64) -> (Crowd, Vec<u32>) {
+/// Builds the population and returns it alongside the entities of each motion
+/// class, since a sweep chooses which class its viewers are drawn from.
+fn crowd(cfg: &WorldConfig, seed: u64) -> (Crowd, [Vec<u32>; MIX.len()]) {
     let mut rng = Rng::new(seed);
     let margin = Fixed::from_meters(8).raw();
     let extent = cfg.region_size().raw() - 2 * margin;
@@ -151,7 +159,7 @@ fn crowd(cfg: &WorldConfig, seed: u64) -> (Crowd, Vec<u32>) {
 
     let mut pending = Vec::with_capacity(ENTITIES);
     let (mut vx, mut vy) = (Vec::with_capacity(ENTITIES), Vec::with_capacity(ENTITIES));
-    let mut walkers = Vec::new();
+    let mut by_class: [Vec<u32>; MIX.len()] = std::array::from_fn(|_| Vec::new());
 
     // Cumulative shares, so a single draw picks a class.
     let mut cuts = [0.0f64; MIX.len()];
@@ -173,11 +181,9 @@ fn crowd(cfg: &WorldConfig, seed: u64) -> (Crowd, Vec<u32>) {
         let (dx, dy) = rng.heading(per_tick);
         vx.push(dx);
         vy.push(dy);
-        if class == VIEWER_CLASS {
-            walkers.push(i as u32);
-        }
+        by_class[class].push(i as u32);
     }
-    (Crowd { pending, vx, vy, lo: margin, hi: margin + extent }, walkers)
+    (Crowd { pending, vx, vy, lo: margin, hi: margin + extent }, by_class)
 }
 
 /// What one client believes, and what it has ever been told.
@@ -329,56 +335,72 @@ impl Default for Metrics {
     }
 }
 
-struct Run {
+/// One configuration to measure. Built from [`Sweep::base`] and varied one
+/// field at a time, so a sweep reads as the single thing it changes.
+#[derive(Clone, Copy)]
+struct Sweep {
     label: &'static str,
+    weights: Weights,
     ghost_cap: usize,
+    grace: u32,
+    viewer_class: usize,
+    send_period: u8,
+    seed: u64,
+}
+
+impl Sweep {
+    fn base() -> Sweep {
+        Sweep {
+            label: "1/d",
+            weights: curve(2),
+            ghost_cap: DEFAULT_GHOST_CAP,
+            grace: DEFAULT_GRACE,
+            viewer_class: WALKING_VIEWERS,
+            send_period: 1,
+            seed: 0x5EED,
+        }
+    }
+}
+
+struct Run {
+    sweep: Sweep,
+    /// Mean ghosts held per viewer at the end of the run. Not the cap: grace
+    /// lets a table keep entries the ghost set no longer contains.
+    ghosts: f64,
     metrics: Metrics,
 }
 
-/// A weight table proportional to `d^-k`.
-///
-/// A band is `ilog2` of a squared separation, so it is half a doubling of
-/// distance and the shift per band is `k/2`. Bands must be anchored at the near
-/// end of what is actually in view: a one-meter separation is band 20 and the
-/// default view radius is band 35, so a table indexed from band 0 is constant
-/// across the entire range that matters and sweeps nothing.
-fn curve(k: f64) -> Weights {
-    let near = ((RAW_PER_M * RAW_PER_M) as u64).ilog2();
-    let mut t = [0u16; BANDS];
-    for (b, slot) in t.iter_mut().enumerate() {
-        let over = (b as u32).saturating_sub(near);
-        let shift = (over as f64 * k / 2.0).round() as u32;
-        *slot = 1u16 << 12u32.saturating_sub(shift);
-    }
-    Weights::new(t)
+/// A weight table, built by the library so a sweep measures the curve that
+/// ships rather than one the harness invented. `k_halves` is the exponent in
+/// halves: 2 is `1/d`.
+fn curve(k_halves: u32) -> Weights {
+    Weights::inverse_power(k_halves)
 }
 
-/// The span of a curve across what a viewer can see, for the report.
-fn span(k: f64, cfg: &WorldConfig) -> (u32, u32) {
-    let near = ((RAW_PER_M * RAW_PER_M) as u64).ilog2();
+/// What a curve spans across the view radius, for the report.
+fn span(w: Weights, cfg: &WorldConfig) -> (u32, u32) {
     let r = cfg.horizontal_view_radius().raw() as u64;
-    let far = (r * r).ilog2();
-    let w = |b: u32| 1u32 << 12u32.saturating_sub(((b - near) as f64 * k / 2.0).round() as u32);
-    (w(near), w(far))
+    (w.at(NEAR_BAND), w.at((r * r).ilog2() as usize))
 }
 
-fn run(label: &'static str, weights: Weights, ghost_cap: usize) -> Run {
+fn run(s: Sweep) -> Run {
     let cfg = WorldConfig::default();
-    let (game, walkers) = crowd(&cfg, 0x5EED);
+    let (game, by_class) = crowd(&cfg, s.seed);
     let policy = Policy {
-        ghost_cap,
-        grace: DEFAULT_GRACE,
+        ghost_cap: s.ghost_cap,
+        grace: s.grace,
         unseen_drift: cfg.horizontal_view_radius().raw() as u32,
-        weights,
+        weights: s.weights,
     };
-    let mut sim = WorldSimulation::with_replication(cfg, game, ghost_cap, policy);
+    let mut sim = WorldSimulation::with_replication(cfg, game, s.ghost_cap, policy);
     sim.tick();
 
-    // A ViewerId is not an EntityId. Avatars are scattered ids drawn from the
-    // walkers, so the two must be kept side by side.
+    // A ViewerId is not an EntityId. Avatars are scattered ids drawn from one
+    // motion class, so the two must be kept side by side.
     let mut viewers = Vec::with_capacity(VIEWERS);
-    for &e in walkers.iter().take(VIEWERS) {
-        viewers.push(sim.register_viewer(EntityId::from_raw(e), ClientLimits::default()));
+    let limits = ClientLimits { send_period: s.send_period, ..ClientLimits::default() };
+    for &e in by_class[s.viewer_class].iter().take(VIEWERS) {
+        viewers.push(sim.register_viewer(EntityId::from_raw(e), limits));
     }
 
     let mut clients: Vec<Client> = (0..viewers.len()).map(|_| Client::new()).collect();
@@ -433,7 +455,7 @@ fn run(label: &'static str, weights: Weights, ghost_cap: usize) -> Run {
                 for (_, b) in &o.sent {
                     m.sent_by_band[*b] += 1;
                 }
-                for &e in &o.candidates {
+                for (k, &e) in o.candidates.iter().enumerate() {
                     // The gather does not exclude a viewer's own entity, and a
                     // client does not need a ghost of itself.
                     if e == avatar {
@@ -441,15 +463,26 @@ fn run(label: &'static str, weights: Weights, ghost_cap: usize) -> Run {
                     }
                     let Some(truth) = sim.position(e) else { continue };
                     let sep = isqrt(truth.dist_sq(at).raw());
-                    m.seen_by_band[band_of(sep)] += 1;
+                    // Only the ghost set is owed a record: the gather overshoots
+                    // it, and a candidate past it is one selection declines to
+                    // score by design rather than one being starved. Counting
+                    // those made a cap look worse the more its walk overshot.
+                    let owed = k < s.ghost_cap;
+                    if owed {
+                        m.seen_by_band[band_of(sep)] += 1;
+                    }
                     match c.told.get(&e) {
+                        // A ghost is a belief the client renders whether or not
+                        // the entity is still in the set being refreshed, so
+                        // what `grace` holds past the set is counted here.
                         Some(believed) => m.observe(isqrt(truth.dist_sq(*believed).raw()), sep),
-                        None => m.unrepresented += 1,
+                        None if owed => m.unrepresented += 1,
+                        None => {}
                     }
                 }
             }
 
-            for &e in &o.candidates {
+            for &e in o.candidates.iter().take(s.ghost_cap) {
                 c.ever_seen[e.index()] = true;
             }
             for &e in &o.departed {
@@ -474,13 +507,84 @@ fn run(label: &'static str, weights: Weights, ghost_cap: usize) -> Run {
             }
         }
     }
-    Run { label, ghost_cap, metrics: m }
+    let ghosts =
+        viewers.iter().map(|&v| sim.ghost_count(v)).sum::<usize>() as f64 / viewers.len() as f64;
+    Run { sweep: s, ghosts, metrics: m }
 }
 
 /// Integer square root, so the harness reports separations without floats
 /// deciding anything.
 fn isqrt(v: u64) -> i64 {
     v.isqrt() as i64
+}
+
+/// The four tables reported for one sweep.
+fn report(title: &str, runs: &[Run]) {
+    println!("\n=== {title} ===\n");
+    println!(
+        "{:<11} {:>5} {:>5} {:>9} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>7} {:>7}",
+        "curve",
+        "cap",
+        "grace",
+        "ang mrad",
+        "p99 m",
+        "never",
+        "unrep",
+        "cand",
+        "rec/pkt",
+        "arr",
+        "dep",
+        "B/pkt",
+        "ghosts",
+    );
+    for r in runs {
+        let m = &r.metrics;
+        let served = m.served.max(1) as f64;
+        println!(
+            "{:<11} {:>5} {:>5} {:>9.2} {:>7.3} {:>6.1}% {:>6.1}% {:>7.1} {:>8.1} {:>6.2} {:>6.2} {:>7.0} {:>7.1}",
+            r.sweep.label,
+            r.sweep.ghost_cap,
+            r.sweep.grace,
+            m.mean_mrad(None),
+            m.quantile_m(0.99),
+            100.0 * m.never_told as f64 / m.ever_seen.max(1) as f64,
+            100.0 * m.unrepresented as f64
+                / (m.unrepresented + m.total_represented()).max(1) as f64,
+            m.seen_by_band.iter().sum::<u64>() as f64 / served,
+            m.records as f64 / served,
+            m.arrivals as f64 / served,
+            m.departures as f64 / served,
+            m.bytes as f64 / served,
+            r.ghosts,
+        );
+    }
+
+    for (what, value) in [
+        ("updates per candidate-tick, by separation", 0u8),
+        ("mean angular error by separation, milliradians", 1),
+        ("mean error by separation, meters", 2),
+    ] {
+        println!("\n{what}");
+        print!("{:<11} {:>5} {:>5}", "curve", "cap", "grace");
+        for n in BAND_NAMES {
+            print!(" {n:>10}");
+        }
+        println!();
+        for r in runs {
+            print!("{:<11} {:>5} {:>5}", r.sweep.label, r.sweep.ghost_cap, r.sweep.grace);
+            for b in 0..4 {
+                match value {
+                    0 => {
+                        let seen = r.metrics.seen_by_band[b].max(1);
+                        print!(" {:>10.3}", r.metrics.sent_by_band[b] as f64 / seen as f64)
+                    }
+                    1 => print!(" {:>10.2}", r.metrics.mean_mrad(Some(b))),
+                    _ => print!(" {:>10.3}", r.metrics.mean_m(Some(b))),
+                }
+            }
+            println!();
+        }
+    }
 }
 
 fn main() {
@@ -495,83 +599,77 @@ fn main() {
     println!("\n");
 
     let cfg = WorldConfig::default();
-    let curves: [(&'static str, f64); 5] =
-        [("flat", 0.0), ("1/sqrt(d)", 0.5), ("1/d", 1.0), ("1/d^2", 2.0), ("1/d^4", 4.0)];
+    let curves: [(&'static str, u32); 6] = [
+        ("flat", 0),
+        ("1/sqrt(d)", 1),
+        ("1/d", 2),
+        ("d^-1.5", 3),
+        ("1/d^2", 4),
+        ("1/d^4", 8),
+    ];
     println!("weight across the view radius, near to far:");
     for (label, k) in curves {
-        let (n, f) = span(k, &cfg);
+        let (n, f) = span(curve(k), &cfg);
         println!("  {label:<10} {n:>6} -> {f:<6} ({}x)", n / f.max(1));
     }
-    println!();
 
     let mut runs = Vec::new();
     for cap in [256usize, 512] {
         for (label, k) in curves {
-            runs.push(run(label, curve(k), cap));
+            runs.push(run(Sweep { label, weights: curve(k), ghost_cap: cap, ..Sweep::base() }));
         }
     }
+    report("curve, at two caps", &runs);
 
-    println!(
-        "{:<10} {:>4} {:>10} {:>10} {:>10} {:>8} {:>8} {:>9}",
-        "curve", "cap", "mean ang", "mean err", "p99 err", "never", "unrep", "rec/tick"
-    );
-    for r in &runs {
-        let m = &r.metrics;
-        let served = m.served.max(1) as f64;
-        println!(
-            "{:<10} {:>4} {:>6.2} mrad {:>8.3} m {:>8.3} m {:>7.1}% {:>7.1}% {:>9.1}",
-            r.label,
-            r.ghost_cap,
-            m.mean_mrad(None),
-            m.mean_m(None),
-            m.quantile_m(0.99),
-            100.0 * m.never_told as f64 / m.ever_seen.max(1) as f64,
-            100.0 * m.unrepresented as f64
-                / (m.unrepresented + m.total_represented()).max(1) as f64,
-            m.records as f64 / served,
-        );
-    }
+    // A packet holds the same 98 records whatever the cap is, so the cap trades
+    // how many entities a client can know about against how often each is
+    // refreshed.
+    let caps: Vec<Run> = [64usize, 128, 160, 192, 224, 256, 384, 512, 1024]
+        .into_iter()
+        .map(|cap| run(Sweep { ghost_cap: cap, ..Sweep::base() }))
+        .collect();
+    report("ghost cap", &caps);
 
-    println!("\nupdates per candidate-tick, by separation");
-    print!("{:<10} {:>4}", "curve", "cap");
-    for n in BAND_NAMES {
-        print!(" {n:>10}");
-    }
-    println!();
-    for r in &runs {
-        print!("{:<10} {:>4}", r.label, r.ghost_cap);
-        for b in 0..4 {
-            let seen = r.metrics.seen_by_band[b].max(1);
-            print!(" {:>10.3}", r.metrics.sent_by_band[b] as f64 / seen as f64);
-        }
-        println!();
+    // Grace holds a ghost after it leaves the ghost set. Too little and a
+    // boundary crossing costs a despawn and a re-send at unseen priority; too
+    // much and a client keeps ghosts nothing is refreshing. Swept against a
+    // walking viewer and a driving one, since a viewer that crosses a crowd
+    // churns its ghost set and one standing in a crowd does not.
+    for (class, speed) in [(WALKING_VIEWERS, MIX[WALKING_VIEWERS].1), (DRIVING_VIEWERS, MIX[DRIVING_VIEWERS].1)] {
+        let graces: Vec<Run> = [0u32, 1, 2, 3, 5, 10, 20]
+            .into_iter()
+            .map(|g| run(Sweep { grace: g, viewer_class: class, ..Sweep::base() }))
+            .collect();
+        report(&format!("grace, viewers at {speed} m/s"), &graces);
     }
 
-    println!("\nmean angular error by separation, milliradians");
-    print!("{:<10} {:>4}", "curve", "cap");
-    for n in BAND_NAMES {
-        print!(" {n:>10}");
-    }
-    println!();
-    for r in &runs {
-        print!("{:<10} {:>4}", r.label, r.ghost_cap);
-        for b in 0..4 {
-            print!(" {:>10.2}", r.metrics.mean_mrad(Some(b)));
-        }
-        println!();
-    }
+    // What a moving viewer costs, with grace held at the default: the same
+    // sweep the pipeline benchmark cannot run, since its viewers stand still.
+    let movers: Vec<Run> = [WALKING_VIEWERS, DRIVING_VIEWERS]
+        .into_iter()
+        .map(|class| run(Sweep { viewer_class: class, ..Sweep::base() }))
+        .collect();
+    report("viewer speed, at the default grace", &movers);
 
-    println!("\nmean error by separation, meters");
-    print!("{:<10} {:>4}", "curve", "cap");
-    for n in BAND_NAMES {
-        print!(" {n:>10}");
-    }
-    println!();
-    for r in &runs {
-        print!("{:<10} {:>4}", r.label, r.ghost_cap);
-        for b in 0..4 {
-            print!(" {:>10.3}", r.metrics.mean_m(Some(b)));
-        }
-        println!();
-    }
+    // A viewer's ghosts are stamped only on the ticks it is served, so a send
+    // period above the grace makes every ghost depart and arrive again on every
+    // turn. This is where that shows up rather than in a note.
+    let periods: Vec<Run> = [("period 1", 1u8), ("period 2", 2), ("period 4", 4), ("period 8", 8)]
+        .into_iter()
+        .map(|(label, send_period)| run(Sweep { label, send_period, ..Sweep::base() }))
+        .collect();
+    report("send period, at the default grace", &periods);
+
+    // Coverage moves around between populations in a way the error columns do
+    // not, so the same caps are run against three crowds before anything is
+    // concluded from a `never` figure.
+    let seeds: Vec<Run> = [("seed 5EED", 0x5EEDu64), ("seed C0FFEE", 0xC0FFEE), ("seed BEEF", 0xBEEF)]
+        .into_iter()
+        .flat_map(|(label, seed)| {
+            [160usize, 192, 224, 256]
+                .into_iter()
+                .map(move |ghost_cap| run(Sweep { label, ghost_cap, seed, ..Sweep::base() }))
+        })
+        .collect();
+    report("population, at four caps", &seeds);
 }

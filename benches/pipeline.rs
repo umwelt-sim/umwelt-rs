@@ -321,7 +321,7 @@ fn bench_ghost_cap(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/ghost_cap");
     group.sample_size(20);
 
-    for &cap in &[64usize, 128, 256, 512] {
+    for &cap in &[64usize, 128, 256, 512, 1024] {
         let mut sim = build(
             hot_cell(&cfg, 8_192, 8_192, 0xC0FFEE),
             8_192,

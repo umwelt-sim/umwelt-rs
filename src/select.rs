@@ -72,21 +72,42 @@ impl Weights {
     /// is `1/d`. A table indexed from band 0 would be constant across
     /// everything inside a view radius and would weight nothing at all.
     ///
-    /// Chosen by the quality harness, which measured it as 34% better than flat
-    /// weighting for angular error within 32 m under a population containing
-    /// fast movers. **That population is invented rather than taken from a real
-    /// game**, so this answers open question 2 provisionally.
+    /// Chosen by the quality harness. At the default ghost cap it is 8% better
+    /// than flat weighting for angular error within 32 m, and at a cap of 512,
+    /// where slots are scarce against the set competing for them, 35%. Steeper
+    /// curves gain little and lose the far bands: `d^-1.5` is within 0.3% of
+    /// this one at the default cap, and nothing steeper than that is expressible
+    /// across a view radius. **The population measured is invented rather than
+    /// taken from a real game**, which is the remaining uncertainty in open
+    /// question 2 rather than the curve.
     pub fn inverse_distance() -> Weights {
+        Weights::inverse_power(2)
+    }
+
+    /// Weight proportional to `d^-k`, where `k` is `k_halves` halves: 2 is
+    /// `1/d`, 3 is `d^-1.5`, 4 is `1/d^2`, and 0 weights every band alike.
+    ///
+    /// A band is half a doubling of distance, so the shift per band is `k/2`
+    /// and the parameter buys quarter-shift resolution without a float
+    /// anywhere: a table is the same on every machine and in every replay.
+    ///
+    /// Weights floor at 1 rather than reaching zero, which a zero would starve.
+    /// A table spans 4096 to 1 and the default view radius is eight doublings
+    /// of distance from a meter, so anything steeper than `d^-1.5` hits that
+    /// floor inside the radius and is flat from there out; see [`NEAR_BAND`].
+    pub fn inverse_power(k_halves: u32) -> Weights {
         let mut t = [0u16; BANDS];
         for (b, slot) in t.iter_mut().enumerate() {
-            let over = b.saturating_sub(NEAR_BAND);
-            *slot = 1u16 << 12usize.saturating_sub(over / 2);
+            let over = b.saturating_sub(NEAR_BAND) as u32;
+            *slot = 1u16 << 12u32.saturating_sub(over * k_halves / 4);
         }
         Weights::new(t)
     }
 
+    /// The weight one band carries. A table is data, so a caller sweeping one
+    /// can report what it swept.
     #[inline(always)]
-    fn at(&self, band: usize) -> u32 {
+    pub fn at(&self, band: usize) -> u32 {
         self.0[band] as u32
     }
 }
@@ -110,6 +131,10 @@ pub struct Policy {
     /// Ticks a ghost survives after leaving the ghost set. Absorbs a viewer
     /// jittering across the boundary rather than making it a departure and an
     /// arrival.
+    ///
+    /// Ghosts are stamped and aged only on the ticks their viewer is served, so
+    /// this is in ticks but is measured in serves: below a client's send period
+    /// it behaves as zero. See [`DEFAULT_GRACE`](crate::sim::DEFAULT_GRACE).
     pub grace: u32,
     /// See [`DEFAULT_UNSEEN_DRIFT`].
     pub unseen_drift: u32,
@@ -662,5 +687,35 @@ mod tests {
         let mut t = [1u16; BANDS];
         t[7] = 0;
         assert!(std::panic::catch_unwind(|| Weights::new(t)).is_err());
+    }
+
+    #[test]
+    fn inverse_distance_is_a_half_shift_per_band() {
+        let w = Weights::inverse_distance();
+        assert_eq!(w, Weights::inverse_power(2), "1/d is two halves of an exponent");
+        for over in 0..24 {
+            assert_eq!(
+                w.at(NEAR_BAND + over),
+                4096 >> (over / 2),
+                "band {over} above a meter halves every second band"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flat_curve_weights_every_band_alike() {
+        let w = Weights::inverse_power(0);
+        assert!((0..BANDS).all(|b| w.at(b) == 4096));
+    }
+
+    #[test]
+    fn a_curve_steeper_than_three_halves_floors_inside_the_view_radius() {
+        // A band is half a doubling of distance, so band `NEAR_BAND + 16` is
+        // 2^8 m, the default view radius. A table spanning 4096 to 1 reaches
+        // its floor exactly there at `d^-1.5` and sooner past it.
+        assert_eq!(Weights::inverse_power(3).at(NEAR_BAND + 16), 1);
+        assert!(Weights::inverse_power(3).at(NEAR_BAND + 15) > 1);
+        assert_eq!(Weights::inverse_power(4).at(NEAR_BAND + 12), 1, "d^-2 floors at 64 m");
+        assert_eq!(Weights::inverse_power(8).at(NEAR_BAND + 6), 1, "d^-4 floors at 8 m");
     }
 }

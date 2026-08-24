@@ -679,7 +679,10 @@ Consequences of scoring on displacement rather than elapsed time:
   walked very little, scores near zero; one that returns because it walked
   scores high and should be sent. Elapsed time cannot tell those apart. Past the
   grace period the ghost is gone and a returning entity is sent regardless.
-  Unverified: no measurement of churn exists.
+  ~~Unverified: no measurement of churn exists.~~ Measured: 0.49 first sightings
+  per packet for a walking viewer and 2.92 for one crossing a crowd at 30 m/s,
+  against 98 records. Grace trades that count against ghosts held past their
+  usefulness, and one tick is the best of that trade; see §Quality harness.
 
 Displacement is `|dx| + |dy| + |dz|`. Computed: that over-estimates the
 Euclidean step by up to 1.73x, direction-dependent, and needs no square root.
@@ -1008,21 +1011,28 @@ unverified, idle entities would then take slots in proportion to their share of
 the candidate set. Rejected also because the growth curve would be tuned against
 a proxy with no error signal feeding back. See §Odometer.
 
-### Decided provisionally: weight proportional to 1/d
+### Decided: weight proportional to 1/d
 
 `Weights::inverse_distance` halves the weight at twice the separation, anchored
 at a one-meter separation. How wrong an entity looks falls off with distance,
 since a meter of error subtends a smaller angle the further away it is, so a
 packet is better spent on what is close.
 
-Measured by the quality harness. **The population it ran against is invented
-rather than taken from a real game**, so this settles open question 2 only
-provisionally.
+Measured by the quality harness, swept as `Weights::inverse_power`, which takes
+the exponent in halves and builds a table by integer shifts alone. The harness
+sweeps that constructor rather than a table of its own, so what is measured is
+what ships.
 
-Computed: a `[u16; BANDS]` table spans 4096 to 1, and the default 256 m view
-radius is eight doublings of distance from one meter, so the steepest curve it
-can express across the whole view is about `d^-1.5`. Anything steeper flattens
-partway out, which is why `d^-4` measured identically to flat weighting.
+Computed and now pinned by test: a `[u16; BANDS]` table spans 4096 to 1, and the
+default 256 m view radius is eight doublings of distance from one meter, so the
+steepest curve it can express across the whole view is `d^-1.5`. Anything steeper
+reaches the floor inside the radius and is flat from there out, which is why
+`d^-4` measures like flat weighting at the far end.
+
+Measured, the top three curves are within 0.3% at the default ghost cap and the
+choice is worth 8% against flat; at twice that cap it is worth 35% and `d^-1.5`
+takes the three near bands. **The curve matters in proportion to how
+oversubscribed the ghost set is.** See §Quality harness, measured.
 
 ### Open questions
 
@@ -1035,11 +1045,21 @@ partway out, which is why `d^-4` measured identically to flat weighting.
    ordering to make the reconcile a merge rather than a lookup per entity. The
    distance-ordered walk means candidates no longer arrive id-sorted, which
    §Snapshot predicted when the cap was proposed.
-2. **The growth curve.** What function makes a distant entity update at a rate
-   that looks right to a human rather than merely being cheap. Tuning against
-   perception, not a derivation.
-3. **Objective.** Minimizing mean client-side position error and bounding
-   worst-case error for any single entity are different schemes.
+2. ~~**The growth curve.**~~ Decided: `1/d`, and the shape of the answer is
+   that steeper is better until the weight table floors, which happens at
+   `d^-1.5` across a 256 m radius. Curves between `1/d` and `d^-1.5` are within
+   0.3% of each other at the ghost cap that ships and separate by 2 to 4% at
+   twice it. What remains open is the population, not the curve: every figure
+   comes from an invented mix.
+3. ~~**Objective.**~~ Decided: mean angular error over the ghost set, with
+   worst-case bounded structurally rather than by the objective. Measured, the
+   two are not in tension the way this question assumed. Nothing starves: an
+   entity in a viewer's ghost set that is never sent is 0.2% or below at every
+   cap, curve, grace and send period swept, because an idle entity scores zero
+   and a moving one grows without bound until it wins a slot. And the 99th
+   percentile does not answer to the objective at all: it is 2.0 m in every
+   configuration at a send period of one, doubling with every doubling of the
+   period. It is a cadence and packet-size lever.
 
 ### What the accumulator does not fix
 
@@ -1414,10 +1434,13 @@ entity in the world is in the dense cell.
 starts seeing the nearest N. That is the entity cap every MMO ships, and it is a
 product decision arriving as an optimization.
 
-**Not established.** What N should be. It has to leave the accumulator enough
-candidates to choose among, and records per packet is itself arithmetic from
-three unverified inputs. The 512 default is a placeholder. Nothing has measured
-what a viewer notices when entities beyond the cap stop existing.
+~~**Not established.** What N should be.~~ Established: 256, measured against
+both ends of the trade. It has to leave the accumulator enough candidates to
+choose among, and it has to be small enough that the ones it holds are refreshed
+often; below about 160 a client's packet does not even fill. See §Quality
+harness, measured. What a viewer notices when entities past the cap stop
+existing is still unmeasured, and is a different question from what it notices
+about the ones inside it.
 
 Correctness at a ragged population is tested rather than assumed: cell size,
 `sub_axis`, and `cell_shift` are all powers of two, so a 10,000 crowd exercises
@@ -1440,37 +1463,143 @@ which is the reason the odometer exists.
 Errors are angular, in milliradians, because a mean over meters cannot compare a
 near entity against a far one and is minimized by weighting everything equally.
 
-Mean angular error within 32 m, at a ghost cap of 512:
+**Corrected: what the harness counts.** Starvation and coverage are counted over
+the ghost set. Error is counted over every ghost a client holds, in the set or
+not, since a stale ghost is rendered either way. The first revision counted both
+over every candidate the gather returned, which made a cap look worse the more
+its walk overshot it: an entity past the ghost set is one selection declines to
+score by design, not one being starved. **That accounting is where the 8.5% and
+2.9% "never sent" figures this section used to report came from.** Counted
+against the set, never-sent is 0.2% or below at every cap, curve, grace and send
+period below. Starvation is not a live problem, and the earlier figures were
+measuring the walk cap's overshoot.
 
-| curve | walkers only | with 5% vehicles |
-|---|---|---|
-| flat | 4.31 | 14.78 |
-| 1/sqrt(d) | 2.81 | 10.35 |
-| **1/d** | **2.51** | **9.71** |
-| 1/d^2 | 2.44 | 9.46 |
-| 1/d^4 | 3.93 | 13.72 |
+Every table below is one sweep of `cargo run --release --example harness`, each
+row a full 400-tick run, all from one session at the defaults this tuning
+settled. Error is mean angular error in milliradians, by separation.
 
-One entity in twenty at vehicle speed roughly triples the error. Below that the
-curve is cosmetic: every option leaves error small enough that no one would see
-it. Above it the curve is worth 34%.
+**The curve**, at the default ghost cap of 256:
 
-`1/d^2` is marginally better within 32 m and worse from 64 to 128 m. `1/d^4`
-matches flat because the table cannot express it.
+| curve | 0-32 m | 32-64 m | 64-128 m | 128 m+ |
+|---|---|---|---|---|
+| flat | 10.20 | 3.11 | 1.44 | **0.69** |
+| 1/sqrt(d) | 9.62 | 2.95 | 1.47 | 0.70 |
+| **1/d** | 9.42 | 2.91 | 1.40 | 0.75 |
+| d^-1.5 | **9.40** | **2.90** | **1.39** | 0.79 |
+| 1/d^2 | **9.40** | 2.93 | 1.48 | 0.70 |
+| 1/d^4 | 10.03 | 3.11 | 1.44 | 0.69 |
 
-**Starvation is solved.** Entities that were candidates for a viewer and never
-once sent: 2.9% at a ghost cap of 512 and 8.5% at 256, against the 66.5% the
-static-priority scratch simulation starved. Candidate-ticks where the client
-held no ghost at all: 3.5% and 11.1%.
+and at a cap of 512, where the set competing for a packet is twice the size:
 
-**What the curve does not fix.** The 99th-percentile error is 2.0 m in every
-configuration measured. That is the vehicles, and no weighting touches it. The
-levers there are a larger packet or a higher send rate, not the curve.
+| curve | 0-32 m | 32-64 m | 64-128 m | 128 m+ |
+|---|---|---|---|---|
+| flat | 14.78 | 4.70 | 2.21 | **1.04** |
+| 1/sqrt(d) | 11.09 | 3.72 | 2.34 | 1.11 |
+| **1/d** | 9.61 | 3.28 | 1.87 | 1.30 |
+| d^-1.5 | **9.40** | **3.11** | **1.80** | 1.57 |
+| 1/d^2 | 9.46 | 3.54 | 2.43 | 1.16 |
+| 1/d^4 | 13.72 | 4.75 | 2.24 | 1.06 |
+
+At the default cap the top three curves are within 0.3% of each other and the
+choice is worth 8% against flat. At 512 it is worth 35%, and `d^-1.5` wins the
+three near bands. **The curve matters in proportion to how oversubscribed the
+ghost set is**, which is why a cap sweep and a curve sweep cannot be read apart.
+
+Nothing steeper than `d^-1.5` is expressible: the table spans 4096 to 1, and at
+`1/d^2` that floor arrives at 64 m and at `1/d^4` at 8 m, so both are flat across
+most of the view and score like flat weighting at the far end. `select.rs` pins
+those three floors by test.
+
+`1/d` stays the default. `d^-1.5` is better where it differs, by less than the
+run-to-run meaning of these numbers at the cap that ships.
+
+**The ghost cap.** Quality is the harness crowd; cost is the town square at
+8,192 viewers from `benches/pipeline.rs`, a different scenario measured the same
+session, with the walk cap matched to the ghost cap throughout:
+
+| cap | records used of 98 | 0-32 m | 32-64 m | 64-128 m | 128 m+ | tick, 1 thread | tick, 8 threads |
+|---|---|---|---|---|---|---|---|
+| 64 | 41.8 | 9.83 | 2.92 | 1.46 | 0.70 | 16.25 ms | 3.91 ms |
+| 128 | 83.5 | 9.62 | 2.91 | 1.40 | **0.66** | 29.46 ms | 7.17 ms |
+| 160 | 97.5 | 9.55 | 2.90 | 1.38 | 0.67 | | |
+| 192 | 98.0 | 9.53 | 2.91 | **1.37** | 0.68 | | |
+| 224 | 98.0 | 9.46 | 2.91 | **1.37** | 0.70 | | |
+| **256** | 98.0 | **9.42** | **2.90** | 1.40 | 0.75 | 54.26 ms | 13.44 ms |
+| 384 | 98.0 | 9.48 | 3.08 | 1.62 | 1.01 | | |
+| 512 | 98.0 | 9.61 | 3.28 | 1.87 | 1.30 | 103.75 ms | 24.58 ms |
+| 1,024 | 98.0 | 10.00 | 3.82 | 2.45 | 1.82 | 203.19 ms | 48.63 ms |
+
+The cap is bounded from both ends. **Below about 160 a client's packet does not
+fill**, because only a ghost that moved consumes a slot: at a cap of 64 a viewer
+sends 42 records of the 98 its 1,200-byte payload paid for. Above 256 every
+ghost is refreshed less often and every band's error grows, while cost rises by
+1.8 to 2.0x per doubling of the cap. Quality is flat from 160 to 384,
+which is where the cap is a real dial; 256 is the top of that, keeping packet-fill
+margin for a crowd denser or slower than this one.
+
+The cost columns are the same benchmark at two thread counts, since the single
+thread figure is what the older tables in this document are comparable to and
+the eight-thread figure is what a consumer gets by default. Both were rerun in
+this session. **The one-thread column runs 8 to 12% slower than the table in
+§Ghost cap and walk cap, measured**, in the direction of the between-session
+drift already documented there; the shape is identical.
+
+**Grace.** Viewers drawn from the walkers at 1.5 m/s, and from the vehicles at
+30 m/s, which is what a viewer crossing a crowd rather than standing in one
+looks like:
+
+| grace | 0-32 m, walking | 0-32 m, driving | first sightings per packet, driving | ghosts held, driving |
+|---|---|---|---|---|
+| 0 | **9.42** | 9.85 | 2.96 | 254.6 |
+| **1** | **9.42** | **9.74** | 2.92 | 258.3 |
+| 2 | 9.44 | 9.77 | 2.89 | 261.4 |
+| 3 | 9.47 | 9.81 | 2.87 | 264.4 |
+| 5 | 9.53 | 9.91 | 2.83 | 269.4 |
+| 10 | 9.71 | 10.14 | 2.76 | 283.8 |
+| 20 | 9.99 | 10.38 | 2.67 | 311.6 |
+
+Grace buys fewer first sightings and pays in ghosts held past their usefulness,
+and every tick of it past the first is a worse trade than the last. One tick is
+the least error of any value swept against a moving viewer, ties for the best
+against a standing one, and still takes 1.4% off the churn. `DEFAULT_GRACE` was
+3 on nothing but taste and is now 1.
+
+A standing viewer barely exercises the parameter at all: 20 ticks of grace costs
+it 6% error to save a fifth of an already small churn. The case grace exists for
+is the moving viewer, and that is the column that has an interior optimum.
+
+**Send period**, at the default cap and grace:
+
+| period | mean angular | p99 error | 0-32 m | first sightings per packet |
+|---|---|---|---|---|
+| 1 | 1.63 | 2.0 m | 9.42 | 0.49 |
+| 2 | 3.56 | 4.0 m | 19.22 | 0.97 |
+| 4 | 7.41 | 8.0 m | 38.74 | 1.82 |
+| 8 | 15.05 | 16.0 m | 77.61 | 3.36 |
+
+Error scales with the period exactly, which is the useful result: **the 99th
+percentile is a cadence lever, not a curve one.** No weighting in the table
+above moves it and every one of these rows doubles it.
+
+This sweep also refutes a claim that was in `ClientLimits::send_period`. A period
+above the grace does not make every ghost depart and arrive again each turn: at
+a period of 8, a client still holds its 256 ghosts and takes 3.4 first sightings
+per packet, because everything still in the ghost set is stamped on every
+serve. Measured at a grace of both 1 and 3, which agree. What actually happens is that grace goes inert, since a
+ghost is only aged when its viewer is served. Per tick rather than per packet,
+the churn at a period of 8 is slightly lower than at 1.
+
+**What none of this fixes.** The 99th-percentile error is 2.0 m in every
+configuration at a period of one. That is the vehicles, and no cap, curve or
+grace touches it; the levers are a larger packet or a higher send rate.
 
 Caveats. The harness is newer and less trusted than the library: four bugs were
-found in it during its first run, each surfacing as an implausible number rather
-than a failing test. Only one density and one motion mix have been run, and
-viewers are all drawn from the walkers, so a viewer traveling at vehicle speed
-is unmeasured and the grace period is barely exercised.
+found in it during its first run and a fifth, the accounting corrected above,
+during this tuning, each surfacing as an implausible number rather than as a
+failing test. One density and one motion mix have been run. The cap sweep was
+repeated against three populations, which moved every figure by less than the
+gaps being read from it. **Every number here is a measurement of an invented
+population, which is the standing reason to hold the defaults loosely.**
 
 ### Odometer benchmark, measured
 
@@ -1647,6 +1776,18 @@ sized to the ghost cap.
 Monotone and close to linear in the cap, which it was not before the fix. The
 cap is a dial between cost and how many entities a client can see.
 
+These rows are single-threaded, which the benchmark no longer is by default:
+`WorldSimulation` gained threads after they were taken, and running the same
+sweep today spends `available_parallelism` unless a caller says otherwise. It
+was rerun both ways during tuning, extended to a cap of 1,024, and paired with
+what each cap costs in accuracy; see §Quality harness, measured. **The rerun is
+8 to 12% slower than this table at one thread**, in the direction of the
+between-session drift already documented, with the same shape.
+
+What the cap should be is no longer open. 256, because below about 160 a
+client's packet does not fill and above 256 accuracy falls in every band while
+cost keeps rising linearly.
+
 Selection keeps the nearest `ghost_cap` candidates and discards the rest
 unscored, so a walk cap above the ghost cap is waste. At a ghost cap of 256:
 
@@ -1682,11 +1823,19 @@ churns it. The prediction that a returning entity "looks maximally stale and
 wins a slot immediately" was exactly right, and the pipeline benchmark is the
 only thing that could see it.
 
-What remains unmeasured is churn under a *moving* viewer. The pipeline benchmark
+~~What remains unmeasured is churn under a *moving* viewer.~~ Measured, for
+quality: the harness draws its viewers from a chosen motion class, and the grace
+sweep runs one at a walker's 1.5 m/s and one at a vehicle's 30 m/s. A viewer
+crossing a crowd takes 2.92 first sightings per packet against a walking
+viewer's 0.49, six times the churn, and pays 3% more angular error in the near
+band. It holds no ghost at all for 1.5% of its ghost-set-tick pairs, against
+0.2% for a walking viewer.
+That is the case `grace` exists for, and it is the one with an interior optimum.
+
+What remains unmeasured is the *cost* of that churn. The pipeline benchmark
 oscillates entities in place so a population shape survives thousands of
-iterations, which holds distances nearly constant and understates how often
-entities cross a view radius. A viewer walking through a crowd is the case that
-would exercise `grace`, and nothing does yet.
+iterations, which holds distances nearly constant, and its viewers do not move at
+all. Nothing puts a moving viewer on the tick-cost path.
 
 **A whole tick over a populated region.** ~~Every benchmark so far measures one
 population shape in isolation.~~ Built and measured: see the clustered rows of
@@ -1863,6 +2012,11 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   2(N-1) lines against ~10,000 writes. Not measured.
 - `WorldSimulation` has no `run`. The clock and the pinned thread belong with
   the edge work.
+- **`grace` is in ticks but is only evaluated when a viewer is served**, since
+  that is when its ghosts are stamped and aged. A grace below a client's send
+  period therefore behaves as zero. Measured as harmless: per tick, the churn at
+  a send period of 8 is slightly lower than at 1. Expressing it in serves would
+  cost a field per viewer to hold the serve count, and nothing yet needs it.
 - `Mul`/`Div` rounding disagree for negative values.
 - `protocol_hash` could send raw field values instead of a digest, which is certain rather
   than near-certain, and names the offending field.

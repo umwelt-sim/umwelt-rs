@@ -32,8 +32,15 @@ use crate::sim::viewer::{ClientLimits, Viewer, ViewerId};
 use crate::snapshot::CellSnapshot;
 use crate::subscription::Subscription;
 
-/// Entities a viewer's client knows about: the nearest this many. A
-/// placeholder; see the ghost cap sweep in the design document.
+/// Entities a viewer's client knows about: the nearest this many.
+///
+/// Measured, against a 1,200-byte payload that holds 98 records. Below about
+/// 160 a client's packet does not fill, since only a ghost that moved consumes
+/// a slot: a cap of 64 sends 42 records of the 98 it paid for. Above 256 every
+/// ghost is refreshed less often and error grows in every distance band, while
+/// the tick cost stays linear in the cap. Quality is flat from 160 to 384, and
+/// this sits at the top of that with room for a denser crowd to still fill a
+/// packet. See §Quality harness in the design document.
 pub const DEFAULT_GHOST_CAP: usize = 256;
 
 /// Entities a viewer's gather examines before it stops.
@@ -45,8 +52,18 @@ pub const DEFAULT_GHOST_CAP: usize = 256;
 /// swept apart.
 pub const DEFAULT_WALK_CAP: usize = DEFAULT_GHOST_CAP;
 
-/// Ticks a ghost survives after leaving the ghost set. A placeholder.
-pub const DEFAULT_GRACE: u32 = 3;
+/// Ticks a ghost survives after leaving the ghost set.
+///
+/// One tick, which absorbs a rank flapping across the edge of the set without
+/// keeping anything longer. Measured: against a viewer crossing a crowd at
+/// 30 m/s, one tick of grace is the least client-side error of any value swept,
+/// 1.4% fewer first sightings than no grace at all, and 1.5% more ghosts held.
+/// Every value above it trades error for churn at a worsening rate: 20 ticks
+/// costs 7% more error and holds 21% more ghosts to take 9% off the churn.
+///
+/// A ghost is only aged when its viewer is served, so a grace below a client's
+/// [`send_period`](ClientLimits::send_period) behaves as zero.
+pub const DEFAULT_GRACE: u32 = 1;
 
 /// The consumer's game, called once per tick.
 pub trait Game {

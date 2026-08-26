@@ -313,16 +313,33 @@ that has not been told the entity exists. Spawn notifications and events on the
 same entity must be ordered relative to each other. TRIBES gave ghost creation
 the same guaranteed delivery path as events.
 
-**The event reserve is currently a fixed cut and should be a floor.**
+~~**The event reserve is a fixed cut and should be a floor.**
 `state_budget_bytes` is computed once as `payload - header - reserve`, so 256 of
-1,200 bytes are unavailable to state even when no events are pending. That is
-over 20% of every packet held for something usually absent. It should be
-reserved only against an actual backlog, with state taking the remainder
-otherwise.
+1,200 bytes are unavailable to state even when no events are pending.~~ It is a
+floor now. `PacketBudget::state_bytes_available` takes the bytes actually queued
+and holds back `min(queued, reserve)`, so state takes the whole packet when
+nothing is pending, and a backlog past the reserve waits its turn rather than
+starving state. At a 12-byte record: 98 records idle, 90 with 100 bytes queued,
+77 under a full backlog.
 
-**Blocked on client registration.** `Entity(EntityId)` means "the client
-controlling this entity" and nothing maps a connection to an avatar yet. That is
-the same missing API the accumulator's per-client state needs, not a new one.
+~~**Blocked on client registration.** `Entity(EntityId)` means "the client
+controlling this entity" and nothing maps a connection to an avatar yet.~~
+Registration is built: `register_viewer` names a viewer's avatar and `avatar_of`
+reads it back.
+
+**What the entity-named targets still need is the reverse direction.**
+`avatar_of` maps viewer to entity; nothing maps entity to viewer, so `Entity`
+has no lookup. `Observers` is the harder one. Ghost state is stored per viewer,
+a `GhostTable` keyed by entity id, so "every client holding a ghost of entity N"
+is answerable only by scanning every viewer's table or by maintaining a reverse
+index that pays on every `sent` and `evict`, both of which are in the per-viewer
+hot path. Undecided. It should be decided before the ghost record grows for
+acknowledgement, so that struct is touched once rather than twice.
+
+**Blocked on the transport.** The delivery machinery above is per connection.
+Sequence numbers, a window and retransmit have nothing to acknowledge against
+until the sim-to-edge protocol exists, and the ordering constraint is a
+wire-format decision. Events wait on step 8 of the build order.
 
 ### Payloads leave through a `PayloadSink`
 
@@ -2352,12 +2369,14 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   carries the snapshot index and `CellSnapshot::pos_at` resolves it. The cheap
   fix for the remaining cases is one array of length n written during the
   scatter, where the writes are sequential.
-- Per-client state (subscription, accumulator scores, send cadence) belongs to
-  `WorldSimulation`. Client registration is the API that does not exist yet:
-  something has to say a connection exists, name its avatar entity, and attach a
-  the edge. Deferred deliberately; it belongs with the accumulator, since
-  that is what gives per-client state its shape. Event delivery is blocked on the
-  same API.
+- ~~Per-client state (subscription, accumulator scores, send cadence) belongs to
+  `WorldSimulation`. Client registration is the API that does not exist yet.~~
+  Built. `register_viewer` takes an avatar entity and what the connection
+  declared, `unregister_viewer` drops the client, and the per-client state lives
+  on `Viewer`. Viewer ids are dense and reusable, since a recycled viewer has an
+  empty ghost set. Nothing here names a socket: mapping a viewer to a connection
+  is the edge's. What is still missing is the reverse lookup, entity to viewer,
+  which is what `EventTarget::Entity` needs; see §Events.
 - **A ghost's mark advances on send rather than on acknowledgement**, so a lost
   packet leaves a client's copy of a since-idle entity permanently wrong. There
   is no protocol to acknowledge against yet. Fixing it needs a pending mark
@@ -2365,10 +2384,13 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 - Viewers are not padded to a cache line, so two workers share the line at each
   chunk boundary. A viewer is written twice per tick, so the contention is
   2(N-1) lines against ~10,000 writes. Not measured.
-- `WorldSimulation` has no `run`, so a consumer writes the loop. What `run` has
-  to do is settled and recorded in §Pacing the loop, and the measurement that
-  shaped it is §Idle costs speed. Building it waits on the edge work only because
-  the thread that owns the clock is the one the edge will want.
+- ~~`WorldSimulation` has no `run`, so a consumer writes the loop. Building it
+  waits on the edge work only because the thread that owns the clock is the one
+  the edge will want.~~ Built, in `sim::clock`. `run` and `run_with` pace the
+  loop against absolute deadlines as §Pacing the loop settled, `Wait` carries the
+  sleep-then-hold choice §Idle costs speed measured, and `Overrun` chooses what a
+  late tick does instead of running extra ticks to catch up. It did not have to
+  wait on the edge after all.
 - **`grace` is in ticks but is only evaluated when a viewer is served**, since
   that is when its ghosts are stamped and aged. A grace below a client's send
   period therefore behaves as zero. Measured as harmless: per tick, the churn at

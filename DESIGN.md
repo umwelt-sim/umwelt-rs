@@ -1214,6 +1214,12 @@ happen, and the smoke test below shows why in numbers.
 `examples/herd-edge.rs` asks for a population, walks it, hands observers back and
 asks for replacements, and reads the replication that comes down.
 
+`herd-sim` draws a card per attached edge when stdout is a terminal, adding and
+dropping cards as edges come and go, and writes one line a second when stdout is
+redirected. The figures below come from the redirected form. Per-edge counters
+live on `Edges`, since a region's total says nothing about which edge is
+carrying what.
+
 Conditions: one region, eight edges, one M1, loopback, 20 Hz, AC power. Mean
 and worst tick are taken within one second. These are smoke test figures from a
 laptop rather than benchmark figures, and §Whole-pipeline is the measurement to

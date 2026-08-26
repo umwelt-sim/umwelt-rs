@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::entity::EntityId;
 use crate::net::error::NetError;
-use crate::net::region::edges::{Edge, EdgeId, Edges};
+use crate::net::region::edges::{Edge, EdgeId, EdgeStats, Edges};
 use crate::net::region::protocol::{
     DespawnEntities, EntitiesSpawned, EntityKind, KIND_DESPAWN_ENTITIES, KIND_ENTITIES_SPAWNED,
     KIND_MOVE_ENTITIES, KIND_POSITION_UPDATES, KIND_QUIT, KIND_SPAWN_ENTITIES,
@@ -95,7 +95,9 @@ pub struct Inbound {
     /// also gets a viewer; an unattended entity is only reported back.
     fresh: Mutex<Vec<(EdgeId, EntityId, EntityKind)>>,
     /// Despawned during the last apply, waiting for its viewer to be dropped.
-    gone: Mutex<Vec<EntityId>>,
+    /// `None` for an entity orphaned by its edge detaching, since that edge's
+    /// counters have already gone with it.
+    gone: Mutex<Vec<(Option<EdgeId>, EntityId)>>,
     /// Entity index to viewer raw. The direction the simulation does not hold,
     /// and the one tearing an entity down needs.
     watchers: Mutex<Vec<u32>>,
@@ -144,6 +146,7 @@ impl Inbound {
     /// is queued and applied on the next tick.
     pub fn serve(&self, edge: &Edge) -> Result<(), NetError> {
         let id = edge.id();
+        let stats = self.edges.stats(id);
         let mut sock = edge.stream();
         let mut body = Vec::new();
         loop {
@@ -169,6 +172,9 @@ impl Inbound {
             };
             self.queue.lock().expect("not poisoned").push(command);
             self.received.fetch_add(1, Ordering::Relaxed);
+            if let Some(stats) = &stats {
+                stats.messages.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -188,7 +194,7 @@ impl Inbound {
         for id in self.edges.take_detached() {
             if step.live().contains(id) {
                 step.despawn(id);
-                self.gone.lock().expect("not poisoned").push(id);
+                self.gone.lock().expect("not poisoned").push((None, id));
                 out.orphaned += 1;
             }
         }
@@ -200,16 +206,17 @@ impl Inbound {
         for command in commands {
             match command {
                 Command::Spawn { edge, spawns } => {
+                    let stats = self.edges.stats(edge);
                     for (pos, kind) in spawns {
                         if !cfg.contains(pos) {
-                            out.refused += 1;
+                            refuse(&mut out, &stats);
                             continue;
                         }
                         let id = step.spawn(pos);
                         if self.edges.claim(edge, id).is_err() {
                             // The edge detached between sending and now.
                             step.despawn(id);
-                            out.refused += 1;
+                            refuse(&mut out, &stats);
                             continue;
                         }
                         self.fresh.lock().expect("not poisoned").push((edge, id, kind));
@@ -218,24 +225,26 @@ impl Inbound {
                     }
                 }
                 Command::Despawn { edge, ids } => {
+                    let stats = self.edges.stats(edge);
                     for id in ids {
                         if self.edges.edge_for(id) != Some(edge) {
-                            out.refused += 1;
+                            refuse(&mut out, &stats);
                             continue;
                         }
                         self.edges.release(id);
                         step.despawn(id);
-                        self.gone.lock().expect("not poisoned").push(id);
+                        self.gone.lock().expect("not poisoned").push((Some(edge), id));
                         out.despawned += 1;
                     }
                 }
                 Command::Move { edge, moves } => {
+                    let stats = self.edges.stats(edge);
                     for (id, pos) in moves {
                         if self.edges.edge_for(id) != Some(edge)
                             || !cfg.contains(pos)
                             || !step.live().contains(id)
                         {
-                            out.refused += 1;
+                            refuse(&mut out, &stats);
                             continue;
                         }
                         writes.push((id.index(), pos));
@@ -272,10 +281,13 @@ impl Inbound {
 
         // Teardown first. Viewer ids are reusable, so registering before
         // dropping could hand out an id this batch then clears.
-        for id in gone {
+        for (edge, id) in gone {
             let Some(viewer) = self.take_watcher(id) else { continue };
             sim.unregister_viewer(viewer);
             sink.unbind(viewer);
+            if let Some(stats) = edge.and_then(|e| self.edges.stats(e)) {
+                stats.observers.fetch_sub(1, Ordering::Relaxed);
+            }
             out.unregistered += 1;
         }
 
@@ -288,6 +300,9 @@ impl Inbound {
                 let viewer = sim.register_viewer(id, limits);
                 sink.bind(viewer, id);
                 self.set_watcher(id, viewer);
+                if let Some(stats) = self.edges.stats(edge) {
+                    stats.observers.fetch_add(1, Ordering::Relaxed);
+                }
                 out.registered += 1;
                 viewer
             });
@@ -323,6 +338,14 @@ impl Inbound {
         let slot = watchers.get_mut(entity.index())?;
         let raw = std::mem::replace(slot, NONE);
         (raw != NONE).then(|| ViewerId::from_raw(raw))
+    }
+}
+
+/// Counts one declined command, on the run total and on the edge that sent it.
+fn refuse(out: &mut Applied, stats: &Option<Arc<EdgeStats>>) {
+    out.refused += 1;
+    if let Some(stats) = stats {
+        stats.refused.fetch_add(1, Ordering::Relaxed);
     }
 }
 

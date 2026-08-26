@@ -24,7 +24,7 @@ mod wire;
 
 pub use auth::{AllowAll, Authorizer, Denied, MAX_CREDENTIAL_BYTES, SharedSecret};
 pub use client::{Decision, Incoming, Offer, RegionClient};
-pub use edges::{ClaimError, Edge, EdgeId, Edges};
+pub use edges::{ClaimError, Edge, EdgeId, EdgeStats, EdgeView, Edges};
 pub use protocol::{
     ClientIdentification, DespawnEntities, EntitiesSpawned, EntityKind, HANDSHAKE_TIMEOUT,
     MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities,

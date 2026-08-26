@@ -41,6 +41,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::entity::EntityId;
 use crate::net::error::NetError;
@@ -120,12 +121,52 @@ impl fmt::Display for ClaimError {
 
 impl std::error::Error for ClaimError {}
 
+/// Running totals for one attached edge.
+///
+/// Cumulative since the edge attached, so a caller wanting rates takes
+/// differences between samples. An operator watching a region needs to know
+/// which edge is carrying what, not only the region's total.
+#[derive(Debug, Default)]
+pub struct EdgeStats {
+    /// Frames written to this edge, payloads and replies together.
+    pub frames: AtomicU64,
+    /// Bytes of frame body written, excluding the five-byte frame header.
+    pub bytes: AtomicU64,
+    /// Frames read from this edge.
+    pub messages: AtomicU64,
+    /// Entities this edge manages that have a viewer watching them.
+    pub observers: AtomicUsize,
+    /// Commands from this edge the region declined.
+    pub refused: AtomicU64,
+}
+
+/// One edge's state, sampled together under a single lock.
+///
+/// Reading each field through its own accessor would take the lock once per
+/// field and could show a mixture of two moments.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeView {
+    pub id: EdgeId,
+    pub peer: SocketAddr,
+    /// How long this edge has been attached.
+    pub uptime: Duration,
+    pub entities: usize,
+    pub observers: usize,
+    pub frames: u64,
+    pub bytes: u64,
+    pub messages: u64,
+    pub refused: u64,
+}
+
 /// What one attached edge is, from the region's side.
 #[derive(Debug)]
 struct EdgeRecord {
     peer: SocketAddr,
+    /// When this edge completed its handshake.
+    since: Instant,
     /// Entities whose clients this edge holds the connections for.
     entities: Vec<EntityId>,
+    stats: Arc<EdgeStats>,
     /// The write half, so a reply or a payload can reach this edge from a
     /// thread that does not own the [`Edge`]. One lock per edge, since two
     /// writers interleaving would splice one frame into another.
@@ -187,6 +228,38 @@ impl Edges {
     pub fn peer(&self, id: EdgeId) -> Option<SocketAddr> {
         let slots = self.slots.lock().expect("not poisoned");
         slots.get(id.index()).and_then(|held| held.as_ref()).map(|rec| rec.peer)
+    }
+
+    /// One edge's counters, shared so a caller can hold them across ticks.
+    pub fn stats(&self, edge: EdgeId) -> Option<Arc<EdgeStats>> {
+        let slots = self.slots.lock().expect("not poisoned");
+        slots.get(edge.index()).and_then(|held| held.as_ref()).map(|r| Arc::clone(&r.stats))
+    }
+
+    /// Every attached edge with its counters, sampled at one moment.
+    ///
+    /// Allocates and takes the lock, so this is a reporting path rather than
+    /// something to call per tick.
+    pub fn view(&self) -> Vec<EdgeView> {
+        let slots = self.slots.lock().expect("not poisoned");
+        slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, held)| {
+                let rec = held.as_ref()?;
+                Some(EdgeView {
+                    id: EdgeId::from_raw(i as u32),
+                    peer: rec.peer,
+                    uptime: rec.since.elapsed(),
+                    entities: rec.entities.len(),
+                    observers: rec.stats.observers.load(Ordering::Relaxed),
+                    frames: rec.stats.frames.load(Ordering::Relaxed),
+                    bytes: rec.stats.bytes.load(Ordering::Relaxed),
+                    messages: rec.stats.messages.load(Ordering::Relaxed),
+                    refused: rec.stats.refused.load(Ordering::Relaxed),
+                })
+            })
+            .collect()
     }
 
     /// Every edge attached right now, for an operator view.
@@ -304,10 +377,12 @@ impl Edges {
     /// The control path: replies an edge is waiting on, which are few and want
     /// no latency. Returns [`NetError::Closed`] if that id names nobody.
     pub(crate) fn send(&self, edge: EdgeId, kind: u8, body: &[u8]) -> Result<(), NetError> {
-        let writer = self.writer_for(edge)?;
+        let (writer, stats) = self.writer_for(edge)?;
         let mut sock = writer.lock().expect("not poisoned");
         write_frame_parts(&mut *sock, kind, &[body])?;
         sock.flush()?;
+        stats.frames.fetch_add(1, Ordering::Relaxed);
+        stats.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -321,9 +396,12 @@ impl Edges {
         kind: u8,
         parts: &[&[u8]],
     ) -> Result<(), NetError> {
-        let writer = self.writer_for(edge)?;
+        let (writer, stats) = self.writer_for(edge)?;
         let mut sock = writer.lock().expect("not poisoned");
-        write_frame_parts(&mut *sock, kind, parts)
+        write_frame_parts(&mut *sock, kind, parts)?;
+        stats.frames.fetch_add(1, Ordering::Relaxed);
+        stats.bytes.fetch_add(parts.iter().map(|p| p.len() as u64).sum::<u64>(), Ordering::Relaxed);
+        Ok(())
     }
 
     /// Pushes every edge's queued frames to its socket.
@@ -351,12 +429,16 @@ impl Edges {
         pushed
     }
 
-    fn writer_for(&self, edge: EdgeId) -> Result<Arc<Mutex<BufWriter<TcpStream>>>, NetError> {
+    #[allow(clippy::type_complexity)]
+    fn writer_for(
+        &self,
+        edge: EdgeId,
+    ) -> Result<(Arc<Mutex<BufWriter<TcpStream>>>, Arc<EdgeStats>), NetError> {
         let slots = self.slots.lock().expect("not poisoned");
         slots
             .get(edge.index())
             .and_then(|held| held.as_ref())
-            .map(|rec| Arc::clone(&rec.writer))
+            .map(|rec| (Arc::clone(&rec.writer), Arc::clone(&rec.stats)))
             .ok_or(NetError::Closed)
     }
 
@@ -370,7 +452,13 @@ impl Edges {
                 slots.len() - 1
             }
         };
-        slots[at] = Some(EdgeRecord { peer, entities: Vec::new(), writer });
+        slots[at] = Some(EdgeRecord {
+            peer,
+            since: Instant::now(),
+            entities: Vec::new(),
+            stats: Arc::new(EdgeStats::default()),
+            writer,
+        });
         self.live.fetch_add(1, Ordering::Relaxed);
         self.accepted.fetch_add(1, Ordering::Relaxed);
         EdgeId::from_raw(at as u32)

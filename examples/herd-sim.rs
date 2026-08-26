@@ -15,6 +15,7 @@
 mod herd;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use umwelt::net::{EdgeSink, Inbound, RegionId, RegionServer, SharedSecret};
@@ -25,11 +26,17 @@ use umwelt::{WorldConfig, WorldSimulation};
 /// the point of the exercise: no world logic, only the wire.
 struct Applier {
     inbound: Arc<Inbound>,
+    /// Slots ever allocated, which is what the snapshot rebuild and the
+    /// odometer walk. `WorldSimulation` reports live entities and has no
+    /// accessor for this, so the game reads it off `Step` and publishes it.
+    /// Under churn it grows without bound, since despawn does not reclaim.
+    slots: Arc<AtomicUsize>,
 }
 
 impl Game for Applier {
     fn step(&mut self, step: &mut Step<'_>) {
         self.inbound.apply(step);
+        self.slots.store(step.slots(), Ordering::Relaxed);
     }
 }
 
@@ -77,8 +84,12 @@ fn main() {
     let edges = Arc::clone(server.edges());
     let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
     let sink = EdgeSink::new(Arc::clone(&edges));
-    let mut sim = WorldSimulation::new(cfg, Applier { inbound: Arc::clone(&inbound) })
-        .with_sink(Handoff::new(sink.clone()));
+    let slots = Arc::new(AtomicUsize::new(0));
+    let mut sim = WorldSimulation::new(
+        cfg,
+        Applier { inbound: Arc::clone(&inbound), slots: Arc::clone(&slots) },
+    )
+    .with_sink(Handoff::new(sink.clone()));
 
     std::thread::scope(|scope| {
         // Accept loop. Each attached edge gets a thread that only queues what it
@@ -126,11 +137,12 @@ fn main() {
                     // count means the delivery side is behind, not the tick.
                     println!(
                         "herd-sim: {ticks} ticks | {} edges | {} entities | \
-                         {} viewers/tick | {records} records | \
+                         {} slots | {} viewers/tick | {records} records | \
                          mean {:.2} ms worst {:.2} ms | \
                          delivered {} dropped {} | undeliverable {} refused {}",
                         edges.len(),
                         sim.entity_count(),
+                        slots.load(Ordering::Relaxed),
                         served / ticks.max(1) as u64,
                         spent.as_secs_f64() * 1_000.0 / ticks.max(1) as f64,
                         worst.as_secs_f64() * 1_000.0,

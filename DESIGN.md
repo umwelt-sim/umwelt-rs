@@ -1312,6 +1312,86 @@ Not built: the datagram path, the ack path the ghost mark needs, the reliable
 event channel, and the edge server that holds game client sockets. `herd-edge`
 drives the region side of an edge without serving any game clients.
 
+### Slot growth under churn
+
+Despawn clears a liveness bit and does not reclaim the slot, so an edge whose
+game clients come and go grows the arrays that `CellSnapshot::update` and
+`Odometer::accumulate` walk every tick. §Open items predicted that a
+long-running region pays tick time proportional to slots ever allocated. It
+does.
+
+Ten minutes, one region, three edges, 20 Hz, AC power. Each edge holds 2,048
+observers and 512 unattended entities and hands back 32 observers a second,
+asking for 32 replacements, for 96 spawns a second across the region. A control
+run used the same load with churn switched off, so its slot count never moved.
+
+| segment | churn slots | churn mean | control slots | control mean |
+|---|---|---|---|---|
+| 0-60 s | 13,248 | 13.05 ms | 7,680 | 14.35 ms |
+| 120-180 s | 24,480 | 13.33 ms | 7,680 | 14.67 ms |
+| 240-300 s | 35,648 | 13.61 ms | 7,680 | 14.58 ms |
+| 360-420 s | 46,816 | 13.64 ms | 7,680 | 14.17 ms |
+| 480-540 s | 57,952 | 14.55 ms | 7,680 | 14.10 ms |
+| 540-600 s | 63,520 | 15.15 ms | 7,680 | 13.36 ms |
+
+Live entities stayed at 7,680 in both runs, and viewers served stayed at 6,139.
+Slots reached 63,712 in the churn run, 8.3 times the live count.
+
+Comparing the first 30 seconds against the last 30 within each run: the churn
+run rose 15.2%, from 12.93 ms to 14.89 ms. The control fell 5.6%, from 14.13 ms
+to 13.34 ms. The control is what rules out thermal drift over ten minutes of
+sustained load, which would otherwise produce the same curve, because slot count
+and elapsed time move together in the churn run and cannot be separated from
+each other within it.
+
+The two runs differ in absolute level by about 10%, which is inside the
+run-to-run variance recorded in §The smoke test. Only the trend within a run is
+comparable, not the level between runs.
+
+A least-squares fit over the churn run gives **35 ns per slot per tick**, against
+a 12.5 ms intercept. Nothing was dropped or refused in either run.
+
+Taking 35 ns per slot as constant, a 50 ms deadline would be reached at about
+1.07 million slots, which at 96 spawns a second is about three hours. That
+extrapolation runs 17 times past the measured range and the per-slot cost is
+unlikely to hold across it, since the arrays leave successive cache levels on the
+way.
+
+#### Skipping dead slots a word at a time
+
+The three walks tested one slot at a time: `CellSnapshot::update` in both of its
+passes, and `Odometer::accumulate`. A dead slot cost the same as a live one.
+
+`LiveSet::iter` now walks the liveness bitmap by 64-bit word, yields the set bits
+of each, and skips a word that is entirely dead with one comparison. A dead slot
+costs a sixty-fourth of what it did.
+
+Re-running the churn configuration unchanged:
+
+| segment | slots | before | after |
+|---|---|---|---|
+| 0-60 s | 13,248 | 13.05 ms | 12.98 ms |
+| 180-240 s | 30,048 | 13.26 ms | 13.07 ms |
+| 360-420 s | 46,816 | 13.64 ms | 13.18 ms |
+| 480-540 s | 57,952 | 14.55 ms | 13.29 ms |
+| 540-600 s | 63,520 | 15.15 ms | 13.06 ms |
+
+First 30 seconds against last 30: the original rose 15.2%, from 12.93 ms to
+14.89 ms. The rebuilt walk rose 2.8%, from 12.79 ms to 13.15 ms, which is inside
+the run-to-run variance recorded in §The smoke test. The fitted slope went from
+34.3 ns per slot to -3.0 ns per slot, so slot count and tick time no longer show
+a relationship at this range.
+
+The growth is reduced rather than removed. Words are still scanned, at one test
+per 64 dead slots, so the three-hour figure above becomes something on the order
+of a week at the same churn rate. That is arithmetic on the factor of 64 and not
+a measurement: the effect is too small to see across 63,744 slots, and finding
+the new limit needs a longer run or a higher churn rate.
+
+Slot reuse is what removes the growth rather than slowing it, and it is not
+built. It needs either a quarantine until every client has acknowledged the
+despawn, which waits on the ack path, or compaction during a quiet period.
+
 ---
 
 ## The priority accumulator
@@ -2693,8 +2773,8 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   client has acknowledged the despawn. And `update` still walks every slot,
   including dead ones, so a long-running region with heavy churn pays tick time
   proportional to slots ever allocated rather than entities currently alive.
-  Word-level skipping in `LiveSet` would cut that to one test per 64 dead slots;
-  not built, not measured.
+  ~~Not measured.~~ Measured: see §Slot growth under churn. Word-level skipping
+  in `LiveSet` would cut the walk to one test per 64 dead slots. Not built.
 - ~~**Delivery saturates at about 170,000 payloads per second, and the
   simulation does not.**~~ Fixed by batching: see §Delivery used to stop long
   before the tick did. It was three syscalls per payload from one thread; it is

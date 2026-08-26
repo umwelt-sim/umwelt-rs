@@ -113,9 +113,10 @@ impl Odometer {
             self.prev_z[old..].copy_from_slice(&zs[old..]);
         }
 
-        for i in 0..slots {
-            if !live.contains(EntityId::from_raw(i as u32)) {
-                continue;
+        for id in live.iter() {
+            let i = id.index();
+            if i >= slots {
+                break;
             }
             let step = xs[i]
                 .raw()

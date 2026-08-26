@@ -102,6 +102,17 @@ impl LiveSet {
         self.live == 0
     }
 
+    /// Live slots in ascending order, skipping dead ones 64 at a time.
+    ///
+    /// Testing each slot in turn costs the same whether it holds an entity or
+    /// not, so a region that has despawned far more than it holds pays for
+    /// every slot it ever allocated. A word that is entirely dead is one
+    /// comparison rather than 64. See §Slot growth under churn.
+    #[inline]
+    pub fn iter(&self) -> LiveIter<'_> {
+        LiveIter { words: &self.words, at: 0, current: self.words.first().copied().unwrap_or(0) }
+    }
+
     #[inline(always)]
     pub fn contains(&self, id: EntityId) -> bool {
         let i = id.index();
@@ -150,9 +161,115 @@ impl LiveSet {
     }
 }
 
+/// Ascending live slots from a [`LiveSet`], produced by [`LiveSet::iter`].
+///
+/// Holds the current word rather than re-reading it, and clears the lowest set
+/// bit per step, so a dense word costs one instruction per live slot and an
+/// empty one costs a single test.
+#[derive(Clone, Debug)]
+pub struct LiveIter<'a> {
+    words: &'a [u64],
+    /// Index of the word `current` came from.
+    at: usize,
+    /// Bits of that word not yet yielded.
+    current: u64,
+}
+
+impl Iterator for LiveIter<'_> {
+    type Item = EntityId;
+
+    #[inline]
+    fn next(&mut self) -> Option<EntityId> {
+        loop {
+            if self.current != 0 {
+                let bit = self.current.trailing_zeros() as usize;
+                self.current &= self.current - 1;
+                return Some(EntityId::from_raw(((self.at << 6) + bit) as u32));
+            }
+            self.at += 1;
+            self.current = *self.words.get(self.at)?;
+        }
+    }
+}
+
 #[cfg(test)]
 mod live_tests {
     use super::*;
+
+    fn set(of: &[u32]) -> LiveSet {
+        let mut live = LiveSet::new();
+        for &n in of {
+            live.insert(EntityId::from_raw(n));
+        }
+        live
+    }
+
+    fn walked(live: &LiveSet) -> Vec<u32> {
+        live.iter().map(|id| id.raw()).collect()
+    }
+
+    #[test]
+    fn iter_yields_nothing_when_nothing_is_live() {
+        assert!(walked(&LiveSet::new()).is_empty());
+    }
+
+    #[test]
+    fn iter_yields_live_slots_in_ascending_order() {
+        assert_eq!(walked(&set(&[5, 0, 63, 64, 200])), vec![0, 5, 63, 64, 200]);
+    }
+
+    #[test]
+    fn iter_skips_a_long_run_of_dead_slots() {
+        // One live slot either side of 10,000 dead ones.
+        let mut live = set(&[0, 10_001]);
+        assert_eq!(walked(&live), vec![0, 10_001]);
+        live.remove(EntityId::from_raw(0));
+        assert_eq!(walked(&live), vec![10_001]);
+    }
+
+    #[test]
+    fn iter_follows_removals() {
+        let mut live = set(&[1, 2, 3, 64, 65]);
+        live.remove(EntityId::from_raw(2));
+        live.remove(EntityId::from_raw(64));
+        assert_eq!(walked(&live), vec![1, 3, 65]);
+    }
+
+    #[test]
+    fn iter_yields_a_full_word() {
+        let live = set(&(0..64).collect::<Vec<u32>>());
+        assert_eq!(walked(&live), (0..64).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn iter_agrees_with_contains_across_every_slot() {
+        // The property the two walks in `snapshot` and `odometer` rely on.
+        let mut live = LiveSet::new();
+        for n in 0..1_000u32 {
+            if n % 7 == 0 || n % 11 == 0 {
+                live.insert(EntityId::from_raw(n));
+            }
+        }
+        live.insert(EntityId::from_raw(4_000));
+        for n in 0..500u32 {
+            if n % 3 == 0 {
+                live.remove(EntityId::from_raw(n));
+            }
+        }
+        let by_contains: Vec<u32> =
+            (0..live.slots() as u32).filter(|&n| live.contains(EntityId::from_raw(n))).collect();
+        assert_eq!(walked(&live), by_contains);
+        assert_eq!(walked(&live).len(), live.live());
+    }
+
+    #[test]
+    fn iter_counts_what_live_reports() {
+        let mut live = set(&(0..300).collect::<Vec<u32>>());
+        for n in (0..300).step_by(2) {
+            live.remove(EntityId::from_raw(n));
+        }
+        assert_eq!(walked(&live).len(), live.live());
+    }
 
     fn id(n: u32) -> EntityId {
         EntityId::from_raw(n)

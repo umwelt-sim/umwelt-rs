@@ -406,9 +406,12 @@ impl CellSnapshot {
         // Pass 1: tally into starts[c + 1], so the running total below produces
         // each cell's start offset with no shifting afterward.
         self.starts.fill(0);
-        for i in 0..slots {
-            if !live.contains(EntityId::from_raw(i as u32)) {
-                continue;
+        // The live set may cover more slots than the arrays, and it yields in
+        // ascending order, so a slot past the end ends the walk.
+        for id in live.iter() {
+            let i = id.index();
+            if i >= slots {
+                break;
             }
             let c = cfg.cell_id(cfg.cell_of(Pos2::new(xs[i], ys[i]))).index();
             self.starts[c + 1] += 1;
@@ -422,14 +425,15 @@ impl CellSnapshot {
         // Pass 3: scatter in ascending id order, leaving each cell's range
         // sorted by id.
         self.cursor.copy_from_slice(&self.starts[..self.cells]);
-        for i in 0..slots {
-            if !live.contains(EntityId::from_raw(i as u32)) {
-                continue;
+        for id in live.iter() {
+            let i = id.index();
+            if i >= slots {
+                break;
             }
             let c = cfg.cell_id(cfg.cell_of(Pos2::new(xs[i], ys[i]))).index();
             let d = self.cursor[c] as usize;
             self.cursor[c] += 1;
-            self.ids[d] = EntityId::from_raw(i as u32);
+            self.ids[d] = id;
             self.xs[d] = xs[i];
             self.ys[d] = ys[i];
             self.zs[d] = zs[i];

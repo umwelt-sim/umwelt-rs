@@ -336,10 +336,11 @@ index that pays on every `sent` and `evict`, both of which are in the per-viewer
 hot path. Undecided. It should be decided before the ghost record grows for
 acknowledgement, so that struct is touched once rather than twice.
 
-**Blocked on the transport.** The delivery machinery above is per connection.
-Sequence numbers, a window and retransmit have nothing to acknowledge against
-until the sim-to-edge protocol exists, and the ordering constraint is a
-wire-format decision. Events wait on step 8 of the build order.
+**Blocked on what a session carries.** The delivery machinery above is per
+connection. The link is built and its handshake works (§The region link), but a
+session carries nothing yet, so sequence numbers, a window and retransmit have
+nothing to run over, and the ordering constraint is still an open wire-format
+question rather than an answered one.
 
 ### Payloads leave through a `PayloadSink`
 
@@ -612,8 +613,8 @@ authored. Everything else in this table derives from those five.
 ## What is built
 
 `fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
-`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`. 204 library
-tests pass.
+`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`. 280
+library tests pass.
 
 A tick runs end to end: the game moves entities, the odometer observes how far
 they went, the snapshot is rebuilt in cell order, and every due viewer is
@@ -621,8 +622,9 @@ subscribed, gathered, scored and selected against it, then handed a payload
 assembled from that selection and passed to its sink. Viewers are partitioned
 across worker threads.
 
-Not built: the clock that drives the tick, events, and any transport past the
-sink.
+Not built: events, and anything a session carries. The clock is built; see
+§Pacing the loop. The region link is built and carries its handshake and nothing
+else; see §The region link.
 
 ### Subscription
 
@@ -957,9 +959,9 @@ than silently missing every subsequent tick. That is a process-level policy and
 belongs with `run`, which is also not built. Nothing currently defends against a
 sink that blocks forever.
 
-Not built: the shipped implementation that speaks the sim-to-edge protocol,
-which is the one that would hand off to an I/O thread and drop rather than
-queue.
+Not built: the sink that writes into a region link, which is the one that
+would hand off to an I/O thread and drop rather than queue. `net` carries the
+handshake; nothing yet carries payloads. See §The region link.
 
 ### Simulation and viewers
 
@@ -981,8 +983,160 @@ Viewers are partitioned across `thread_count` workers with scoped threads, and
 each worker holds its own gather, selection and packet buffers, so the only
 thing they share for writing is the cache line at a chunk boundary.
 
-Not built: `run` and its clock, and events. §Pacing the loop is what the first
-of those has to do.
+Not built: events. `run` and its clock are built, and §Pacing the loop is what
+they do.
+
+### The region link
+
+`net` holds two protocols, and keeping them apart is what the module is for
+rather than an afterthought.
+
+**Region to edge**, `net::region`, is built. One region simulation and the small
+number of edges relaying for it: few peers, mutually trusted, deployed together,
+over a reliable ordered stream.
+
+**Edge to game client** is not built and will be its own module. Many peers,
+none of them trusted, deployed on someone else's machine and updated on their
+schedule. The payloads §Payload assembly produces belong to that link, and they
+are latest-only, lossy, unordered and MTU-sized, so nothing about the framing
+below suits them.
+
+The two differ in peer count, in reliability, in ordering, in who is trusted and
+in what may be disclosed, which is every property that shapes a protocol. So they
+get their own message types, their own framing and their own version, and a
+change to one must not be able to break the other.
+
+**Two ends, and deliberately not one type.** `RegionServer` is a region's
+listening socket. `RegionClient` is one link to a region. An edge server will
+take a `RegionClient` and start its own socket server on the other side of
+itself, speaking the client-facing protocol; it is not built and it is not
+`RegionClient`. Collapsing the two would put per-client work back on the edge
+tier, which is what §Why per-client work stays in the simulation is about.
+
+**Messages are named for what they carry, not for who sends them.** A message
+belongs to the protocol, not to whichever end happens to speak it.
+`ClientIdentification` identifies the connecting client, `ServerInfo` describes
+the server and the region it owns, `Rejection` says the link will not be taken.
+
+**Framing.** A one-byte kind, a `u32` length, then the body, little-endian to
+match §Payload assembly. The length is bounded at 4,096 bytes before anything is
+allocated, which matters more than it looks: it is read from a peer that has not
+authorized yet, because the credential is inside the frame being sized.
+
+**The handshake, in this order.**
+
+1. Client sends `ClientIdentification`: the protocol version it speaks, and its
+   credential.
+2. Server authorizes. A peer that fails gets a bare `Rejection` and nothing else.
+3. Server sends `ServerInfo`: its crate version, its region id, world parameters.
+4. Client accepts, or quits. Both are empty frames.
+
+**The identification goes first and the server info second**, so a peer that
+cannot authorize learns neither the region id nor the shape of the world. The
+reverse order would have been easier to write and would hand both to anyone able
+to open a socket. A test asserts the refusal a client sees carries neither.
+
+The client accepts or quits rather than the server assuming, so a client that
+reads the parameters and finds a world it cannot render, or a region it did not
+mean to reach, leaves instead of becoming an edge the region counts.
+
+**The config crosses as the five authored values, not the struct.** A
+`WorldConfig` is mostly derived, so `WorldParams` carries region size, vertical
+extent, view radius and max speed in whole meters, plus tick rate and
+`protocol_hash`. The client rebuilds through the builder and rejects on a digest
+mismatch. That is one derivation rather than two, and it makes the digest do real
+work rather than decorate the frame: a config that did not come through the
+builder is caught instead of approximated. A server using `with_cell_size_m`
+fails it, and a test pins that.
+
+Three versions are checked and all three move independently. `PROTOCOL_VERSION`
+is the shape of these messages and must match exactly, since region and edge
+deploy together and a skew is a deployment mistake rather than a condition to
+tolerate. It versions this protocol only; the client-facing one will carry its
+own. `ServerVersion` is the crate build, reported so an operator can see what a
+region is running without asking it, and nothing rejects on it. `protocol_hash`
+is the world's wire layout.
+
+**Authorization is a bearer secret, checked once.** `Authorizer` is the seam and
+`SharedSecret` is the shipped implementation, comparing without short-circuiting
+on the first differing byte. It is consulted exactly once per link, during the
+handshake, and never again: after that the established TCP connection is the only
+thing standing in for identity. There is no per-message authentication and no
+per-message integrity check.
+
+What that is worth, stated plainly. The secret crosses the wire on every connect,
+so whoever can read the link has it, and whoever can inject on an established
+connection is not stopped by anything here. It is the second lock rather than the
+first: it stops a misconfigured edge, a stale binary from a previous deployment,
+and a process that wandered onto the right port. Raising the bar means
+challenge-response over a MAC, so the secret itself never travels, which needs a
+vetted crypto implementation rather than a hand-rolled one. That is a dependency
+this crate does not have and a decision nobody has made.
+
+**A handshake has a five second deadline, lifted once the link is up.** A peer
+that connects and then says nothing would otherwise hold a server thread without
+ever presenting a credential, which is a way in that needs no credential. A link
+sits idle between packets, so the same deadline cannot apply to it.
+
+**Threading.** One thread per attached edge, spawned into a `std::thread::scope`
+by `RegionServer::run`, and no dependency. A region takes links from a small
+number of edges rather than from thousands of game clients, so a blocking accept
+loop is sized for the job. The note in §Rust implementation notes that Tokio
+belongs in the edge server is about the client-facing side, which this is not.
+
+### Edges, and what each one manages
+
+A region does not think about sockets one at a time. `Edges` is the set of edges
+relaying for it: dense reusable ids, where each is connected from, and the
+entities each one manages. `Edge` is one attached edge, and holding one is what
+keeps it attached — dropping it closes the link, frees the id, and releases every
+entity it held. Ids are reusable on the same terms as `ViewerId`: a recycled
+`EdgeId` names a different connection carrying nothing over, so there is nothing
+for a stale reference to alias.
+
+**Why an edge owns entities.** A game client connects to an edge, and that edge
+registers a viewer with the region for the client's avatar. The region then
+builds a payload per viewer per tick and hands each to a `PayloadSink`, which has
+to send it to the edge holding that client's connection and to no other. Which
+edge that is, is a fact only this set knows. That is the same argument §Events go
+through umwelt, not around it makes for `Observers`: the replication tier holds
+the mapping, so the routing question belongs to it.
+
+An edge claims the entities it manages, and `Edges::edge_for` answers the routing
+question. A sink resolves a served `ViewerId` to its avatar through `avatar_of`,
+then that avatar to an edge through `edge_for`.
+
+**The lookup sits on the sink's path, which is on the tick's path.** Every served
+viewer costs one, from every worker thread at once. So `edge_for` takes a shared
+lock and one relaxed atomic load and never waits on a claim; claiming and
+releasing take the exclusive lock, and they happen when a game client arrives or
+leaves rather than per tick. **Not measured.** §Payloads leave through a sink is
+why the shape was chosen that way regardless: a sink that merely copied its
+payload under a shared mutex was 70% of a tick at 513 ns per send, so a routing
+lookup that serialized every worker would be the same mistake twice.
+
+**An entity has at most one edge.** A second claim on one already held is a
+`ClaimError` rather than a last-writer-wins, because two edges managing one
+avatar means two clients being sent one viewer's packets, which is a bug to
+surface rather than a race to resolve quietly.
+
+Detaching an edge releases everything it managed. The entities are not despawned:
+they stop being routable, which is the truth, since there is no longer a
+connection to send their clients anything over.
+
+Not benchmarked, and none of it is on the tick path today, since nothing yet
+calls `edge_for`. What is established is that the link runs: six edges attach,
+complete the handshake and stay attached while the region counts them, and 67
+tests cover the framing, the messages, the handshake, the refusals, the deadline,
+the shutdown, and the ownership and routing rules. No number here is a
+performance claim.
+
+Not built: anything a link carries. `Edge::wait_for_close` reads and discards,
+which is the placeholder the payload path replaces, and no `PayloadSink` writes
+into an edge yet. State payloads are latest-only, lossy and unordered, and a
+reliable ordered stream is the wrong shape for them, so what carries them is the
+open question — along with the ack path the ghost mark needs and the reliable
+channel events need.
 
 ---
 
@@ -2214,7 +2368,8 @@ and cell count together rather than one at a time.
 6. `WorldSimulation` and the game hook trait (done); a minimal `herd` game step
    (movement, health; nothing else) is next
 7. Bot harness with adversarial movement patterns
-8. `SimulatorEdge` and the sim-to-edge protocol
+8. `SimulatorEdge` and the sim-to-edge protocol. The link and its handshake are
+   built (§The region link); what a session carries, and the edge itself, are not
 9. Checkpoint path (full-fidelity, distinct from the wire payload)
 10. Cross-region: boundary replication, authority epochs, handoff
 11. Control plane

@@ -34,6 +34,7 @@ pub mod codec;
 pub mod packet;
 mod subscription;
 pub mod sim;
+pub mod net;
 
 pub use fixed::{Fixed, DistSq, FIXED_ONE, FIXED_SHIFT};
 pub use pos::{Pos3, Pos2, CellCoord, CellId};
@@ -52,3 +53,4 @@ pub use sim::{
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
 pub use subscription::{CellList, Subscription};
+pub use net::{RegionClient, RegionId, RegionServer};

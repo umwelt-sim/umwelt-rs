@@ -29,16 +29,35 @@ pub const MAX_FRAME_BYTES: usize = 4096;
 /// Kind, then a `u32` length.
 const HEADER_BYTES: usize = 5;
 
+/// **Does not flush.** A frame written to a `TcpStream` has been handed to the
+/// kernel, since that flush is a no-op. A frame written to a buffered writer
+/// waits for one. The bulk path depends on this: it writes many frames and
+/// flushes once, because a syscall per frame held delivery to about 170,000
+/// payloads a second. See §The smoke test.
 pub(crate) fn write_frame(out: &mut impl Write, kind: u8, body: &[u8]) -> Result<(), NetError> {
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(NetError::FrameTooLarge { claimed: body.len(), max: MAX_FRAME_BYTES });
+    write_frame_parts(out, kind, &[body])
+}
+
+/// One frame from several pieces, without joining them first.
+///
+/// The bulk path has a viewer id and a payload that live in different places,
+/// and copying them together to write them would be a copy per payload.
+pub(crate) fn write_frame_parts(
+    out: &mut impl Write,
+    kind: u8,
+    parts: &[&[u8]],
+) -> Result<(), NetError> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    if len > MAX_FRAME_BYTES {
+        return Err(NetError::FrameTooLarge { claimed: len, max: MAX_FRAME_BYTES });
     }
     let mut head = [0u8; HEADER_BYTES];
     head[0] = kind;
-    head[1..].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    head[1..].copy_from_slice(&(len as u32).to_le_bytes());
     out.write_all(&head)?;
-    out.write_all(body)?;
-    out.flush()?;
+    for part in parts {
+        out.write_all(part)?;
+    }
     Ok(())
 }
 
@@ -117,6 +136,12 @@ impl<'a> Cursor<'a> {
 
     pub(crate) fn bytes(&mut self, n: usize) -> Result<&'a [u8], NetError> {
         self.take(n)
+    }
+
+    /// Everything not yet read, for a message whose tail is an opaque blob.
+    /// Consumes the cursor, since there is nothing left to read after it.
+    pub(crate) fn rest(self) -> &'a [u8] {
+        &self.buf[self.at..]
     }
 
     /// Trailing bytes mean the two ends disagree about the format, so this is a

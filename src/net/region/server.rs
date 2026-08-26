@@ -154,9 +154,9 @@ impl RegionServer {
 
     /// The server's half of the handshake.
     ///
-    /// The order is the point: the credential is checked before this region
-    /// says anything about itself, so a peer that cannot authorize learns
-    /// neither the region id nor the shape of the world.
+    /// The credential is checked before this region says anything about itself,
+    /// so a peer that cannot authorize learns neither the region id nor the
+    /// configuration of the world.
     fn greet(&self, mut sock: TcpStream, peer: SocketAddr) -> Result<Edge, NetError> {
         sock.set_nodelay(true)?;
         // A peer that connects and then says nothing would otherwise hold this
@@ -213,7 +213,7 @@ impl RegionServer {
         sock.set_read_timeout(None)?;
         sock.set_write_timeout(None)?;
 
-        Ok(self.edges.admit(sock, peer))
+        self.edges.admit(sock, peer)
     }
 
     /// Sends a bare rejection and gives up on the connection.

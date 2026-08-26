@@ -517,8 +517,9 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
 
     /// The entity a viewer controls, or `None` if the id is not registered.
     ///
-    /// Exists so a caller never has to reconstruct the mapping itself, which
-    /// invites laundering a `ViewerId` through a raw `u32` into an `EntityId`.
+    /// Exists so a caller never has to reconstruct the mapping itself. Doing
+    /// that means passing a `ViewerId` through a raw `u32` into an `EntityId`,
+    /// which the two newtypes are there to prevent.
     pub fn avatar_of(&self, v: ViewerId) -> Option<EntityId> {
         let viewer = self.viewers.get(v.index())?;
         viewer.registered.then_some(viewer.avatar)

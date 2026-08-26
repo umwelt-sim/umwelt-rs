@@ -56,7 +56,7 @@ impl RecordCodec {
     #[inline]
     pub fn encode(&self, id: EntityId, pos: Pos3, out: &mut Vec<u8>) {
         out.extend_from_slice(&id.raw().to_le_bytes());
-        let (x, y, z) = self.cfg.quantise_pos(pos);
+        let (x, y, z) = self.cfg.quantize_pos(pos);
         let packed =
             (x as u128) | ((y as u128) << self.h_bits) | ((z as u128) << (2 * self.h_bits));
         out.extend_from_slice(&packed.to_le_bytes()[..self.pos_bytes]);
@@ -78,7 +78,7 @@ impl RecordCodec {
         let vmask = (1u128 << self.v_bits) - 1;
         Some((
             id,
-            self.cfg.dequantise_pos(
+            self.cfg.dequantize_pos(
                 (packed & hmask) as u32,
                 ((packed >> self.h_bits) & hmask) as u32,
                 ((packed >> (2 * self.h_bits)) & vmask) as u32,

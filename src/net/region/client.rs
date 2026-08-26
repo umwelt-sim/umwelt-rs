@@ -7,20 +7,27 @@
 //! **This is not an edge server.** An edge server will take a `RegionClient`
 //! and start its own socket server on the other side of itself, speaking the
 //! client-facing protocol to game clients. A `RegionClient` is one link to one
-//! region and knows nothing about game clients, fan-out, or relaying.
-//! Conflating the two would put per-client work back on the edge tier, which is
-//! the mistake the architecture exists to avoid.
+//! region and knows nothing about game clients, fan-out, or relaying. Combining
+//! the two would return per-client work to the edge tier; see §Why per-client
+//! work stays in the simulation.
 
+use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Mutex;
 
 use crate::config::WorldConfig;
+use crate::entity::EntityId;
 use crate::net::error::NetError;
 use crate::net::region::protocol::{
-    ClientIdentification, HANDSHAKE_TIMEOUT, KIND_ACCEPTED, KIND_CLIENT_IDENTIFICATION, KIND_QUIT,
-    KIND_REJECTION, KIND_SERVER_INFO, PROTOCOL_VERSION, RegionId, Rejection, ServerInfo,
-    ServerVersion,
+    ClientIdentification, DespawnEntities, EntitiesSpawned, HANDSHAKE_TIMEOUT, KIND_ACCEPTED,
+    KIND_CLIENT_IDENTIFICATION, KIND_DESPAWN_ENTITIES, KIND_ENTITIES_SPAWNED, KIND_MOVE_ENTITIES,
+    KIND_POSITION_UPDATES, KIND_QUIT, KIND_REJECTION, KIND_SERVER_INFO, MAX_DESPAWN_PER_MESSAGE,
+    MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, PositionUpdates,
+    EntityKind, KIND_SPAWN_ENTITIES, RegionId, Rejection, ServerInfo, ServerVersion,
+    SpawnEntities,
 };
 use crate::net::region::wire::{read_frame, write_frame};
+use crate::pos::Pos3;
 
 /// What a region says it is, before the client commits to it.
 ///
@@ -49,9 +56,26 @@ pub enum Decision {
 /// A connected, handshaken link to one region.
 ///
 /// Dropping it closes the connection.
+/// What the region sent, other than the handshake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Incoming<'a> {
+    /// The entities a [`spawn`](RegionClient::spawn) asked for, and the viewer
+    /// watching each. The region allocated the ids.
+    Spawned(EntitiesSpawned),
+    /// One viewer's payload. Decode it with
+    /// [`PacketReader`](crate::PacketReader).
+    Updates(PositionUpdates<'a>),
+}
+
 #[derive(Debug)]
 pub struct RegionClient {
     stream: TcpStream,
+    /// The write half. Sending takes `&self` so a receive loop and a send loop
+    /// can hold the same client, and two frames must not interleave.
+    ///
+    /// Buffered, so a move batch split across frames by the frame cap costs one
+    /// syscall rather than one per frame.
+    writer: Mutex<BufWriter<TcpStream>>,
     offer: Offer,
 }
 
@@ -128,7 +152,8 @@ impl RegionClient {
         sock.set_read_timeout(None)?;
         sock.set_write_timeout(None)?;
 
-        Ok(RegionClient { stream: sock, offer })
+        let writer = Mutex::new(BufWriter::new(sock.try_clone()?));
+        Ok(RegionClient { stream: sock, writer, offer })
     }
 
     #[inline(always)]
@@ -159,6 +184,112 @@ impl RegionClient {
 
     pub fn peer_addr(&self) -> Result<SocketAddr, NetError> {
         Ok(self.stream.peer_addr()?)
+    }
+
+    // -- the session ------------------------------------------------------
+
+    /// Asks the region to create entities and record this edge as managing
+    /// them.
+    ///
+    /// Each carries an [`EntityKind`], because whether a viewer is registered
+    /// for it is the difference between an entity that costs 12 bytes of
+    /// snapshot and one that costs the whole per-viewer pipeline every tick.
+    ///
+    /// The region allocates the ids and answers with [`Incoming::Spawned`];
+    /// nothing is returned here, because the reply arrives on the same stream
+    /// as everything else. Sends as many messages as the frame cap needs.
+    pub fn spawn(&self, spawns: &[(Pos3, EntityKind)]) -> Result<(), NetError> {
+        self.send_all(
+            KIND_SPAWN_ENTITIES,
+            spawns.chunks(MAX_SPAWN_PER_MESSAGE).map(|chunk| {
+                let mut body = Vec::new();
+                SpawnEntities { spawns: chunk.to_vec() }.encode(&mut body);
+                body
+            }),
+        )
+    }
+
+    /// [`spawn`](Self::spawn) where every entity has a client behind it.
+    pub fn spawn_observers(&self, positions: &[Pos3]) -> Result<(), NetError> {
+        self.spawn(&SpawnEntities::observers(positions).spawns)
+    }
+
+    /// [`spawn`](Self::spawn) where nothing observes: projectiles, wildlife,
+    /// NPCs. Static scenery does not belong in a region at all.
+    pub fn spawn_unattended(&self, positions: &[Pos3]) -> Result<(), NetError> {
+        self.spawn(&SpawnEntities::unattended(positions).spawns)
+    }
+
+    /// Sends new absolute positions for entities this edge manages.
+    ///
+    /// The region declines any naming an entity it does not have this edge down
+    /// as managing, so a stale id costs a refusal rather than moving somebody
+    /// else's entity.
+    pub fn move_entities(&self, moves: &[(EntityId, Pos3)]) -> Result<(), NetError> {
+        self.send_all(
+            KIND_MOVE_ENTITIES,
+            moves.chunks(MAX_MOVES_PER_MESSAGE).map(|chunk| {
+                let mut body = Vec::new();
+                MoveEntities { moves: chunk.to_vec() }.encode(&mut body);
+                body
+            }),
+        )
+    }
+
+    /// Gives entities back, because the game clients behind them have gone.
+    ///
+    /// The region despawns them and drops the viewers watching them. An edge
+    /// that disconnects gives up everything it holds without sending this.
+    pub fn despawn(&self, ids: &[EntityId]) -> Result<(), NetError> {
+        self.send_all(
+            KIND_DESPAWN_ENTITIES,
+            ids.chunks(MAX_DESPAWN_PER_MESSAGE).map(|chunk| {
+                let mut body = Vec::new();
+                DespawnEntities { ids: chunk.to_vec() }.encode(&mut body);
+                body
+            }),
+        )
+    }
+
+    /// Reads one message from the region, blocking until it arrives.
+    ///
+    /// `body` is reused across calls, so a receive loop holding one buffer does
+    /// not allocate per message. The result borrows it.
+    ///
+    /// One caller at a time: two threads reading one link would each get part of
+    /// the other's frame.
+    pub fn receive<'a>(&self, body: &'a mut Vec<u8>) -> Result<Incoming<'a>, NetError> {
+        let mut sock = &self.stream;
+        let kind = read_frame(&mut sock, body)?;
+        match kind {
+            KIND_ENTITIES_SPAWNED => Ok(Incoming::Spawned(EntitiesSpawned::decode(body)?)),
+            KIND_POSITION_UPDATES => Ok(Incoming::Updates(PositionUpdates::decode(body)?)),
+            other => Err(NetError::Unexpected { expected: "a session message", got: other }),
+        }
+    }
+
+    /// Tells the region this edge is finished. Everything it manages is
+    /// despawned, whether it said so or not.
+    pub fn quit(&self) -> Result<(), NetError> {
+        self.send(KIND_QUIT, &[])
+    }
+
+    /// Writes one frame and pushes it out.
+    fn send(&self, kind: u8, body: &[u8]) -> Result<(), NetError> {
+        let mut sock = self.writer.lock().expect("not poisoned");
+        write_frame(&mut *sock, kind, body)?;
+        sock.flush()?;
+        Ok(())
+    }
+
+    /// Writes every chunk of one logical message, then pushes once.
+    fn send_all(&self, kind: u8, bodies: impl Iterator<Item = Vec<u8>>) -> Result<(), NetError> {
+        let mut sock = self.writer.lock().expect("not poisoned");
+        for body in bodies {
+            write_frame(&mut *sock, kind, &body)?;
+        }
+        sock.flush()?;
+        Ok(())
     }
 }
 

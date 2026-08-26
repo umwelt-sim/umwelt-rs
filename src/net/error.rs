@@ -59,8 +59,8 @@ pub enum NetError {
     Unexpected { expected: &'static str, got: u8 },
     /// A frame claimed a length past what this side will allocate for it.
     ///
-    /// Refused before the allocation, which is the point: the length is read
-    /// from an unauthorized peer.
+    /// Refused before the allocation is made. The length is read from a peer
+    /// that has not authorized yet.
     FrameTooLarge { claimed: usize, max: usize },
     /// The peer closed before the exchange finished.
     Closed,

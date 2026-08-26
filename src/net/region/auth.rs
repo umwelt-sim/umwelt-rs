@@ -23,9 +23,10 @@ use core::fmt;
 
 /// The credential did not authorize.
 ///
-/// Carries no reason. What the server tells the peer is
+/// Carries no reason. The server tells the peer
 /// [`RejectCode::Unauthorized`](crate::net::RejectCode::Unauthorized) and
-/// nothing more, and a richer type here would only tempt someone to forward it.
+/// nothing more. A type carrying a reason could be forwarded to the peer by
+/// mistake.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Denied;
 
@@ -117,8 +118,8 @@ fn equal_without_short_circuit(a: &[u8], b: &[u8]) -> bool {
 /// Authorizes everyone.
 ///
 /// For tests, benchmarks, and a single-process example where there is no other
-/// process to keep out. Naming it this way means a deployment that reaches for
-/// it has to say so out loud.
+/// process to keep out. The name is explicit so that a deployment selecting it
+/// is visible at the line that constructs it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllowAll;
 

@@ -20,18 +20,21 @@
 //! its id. Putting the info first would have been friendlier to write and would
 //! hand the shape of the world to anyone able to open a socket.
 //!
-//! The client accepts or quits rather than the server assuming: a client that
-//! reads the parameters and finds a world it cannot render, or a region it did
-//! not mean to reach, says so and leaves instead of holding a connection the
-//! server counts as an edge.
+//! The client accepts or quits rather than the server assuming it will stay. A
+//! client that reads the parameters and finds a world it cannot render, or a
+//! region it did not mean to reach, quits, so the server does not count an edge
+//! that is about to leave.
 
 use core::fmt;
 use std::time::Duration;
 
 use crate::config::WorldConfig;
+use crate::entity::EntityId;
 use crate::net::error::{NetError, RejectCode};
 use crate::net::region::auth::MAX_CREDENTIAL_BYTES;
-use crate::net::region::wire::Cursor;
+use crate::net::region::wire::{Cursor, MAX_FRAME_BYTES};
+use crate::pos::Pos3;
+use crate::sim::ViewerId;
 
 // ---------------------------------------------------------------------------
 // Frame kinds
@@ -42,6 +45,11 @@ pub(crate) const KIND_SERVER_INFO: u8 = 2;
 pub(crate) const KIND_REJECTION: u8 = 3;
 pub(crate) const KIND_ACCEPTED: u8 = 4;
 pub(crate) const KIND_QUIT: u8 = 5;
+pub(crate) const KIND_SPAWN_ENTITIES: u8 = 6;
+pub(crate) const KIND_ENTITIES_SPAWNED: u8 = 7;
+pub(crate) const KIND_MOVE_ENTITIES: u8 = 8;
+pub(crate) const KIND_POSITION_UPDATES: u8 = 9;
+pub(crate) const KIND_DESPAWN_ENTITIES: u8 = 10;
 
 /// Names a frame kind for an error message, without echoing the peer's bytes.
 pub(crate) fn kind_name(kind: u8) -> &'static str {
@@ -51,6 +59,11 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
         KIND_REJECTION => "rejection",
         KIND_ACCEPTED => "accepted",
         KIND_QUIT => "quit",
+        KIND_SPAWN_ENTITIES => "spawn entities",
+        KIND_ENTITIES_SPAWNED => "entities spawned",
+        KIND_MOVE_ENTITIES => "move entities",
+        KIND_POSITION_UPDATES => "position updates",
+        KIND_DESPAWN_ENTITIES => "despawn entities",
         _ => "unknown",
     }
 }
@@ -364,9 +377,339 @@ impl Rejection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session messages
+// ---------------------------------------------------------------------------
+
+/// Bytes one spawn request takes: three raw [`Fixed`](crate::Fixed) axes, and
+/// what kind of thing is being spawned.
+const SPAWN_BYTES: usize = 13;
+
+/// Bytes one spawned entity takes in the reply: its id, and the viewer
+/// watching it.
+const SPAWNED_BYTES: usize = 8;
+
+/// Bytes one move takes: an id, and three raw [`Fixed`](crate::Fixed) axes.
+///
+/// Raw fixed point rather than the quantized wire record, because this is the
+/// authoritative position going *into* the simulation. The quantization in
+/// [`RecordCodec`](crate::RecordCodec) is a budget decision about what a client
+/// needs to see. Applying it to an inbound command would add a small position
+/// error on every round trip through the region.
+const MOVE_BYTES: usize = 16;
+
+/// Most entities one [`SpawnEntities`] may ask for, so its reply fits a frame.
+///
+/// An edge wanting more sends more messages. The frame cap is what bounds an
+/// unauthorized peer's allocation, so it does not move to suit a caller.
+pub const MAX_SPAWN_PER_MESSAGE: usize = (MAX_FRAME_BYTES - 4) / SPAWN_BYTES;
+
+/// Most moves one [`MoveEntities`] may carry. Same bargain.
+pub const MAX_MOVES_PER_MESSAGE: usize = (MAX_FRAME_BYTES - 4) / MOVE_BYTES;
+
+/// A full spawn request's reply has to fit a frame too, or the region could
+/// accept a request it cannot answer.
+const _: () = assert!(
+    4 + MAX_SPAWN_PER_MESSAGE * SPAWNED_BYTES <= MAX_FRAME_BYTES,
+    "a reply to a full spawn request does not fit a frame"
+);
+
+/// Most entities one [`DespawnEntities`] may give up. Same bargain.
+pub const MAX_DESPAWN_PER_MESSAGE: usize = (MAX_FRAME_BYTES - 4) / 4;
+
+/// What is behind an entity, which decides whether it observes.
+///
+/// **An entity is a thing with a position; a viewer is a thing that receives.**
+/// Every entity can be seen by whoever is near it. Only an observer is sent
+/// what it can see, and only an observer costs the per-viewer pipeline: a
+/// subscription, a gather, a score, a selection and a packet every tick it is
+/// served, plus a [`GhostTable`](crate::GhostTable) of its own.
+///
+/// The difference is large enough that it cannot be implicit. A region holding
+/// 8,192 unattended entities with one observer among them, and a region holding
+/// 8,192 observers, are the same snapshot and nothing like the same tick.
+///
+/// **Static scenery is not a kind here. It is never spawned at all.** A rock
+/// that never moves is in the client's content package already, and putting it
+/// in the region would pay 12 bytes of snapshot and a gather-walk visit every
+/// tick, forever, to tell clients something they were shipped. What belongs in
+/// a region is what is authoritative and moves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EntityKind {
+    /// Nothing is behind it. Simulated and replicated to whoever can see it,
+    /// observes nothing itself, and no viewer is registered. Projectiles,
+    /// wildlife, NPCs, a vehicle with no driver.
+    #[default]
+    Unattended = 0,
+    /// A game client is behind it. The region registers a viewer watching it,
+    /// so it is sent a budgeted approximation of what it can see.
+    Observer = 1,
+}
+
+impl EntityKind {
+    #[inline(always)]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_u8(raw: u8) -> Option<EntityKind> {
+        match raw {
+            0 => Some(EntityKind::Unattended),
+            1 => Some(EntityKind::Observer),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn observes(self) -> bool {
+        matches!(self, EntityKind::Observer)
+    }
+}
+
+impl fmt::Display for EntityKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EntityKind::Unattended => write!(f, "unattended"),
+            EntityKind::Observer => write!(f, "observer"),
+        }
+    }
+}
+
+/// Asks the region to create entities this edge will manage, at these
+/// positions.
+///
+/// The region allocates the ids, since entity identity is its to hand out, and
+/// records the asking edge as their owner in the same step.
+///
+/// Positions travel with the request rather than the edge spawning at a default
+/// and moving afterward. A crowd that appears at one point and scatters on the
+/// next tick is a region-wide teleport, and the odometer and the subscription
+/// update both assume entities move at most
+/// [`max_horizontal_speed`](crate::WorldConfig::max_horizontal_speed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnEntities {
+    pub spawns: Vec<(Pos3, EntityKind)>,
+}
+
+impl SpawnEntities {
+    /// Every entity an observer, which is what a crowd of players is.
+    pub fn observers(positions: &[Pos3]) -> SpawnEntities {
+        SpawnEntities {
+            spawns: positions.iter().map(|p| (*p, EntityKind::Observer)).collect(),
+        }
+    }
+
+    /// Every entity unattended, which is what a flight of projectiles or a
+    /// herd of wildlife is.
+    pub fn unattended(positions: &[Pos3]) -> SpawnEntities {
+        SpawnEntities {
+            spawns: positions.iter().map(|p| (*p, EntityKind::Unattended)).collect(),
+        }
+    }
+
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&(self.spawns.len() as u32).to_le_bytes());
+        for (pos, kind) in &self.spawns {
+            out.extend_from_slice(&pos.x.raw().to_le_bytes());
+            out.extend_from_slice(&pos.y.raw().to_le_bytes());
+            out.extend_from_slice(&pos.z.raw().to_le_bytes());
+            out.push(kind.as_u8());
+        }
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<SpawnEntities, NetError> {
+        let mut c = Cursor::new(body, "spawn entities");
+        let len = c.u32()? as usize;
+        if len > MAX_SPAWN_PER_MESSAGE {
+            return Err(NetError::Malformed("spawn entities count"));
+        }
+        let mut spawns = Vec::with_capacity(len);
+        for _ in 0..len {
+            let pos = Pos3::new(
+                crate::Fixed::from_raw(c.i32()?),
+                crate::Fixed::from_raw(c.i32()?),
+                crate::Fixed::from_raw(c.i32()?),
+            );
+            let kind = EntityKind::from_u8(c.u8()?)
+                .ok_or(NetError::Malformed("spawn entity kind"))?;
+            spawns.push((pos, kind));
+        }
+        c.finish()?;
+        Ok(SpawnEntities { spawns })
+    }
+}
+
+/// The entities created, in the order they were asked for, and the viewer
+/// watching each one where there is a viewer at all.
+///
+/// An unattended entity has no viewer, and its slot carries `None`. An
+/// observer's viewer id
+/// travels because it is what arrives on a [`PositionUpdates`], and the edge
+/// has no way to work out that pairing for itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntitiesSpawned {
+    pub entities: Vec<(EntityId, Option<ViewerId>)>,
+}
+
+/// No viewer watches this entity. Viewer ids are dense from zero, so the top of
+/// the range is free to reserve.
+const NO_VIEWER: u32 = u32::MAX;
+
+impl EntitiesSpawned {
+    /// The observers among them, which is what an edge tracks for routing.
+    pub fn observers(&self) -> impl Iterator<Item = (EntityId, ViewerId)> + '_ {
+        self.entities.iter().filter_map(|(id, v)| v.map(|v| (*id, v)))
+    }
+
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&(self.entities.len() as u32).to_le_bytes());
+        for (entity, viewer) in &self.entities {
+            out.extend_from_slice(&entity.raw().to_le_bytes());
+            out.extend_from_slice(&viewer.map_or(NO_VIEWER, ViewerId::raw).to_le_bytes());
+        }
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<EntitiesSpawned, NetError> {
+        let mut c = Cursor::new(body, "entities spawned");
+        let len = c.u32()? as usize;
+        if len > MAX_SPAWN_PER_MESSAGE {
+            return Err(NetError::Malformed("entities spawned count"));
+        }
+        let mut entities = Vec::with_capacity(len);
+        for _ in 0..len {
+            let entity = EntityId::from_raw(c.u32()?);
+            let raw = c.u32()?;
+            entities.push((entity, (raw != NO_VIEWER).then(|| ViewerId::from_raw(raw))));
+        }
+        c.finish()?;
+        Ok(EntitiesSpawned { entities })
+    }
+}
+
+/// New absolute positions for entities this edge manages.
+///
+/// Absolute rather than a delta, so a lost or reordered message costs one tick
+/// of staleness rather than corrupting a position permanently. Applying one is
+/// idempotent for the same reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveEntities {
+    pub moves: Vec<(EntityId, Pos3)>,
+}
+
+impl MoveEntities {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&(self.moves.len() as u32).to_le_bytes());
+        for (id, pos) in &self.moves {
+            out.extend_from_slice(&id.raw().to_le_bytes());
+            out.extend_from_slice(&pos.x.raw().to_le_bytes());
+            out.extend_from_slice(&pos.y.raw().to_le_bytes());
+            out.extend_from_slice(&pos.z.raw().to_le_bytes());
+        }
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<MoveEntities, NetError> {
+        let mut c = Cursor::new(body, "move entities");
+        let len = c.u32()? as usize;
+        if len > MAX_MOVES_PER_MESSAGE {
+            return Err(NetError::Malformed("move entities count"));
+        }
+        let mut moves = Vec::with_capacity(len);
+        for _ in 0..len {
+            let id = EntityId::from_raw(c.u32()?);
+            let pos = Pos3::new(
+                crate::Fixed::from_raw(c.i32()?),
+                crate::Fixed::from_raw(c.i32()?),
+                crate::Fixed::from_raw(c.i32()?),
+            );
+            moves.push((id, pos));
+        }
+        c.finish()?;
+        Ok(MoveEntities { moves })
+    }
+}
+
+/// Gives entities back, because the game clients behind them have gone.
+///
+/// An edge's population is not fixed. Clients connect and disconnect, so the
+/// edge that spawned an entity is the one that has to say when it is finished
+/// with it. The region despawns the entity, unregisters the viewer watching it,
+/// and frees the ownership record.
+///
+/// An edge that detaches entirely gives up everything it held without sending
+/// this: the region cannot leave entities alive with no connection behind them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DespawnEntities {
+    pub ids: Vec<EntityId>,
+}
+
+impl DespawnEntities {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&(self.ids.len() as u32).to_le_bytes());
+        for id in &self.ids {
+            out.extend_from_slice(&id.raw().to_le_bytes());
+        }
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<DespawnEntities, NetError> {
+        let mut c = Cursor::new(body, "despawn entities");
+        let len = c.u32()? as usize;
+        if len > MAX_DESPAWN_PER_MESSAGE {
+            return Err(NetError::Malformed("despawn entities count"));
+        }
+        let mut ids = Vec::with_capacity(len);
+        for _ in 0..len {
+            ids.push(EntityId::from_raw(c.u32()?));
+        }
+        c.finish()?;
+        Ok(DespawnEntities { ids })
+    }
+}
+
+/// One viewer's assembled payload, relayed to the edge that manages it.
+///
+/// The payload is exactly what [`PacketWriter`](crate::PacketWriter) built, so
+/// an edge decodes it with [`PacketReader`](crate::PacketReader) and this
+/// protocol does not need to know what is inside.
+///
+/// **A known deviation.** State is latest-only, lossy and unordered by design,
+/// and this link is reliable and ordered. Carrying payloads here is what lets
+/// the smoke test run end to end before the datagram path exists; it is not
+/// what the architecture says should happen in the end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionUpdates<'a> {
+    pub viewer: ViewerId,
+    pub payload: &'a [u8],
+}
+
+impl PositionUpdates<'_> {
+    /// Only the round-trip test builds one of these. The live path writes the
+    /// viewer and the payload straight into the edge's buffer rather than
+    /// joining them into a body first, which is a copy per payload it does not
+    /// need to pay.
+    #[cfg(test)]
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&self.viewer.raw().to_le_bytes());
+        out.extend_from_slice(self.payload);
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<PositionUpdates<'_>, NetError> {
+        let mut c = Cursor::new(body, "position updates");
+        let viewer = ViewerId::from_raw(c.u32()?);
+        let payload = c.rest();
+        Ok(PositionUpdates { viewer, payload })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixed::Fixed;
 
     #[test]
     fn a_region_id_round_trips() {
@@ -528,6 +871,188 @@ mod tests {
         assert!(matches!(Rejection::decode(&[]), Err(NetError::Malformed("rejection"))));
     }
 
+    fn ent(n: u32) -> EntityId {
+        EntityId::from_raw(n)
+    }
+
+    #[test]
+    fn a_spawn_request_round_trips() {
+        let m = SpawnEntities {
+            spawns: vec![
+                (Pos3::from_meters(1, 2, 3), EntityKind::Observer),
+                (Pos3::from_meters(4095, 4095, 1023), EntityKind::Unattended),
+            ],
+        };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(SpawnEntities::decode(&buf).expect("well formed"), m);
+    }
+
+    #[test]
+    fn a_spawn_request_says_what_observes() {
+        let at = [Pos3::from_meters(1, 1, 0), Pos3::from_meters(2, 2, 0)];
+        assert!(SpawnEntities::observers(&at).spawns.iter().all(|(_, k)| k.observes()));
+        assert!(SpawnEntities::unattended(&at).spawns.iter().all(|(_, k)| !k.observes()));
+    }
+
+    #[test]
+    fn an_unknown_entity_kind_is_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 12]);
+        buf.push(9);
+        assert!(matches!(
+            SpawnEntities::decode(&buf),
+            Err(NetError::Malformed("spawn entity kind"))
+        ));
+    }
+
+    #[test]
+    fn every_entity_kind_round_trips() {
+        for kind in [EntityKind::Unattended, EntityKind::Observer] {
+            assert_eq!(EntityKind::from_u8(kind.as_u8()), Some(kind));
+        }
+        assert_eq!(EntityKind::from_u8(2), None);
+    }
+
+    #[test]
+    fn a_spawn_request_past_the_cap_is_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((MAX_SPAWN_PER_MESSAGE + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            SpawnEntities::decode(&buf),
+            Err(NetError::Malformed("spawn entities count"))
+        ));
+    }
+
+    #[test]
+    fn a_full_spawn_request_fits_a_frame() {
+        let m = SpawnEntities {
+            spawns: vec![(Pos3::ZERO, EntityKind::Observer); MAX_SPAWN_PER_MESSAGE],
+        };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert!(buf.len() <= MAX_FRAME_BYTES, "{} bytes does not fit a frame", buf.len());
+    }
+
+    #[test]
+    fn a_spawn_reply_round_trips() {
+        let m = EntitiesSpawned {
+            entities: vec![
+                (ent(0), Some(ViewerId::from_raw(0))),
+                (ent(41), None),
+                (ent(42), Some(ViewerId::from_raw(7))),
+            ],
+        };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(EntitiesSpawned::decode(&buf).expect("well formed"), m);
+    }
+
+    #[test]
+    fn a_spawn_reply_names_only_the_observers_as_watchable() {
+        let m = EntitiesSpawned {
+            entities: vec![
+                (ent(0), Some(ViewerId::from_raw(0))),
+                (ent(41), None),
+                (ent(42), Some(ViewerId::from_raw(7))),
+            ],
+        };
+        assert_eq!(
+            m.observers().collect::<Vec<_>>(),
+            vec![(ent(0), ViewerId::from_raw(0)), (ent(42), ViewerId::from_raw(7))],
+            "an unattended entity has no viewer to route to"
+        );
+    }
+
+    #[test]
+    fn a_move_round_trips_losslessly() {
+        // Raw fixed point, so a position survives the wire exactly. A round trip
+        // that moved an entity would walk it every tick.
+        let m = MoveEntities {
+            moves: vec![
+                (ent(1), Pos3::new(Fixed::from_millis(7, 500), Fixed::ZERO, Fixed::from_raw(1))),
+                (ent(2), Pos3::from_meters(4095, 0, 1023)),
+            ],
+        };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(MoveEntities::decode(&buf).expect("well formed"), m);
+    }
+
+    #[test]
+    fn a_full_move_message_fits_a_frame() {
+        let m = MoveEntities { moves: vec![(ent(0), Pos3::ZERO); MAX_MOVES_PER_MESSAGE] };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert!(buf.len() <= MAX_FRAME_BYTES, "{} bytes does not fit a frame", buf.len());
+    }
+
+    #[test]
+    fn a_move_message_past_the_cap_is_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((MAX_MOVES_PER_MESSAGE + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            MoveEntities::decode(&buf),
+            Err(NetError::Malformed("move entities count"))
+        ));
+    }
+
+    #[test]
+    fn a_truncated_move_message_is_refused() {
+        let m = MoveEntities { moves: vec![(ent(1), Pos3::from_meters(1, 2, 3))] };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        for cut in 0..buf.len() {
+            assert!(MoveEntities::decode(&buf[..cut]).is_err(), "{cut} bytes must not parse");
+        }
+    }
+
+    #[test]
+    fn a_despawn_round_trips() {
+        let m = DespawnEntities { ids: vec![ent(3), ent(9), ent(1000)] };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(DespawnEntities::decode(&buf).expect("well formed"), m);
+    }
+
+    #[test]
+    fn a_full_despawn_message_fits_a_frame() {
+        let m = DespawnEntities { ids: vec![ent(0); MAX_DESPAWN_PER_MESSAGE] };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert!(buf.len() <= MAX_FRAME_BYTES, "{} bytes does not fit a frame", buf.len());
+    }
+
+    #[test]
+    fn a_despawn_message_past_the_cap_is_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((MAX_DESPAWN_PER_MESSAGE + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            DespawnEntities::decode(&buf),
+            Err(NetError::Malformed("despawn entities count"))
+        ));
+    }
+
+    #[test]
+    fn position_updates_carry_the_payload_untouched() {
+        let payload = b"a payload PacketWriter built";
+        let m = PositionUpdates { viewer: ViewerId::from_raw(9), payload };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        let back = PositionUpdates::decode(&buf).expect("well formed");
+        assert_eq!(back.viewer, ViewerId::from_raw(9));
+        assert_eq!(back.payload, payload);
+    }
+
+    #[test]
+    fn position_updates_carry_an_empty_payload() {
+        let m = PositionUpdates { viewer: ViewerId::from_raw(0), payload: &[] };
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(PositionUpdates::decode(&buf).expect("well formed").payload, b"");
+    }
+
     #[test]
     fn every_kind_has_a_name() {
         for kind in [
@@ -536,6 +1061,11 @@ mod tests {
             KIND_REJECTION,
             KIND_ACCEPTED,
             KIND_QUIT,
+            KIND_SPAWN_ENTITIES,
+            KIND_ENTITIES_SPAWNED,
+            KIND_MOVE_ENTITIES,
+            KIND_POSITION_UPDATES,
+            KIND_DESPAWN_ENTITIES,
         ] {
             assert_ne!(kind_name(kind), "unknown", "kind {kind} needs a name");
         }

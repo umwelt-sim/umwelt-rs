@@ -299,9 +299,9 @@ fn shuffled(n: usize, seed: u64) -> Vec<usize> {
 /// footprint is the only variable: 1.5, 3, 6 and 12 KB.
 ///
 /// Steady state, so the table sits at its cap and every commit is a refresh
-/// rather than an insert. Candidates beyond the cap miss, which is the point —
-/// a capped viewer probes everything the gather found and holds only the ghosts
-/// it has room for.
+/// rather than an insert. Candidates beyond the cap miss: a capped viewer
+/// probes everything the gather found and holds only the ghosts it has room
+/// for.
 ///
 /// Commits are `min(held, 98)`, so the 64 row does 64 of them against 98 for
 /// the rest. That is what a viewer holding 64 ghosts would really do, but it

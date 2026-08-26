@@ -24,6 +24,18 @@ use crate::sim::viewer::ViewerId;
 /// so a sink that keeps the bytes copies them.
 pub trait PayloadSink: Sync {
     fn send(&self, viewer: ViewerId, payload: &[u8]);
+
+    /// The burst of sends is over: push anything held back.
+    ///
+    /// A sink that writes to a socket wants to buffer many payloads and pay one
+    /// syscall, not pay one per payload. It cannot know when the burst ends, so
+    /// it is told: [`Handoff`](crate::Handoff) calls this at the end of every
+    /// drain pass, and a caller driving a sink directly calls it when a tick's
+    /// payloads are done.
+    ///
+    /// The default does nothing, which is right for a sink that holds nothing
+    /// back.
+    fn flush(&self) {}
 }
 
 /// Discards every payload.

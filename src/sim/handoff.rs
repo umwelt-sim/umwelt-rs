@@ -74,8 +74,8 @@ impl<S: PayloadSink> Shared<S> {
     /// than allocating. The I/O thread holds the same lock only to swap a
     /// buffer out, never across a call into the wrapped sink.
     ///
-    /// Losing the race drops the frame, which is the one thing this design is
-    /// willing to lose.
+    /// Losing the race drops the frame. Payloads are latest-only, so a dropped
+    /// one costs the client a frame and nothing more.
     fn stash(&self, slot: &Slot, payload: &[u8]) {
         match slot.buf.try_lock() {
             Ok(mut buf) => {
@@ -123,6 +123,11 @@ impl<S: PayloadSink> Shared<S> {
             }
             self.inner.send(ViewerId::from_raw(i as u32), spare);
             self.progress.delivered.fetch_add(1, Ordering::Relaxed);
+        }
+        // The pass is the batch. A sink writing to a socket buffers everything
+        // above and pays its syscalls here, once, instead of per payload.
+        if !ready.is_empty() {
+            self.inner.flush();
         }
     }
 }

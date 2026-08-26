@@ -3,7 +3,7 @@
 //! Measures the gather: for each viewer, walk the subscribed cells of a
 //! cell-ordered snapshot and keep the entities within the view radius.
 //!
-//! Two scenarios, and the ratio between them is the point.
+//! Two scenarios. The ratio between them is what the benchmark reports.
 //!
 //! Uniform spreads entities evenly, which bounds per-viewer work by the
 //! subscription size. It establishes the floor and will look acceptable

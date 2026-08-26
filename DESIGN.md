@@ -301,7 +301,8 @@ growing into a component system.
 **`Observers` is the target that justifies putting this in the library.** Which
 clients currently hold a ghost of a given entity is a fact only the replication
 state knows. A game emitting that itself would have to reconstruct the interest
-set, which is the work umwelt exists to do and has been optimized to do quickly.
+set, which is the work umwelt already does and has been optimized to do
+quickly.
 `Entity` and `Near` a consumer could plausibly build; `Observers` they could not.
 
 Delivery machinery is umwelt's and is not small: sequence numbers, a sliding
@@ -334,7 +335,7 @@ a `GhostTable` keyed by entity id, so "every client holding a ghost of entity N"
 is answerable only by scanning every viewer's table or by maintaining a reverse
 index that pays on every `sent` and `evict`, both of which are in the per-viewer
 hot path. Undecided. It should be decided before the ghost record grows for
-acknowledgement, so that struct is touched once rather than twice.
+acknowledgment, so that struct is touched once rather than twice.
 
 **Blocked on what a session carries.** The delivery machinery above is per
 connection. The link is built and its handshake works (§The region link), but a
@@ -613,8 +614,9 @@ authored. Everything else in this table derives from those five.
 ## What is built
 
 `fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
-`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`. 280
-library tests pass.
+`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`. 306
+library tests pass, and one integration test drives a region and three edges end to
+end.
 
 A tick runs end to end: the game moves entities, the odometer observes how far
 they went, the snapshot is rebuilt in cell order, and every due viewer is
@@ -754,7 +756,7 @@ one entity; a permanent diagonal is the case that would show it. Unmeasured.
 
 The total wraps and the per-call step saturates. Opposite on purpose: a
 saturating total would pin at `u32::MAX` and freeze that entity's score forever,
-which is the starvation this exists to avoid, while a wrapping step would turn
+which is the starvation this prevents, while a wrapping step would turn
 an absurd single-tick jump into a small number. Computed: the total wraps after
 4,194,304 m of path, about 29 hours at 40 m/s. Differences below 2^32 units stay
 exact across a wrap.
@@ -792,7 +794,7 @@ argument turns on is exercised rather than assumed.
 Nothing leaves the table unreported. `evict` appends every dropped id, so a
 caller can always tell a client what it no longer holds.
 
-**The mark advances on send, not on acknowledgement.** A lost packet therefore
+**The mark advances on send, not on acknowledgment.** A lost packet therefore
 leaves a client's copy of a since-idle entity permanently wrong: the entity has
 stopped moving, so its drift stays zero and it is never resent. This is what the
 paper's Most Recent State handles. It cannot be fixed before there is a protocol
@@ -889,7 +891,7 @@ a production path.
 
 **A sink is the one part of a tick the library does not control**, and
 `DESIGN.md`'s own note on owning the loop applies: safe Rust cannot preempt a
-synchronous callback, so a sink that blocks cannot be cancelled. What is done
+synchronous callback, so a sink that blocks cannot be canceled. What is done
 instead:
 
 - **Attributed.** `TickStats::sink_nanos` reports time spent inside `send`,
@@ -1068,7 +1070,7 @@ What that is worth, stated plainly. The secret crosses the wire on every connect
 so whoever can read the link has it, and whoever can inject on an established
 connection is not stopped by anything here. It is the second lock rather than the
 first: it stops a misconfigured edge, a stale binary from a previous deployment,
-and a process that wandered onto the right port. Raising the bar means
+and a process configured against the wrong port. Raising the bar means
 challenge-response over a MAC, so the secret itself never travels, which needs a
 vetted crypto implementation rather than a hand-rolled one. That is a dependency
 this crate does not have and a decision nobody has made.
@@ -1131,12 +1133,184 @@ tests cover the framing, the messages, the handshake, the refusals, the deadline
 the shutdown, and the ownership and routing rules. No number here is a
 performance claim.
 
-Not built: anything a link carries. `Edge::wait_for_close` reads and discards,
-which is the placeholder the payload path replaces, and no `PayloadSink` writes
-into an edge yet. State payloads are latest-only, lossy and unordered, and a
-reliable ordered stream is the wrong shape for them, so what carries them is the
-open question — along with the ack path the ghost mark needs and the reliable
-channel events need.
+### The session
+
+Past the handshake, an edge asks for entities, moves them, gives them back, and
+is sent each of its viewers' payloads. `net::region::session` is both halves.
+
+**Inbound work happens in three places, because what it needs is available at
+three different moments.** `Inbound::serve` runs on the edge's own thread and
+only queues, since the simulation is mid-tick as often as not. `Inbound::apply`
+runs inside `Game::step`, the only place a `Step` exists and therefore the only
+place an entity can be spawned, despawned or moved. `Inbound::settle` runs
+between ticks, the only place `&mut WorldSimulation` exists and therefore the
+only place a viewer can be registered or dropped.
+
+The split is required rather than stylistic. Registering a viewer mid-tick would
+change the set the workers are iterating over, and spawning between ticks would
+write the position arrays after the snapshot had been built from them.
+
+**An entity is not a viewer, and the spawn says which is being asked for.** An
+entity is a thing with a position: it can be seen, and it costs 12 bytes of
+snapshot and a visit during a gather walk. A viewer is an observer: an avatar
+entity plus the replication state kept for it, and it costs a subscription, a
+gather, a score, a selection and a packet every tick it is served, plus a ghost
+table of its own. Every viewer has an avatar; most entities need no viewer.
+
+`EntityKind` carries that on the wire. `Observer` has a game client behind it and
+gets a viewer. `Unattended` has nothing behind it: simulated, replicated to
+whoever can see it, and sent nothing. Projectiles, wildlife, NPCs, a vehicle with
+no driver.
+
+**Static scenery has no kind, because it is never spawned.** A rock that never
+moves is already in the client's content package. Putting it in a region would
+cost 12 bytes of snapshot and a gather-walk visit every tick for the life of the
+region, to replicate a position the client already has. What belongs in a region
+is state that is authoritative and changes. The protocol therefore has no way to
+describe scenery, which is deliberate.
+
+**The region allocates every entity id.** An edge asks for entities by position
+and is told which ids it got. Two edges cannot choose colliding ids because
+neither chooses any, so dispatch cannot go ambiguous through the id scheme. What
+an edge does with those ids on its own side — mapping them to game client
+sockets — is its business and no part of this protocol.
+
+Ids are unique within a region, as §What umwelt stores has always said. An edge
+relaying for several regions sees the same numbers from each and has to key by
+`(RegionId, EntityId)`. Today a `RegionClient` is one link to one region, so
+that falls out; it stops being automatic the moment an edge holds several.
+
+**Every command naming an entity is checked against who manages it.** Entity ids
+are region-wide and an edge can name any of them, so the ownership record is
+the only check separating one edge from another. A move or despawn for an
+entity the sender does
+not manage is counted and dropped, not applied. That check is the authorization
+boundary here, not the id scheme.
+
+**An edge's population is not fixed.** Game clients connect and disconnect, so
+`DespawnEntities` gives entities back: the region despawns them, drops the
+viewer watching each, and frees the ownership record. An edge that detaches
+entirely gives up everything it held without sending anything, because a region
+that kept simulating entities with no connection behind them would be
+replicating for nobody. Detaching happens on the edge's thread and despawning
+needs a `Step`, so the orphans are recorded and the next tick clears them.
+
+**Tearing a viewer down requires entity to viewer, which the simulation does not
+hold.** `Inbound` keeps that map itself. §Open items records the same gap.
+
+**Payloads route by ownership.** `EdgeSink` holds viewer to avatar, filled when
+a viewer registers, and asks `Edges::edge_for` which edge manages that avatar.
+It is wrapped in `Handoff`, so the tick's side of a send is a memory copy and an
+edge that stops reading cannot stall the region.
+
+**A known deviation.** State is latest-only, lossy and unordered, and this link
+is reliable and ordered. Carrying payloads here is what lets the thing run end
+to end before the datagram path exists. It is not what §Architecture says should
+happen, and the smoke test below shows why in numbers.
+
+### The smoke test
+
+`examples/herd-sim.rs` is a region whose game applies whatever its edges sent.
+`examples/herd-edge.rs` asks for a population, walks it, hands observers back and
+asks for replacements, and reads the replication that comes down.
+
+Conditions: one region, eight edges, one M1, loopback, 20 Hz, AC power. Mean
+and worst tick are taken within one second. These are smoke test figures from a
+laptop rather than benchmark figures, and §Whole-pipeline is the measurement to
+quote for per-viewer cost.
+
+Both wait modes are reported because they differ by a factor of four at low
+load. `Wait::Sleep` sleeps until `SPIN_MARGIN` before the deadline and spins the
+rest. `Wait::Hold` holds the core for the whole period.
+
+| observers | entities | sleep mean | hold mean | hold worst | delivered/s | needed/s |
+|---|---|---|---|---|---|---|
+| 1,024 | 8,192 | 9.35 ms | 2.07 ms | 2.66 ms | 21,513 | 20,480 |
+| 2,048 | 8,192 | 11.93 ms | 3.92 ms | 4.57 ms | 43,305 | 40,960 |
+| 4,096 | 8,192 | 14.85 ms | 7.40 ms | 9.63 ms | 81,737 | 81,920 |
+| 8,192 | 8,192 | 15.65 ms | 13.54 ms | 14.75 ms | 163,839 | 163,840 |
+| 12,288 | 12,288 | 22.78 ms | 20.08 ms | 23.26 ms | 255,432 | 245,760 |
+| 16,384 | 16,384 | 28.02 ms | 27.02 ms | 30.43 ms | 328,249 | 327,680 |
+| 24,576 | 24,576 | 38.50 ms | 38.71 ms | 43.65 ms | 512,627 | 491,520 |
+
+The first four rows hold entities at 8,192 and vary how many of them observe.
+The last three make every entity an observer, so both counts move together.
+
+**Per-viewer cost, from the hold column.** Mean tick goes from 2.07 ms at 1,024
+observers to 13.54 ms at 8,192 while the snapshot stays at 8,192 entities. The
+slope is 1.6 µs per viewer per tick. The intercept is about 0.4 ms, which is the
+work done per entity regardless of who observes: the game step, the odometer and
+the snapshot rebuild.
+
+The sleep column is not usable for this, because at low observer counts it is
+measuring the idle penalty rather than the work.
+
+**The idle penalty, reproduced.** Sleep costs 4.52x at 1,024 observers, 2.01x at
+4,096, 1.16x at 8,192 and 0.99x at 24,576. §Idle costs speed predicted 4x on an
+idle region and 1.3x on a busy one, from a different measurement. A tick that
+occupies 2 ms of a 50 ms period spends 96% of that period asleep, and the core
+does not return to full speed immediately.
+
+This also accounts for a set of earlier figures on this page being wrong.
+Sweeping observer count under `Wait::Sleep` and reading the low rows as
+per-viewer cost measures the sleep, not the viewers.
+
+**Whether to make hold the default: no.** It saves 7.3 ms at 1,024 observers,
+where the tick uses 19% of its period and has 41 ms of slack. It saves nothing at
+24,576, where the tick uses 77% of its period: 38.50 ms sleeping against 38.71 ms
+holding. It costs one core held at 100% for the process lifetime in both cases.
+The reason to select it is worst-tick jitter, which is what `Wait::Hold`'s
+documentation already says: at 12,288 observers, sleep's worst tick was 40.40 ms
+and hold's was 23.26 ms.
+
+Untested, and likely to beat both: `SPIN_MARGIN` is 1 ms of a 50 ms period. If
+the penalty is the core returning from a low-power state, spinning for a larger
+fraction of the period may recover most of the 4.52x at a fraction of hold's
+cost. Nobody has swept it.
+
+#### Delivery had to be batched
+
+The first version of the sink wrote a header, wrote a body, and flushed, for
+three syscalls per payload, from the single thread `Handoff` drains with.
+Measured on AC power under `Wait::Hold`, with that version against the
+current one:
+
+| observers | unbatched/s | kept | batched/s | kept |
+|---|---|---|---|---|
+| 8,192 | 172,024 | 105% | 163,839 | 100% |
+| 12,288 | 246,635 | 100% | 255,432 | 104% |
+| 16,384 | 291,772 | 89% | 328,249 | 100% |
+| 24,576 | 221,063 | 45% | 512,627 | 104% |
+
+`kept` is payloads delivered per second against payloads produced per second,
+which is observers times tick rate. Below 100% a client's update rate falls
+without anything reporting an error, because the loss is `Handoff` slots
+overwritten before the I/O thread reaches them rather than the queue refusing
+work. At 24,576 observers and 45%, a client asking for 20 Hz receives about 9 Hz.
+
+The change: [`PayloadSink`] gained `flush`, with a default that does nothing.
+`Handoff` calls it at the end of each drain pass, which is where a burst of sends
+ends. Each edge holds a 256 KB buffered writer, so `EdgeSink` writes the viewer
+id and the payload directly into it, and one syscall per edge per pass replaces
+three per payload. `write_frame` no longer flushes, which changes nothing for the
+raw `TcpStream` the handshake writes to, where flush is already a no-op.
+
+An earlier run of this comparison was taken on battery and reported the unbatched
+path failing from 12,288 observers upward. On AC power it keeps up to 12,288
+and falls behind from 16,384. The battery figures overstated the problem.
+
+**Where the limit sits now.** At 20 Hz with every entity an observer, mean tick
+reaches 38.71 ms of the 50 ms period at 24,576 observers, and delivery still
+keeps up. That is one M1 on loopback. §Open items still wants this curve on
+hardware someone would rent, and still wants a definition of comfortable.
+
+**Payload volume.** 24,576 observers at 98 records each and 20 Hz is 48 million
+records per second, or 578 MB/s, across eight edges. That is what the reliable
+ordered stream is carrying in place of datagrams.
+
+Not built: the datagram path, the ack path the ghost mark needs, the reliable
+event channel, and the edge server that holds game client sockets. `herd-edge`
+drives the region side of an edge without serving any game clients.
 
 ---
 
@@ -1370,7 +1544,7 @@ from 1k to 10k, so linear in viewers with no cache cliff at this size.
 walks ~185 entities per viewer in 938 ns, so 5.06 ns each. The 8,192-entity hot
 cell is 2.37 ns each.
 
-That is backwards from intuition and it is the layout working as designed. A hot
+That is backward from intuition and it is the layout working as designed. A hot
 cell is one contiguous run, so the prefetcher gets a clean stream. Uniform is
 23 separate runs of ~8 entities, and each run touches four arrays for 32 bytes
 apiece, so roughly four cache-line fetches per eight entities, with the prefetcher
@@ -1640,7 +1814,7 @@ predicts 1.22:
 | 256 | 1.08 |
 
 At a cap of 512 the crowd is 6.3% of tick against the uniform case's 5.7%, so a
-dense crowd stops being a special case. That is the point of the mechanism, not
+dense crowd stops being a special case. That is what the mechanism does, not
 the raw speedup.
 
 The sublinear ratios at small caps are the fixed per-viewer costs becoming
@@ -2167,7 +2341,7 @@ Two causes, both in the first version of `select`:
   and was dropped first.
 
 The fix is §Selection: distance chooses the set, drift chooses what to send, and
-an unseen entity scores finitely. Measured afterwards, every scenario reports no
+an unseen entity scores finitely. Measured afterward, every scenario reports no
 arrivals and no departures at steady state, and the crowded cases run 1.7x to
 2.5x faster:
 
@@ -2365,11 +2539,14 @@ and cell count together rather than one at a time.
 3. ~~Gather benchmark: uniform and single hot cell~~ (done)
 4. ~~Sub-cell subdivision, distance-ordered walk, walk cap~~ (done)
 5. ~~Priority accumulator and budget selection~~ (done)
-6. `WorldSimulation` and the game hook trait (done); a minimal `herd` game step
-   (movement, health; nothing else) is next
+6. ~~`WorldSimulation` and the game hook trait; a minimal `herd` game step~~
+   (done). `herd` is now a pair of binaries, `herd-sim` and `herd-edge`, whose
+   game is applying what the edges sent
 7. Bot harness with adversarial movement patterns
-8. `SimulatorEdge` and the sim-to-edge protocol. The link and its handshake are
-   built (§The region link); what a session carries, and the edge itself, are not
+8. `SimulatorEdge` and the sim-to-edge protocol. The link, its handshake and its
+   session are built (§The region link, §The session): edges populate a region,
+   move what they own, and are sent the replication back. Not built: the
+   datagram path, and the edge server that holds game client sockets
 9. Checkpoint path (full-fidelity, distinct from the wire payload)
 10. Cross-region: boundary replication, authority epochs, handoff
 11. Control plane
@@ -2492,7 +2669,7 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 
   It is not one number. What a cell can comfortably hold depends on how many
   viewers are within view of it, the ghost cap, the packet budget, the tick rate
-  and the worker count, and the honest form is a small table or a formula over
+  and the worker count, so the useful form is a small table or a formula over
   those rather than a scalar. The pieces exist: per-viewer cost is roughly linear
   in candidates gathered, the walk cap bounds candidates whatever the crowd does,
   and §Whole-pipeline and §Ghost cap between them give the slope.
@@ -2518,6 +2695,22 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   proportional to slots ever allocated rather than entities currently alive.
   Word-level skipping in `LiveSet` would cut that to one test per 64 dead slots;
   not built, not measured.
+- ~~**Delivery saturates at about 170,000 payloads per second, and the
+  simulation does not.**~~ Fixed by batching: see §Delivery used to stop long
+  before the tick did. It was three syscalls per payload from one thread; it is
+  now one syscall per edge per drain pass, and delivery keeps up to at least
+  24,576 observers at 20 Hz. What remains unproven is the next ceiling, since
+  nothing has been pushed hard enough to find it, and `Handoff` still drains
+  from a single thread.
+- **`run`'s observer takes `&mut WorldSimulation`.** It took `&WorldSimulation`
+  until the session work, which meant a consumer using `run` could not register
+  a viewer at all: between ticks is the only safe point to add or drop one, and
+  the observer is the only thing that runs there. A connection-driven server
+  does that every time a client arrives, so the hole was not hypothetical.
+- **Entity to viewer is still missing from the library, and `Inbound` now keeps
+  its own copy.** Tearing an entity down means dropping the viewer watching it,
+  and nothing in `WorldSimulation` answers that. The map below is what would
+  replace it.
 - `CellSnapshot` has no id-to-slot lookup, so nothing can answer "where is entity
   N." Still needed to locate a client's own avatar and to route an event to a
   specific entity. The replication path no longer needs it: `DiscoveredEntity`
@@ -2532,7 +2725,7 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   empty ghost set. Nothing here names a socket: mapping a viewer to a connection
   is the edge's. What is still missing is the reverse lookup, entity to viewer,
   which is what `EventTarget::Entity` needs; see §Events.
-- **A ghost's mark advances on send rather than on acknowledgement**, so a lost
+- **A ghost's mark advances on send rather than on acknowledgment**, so a lost
   packet leaves a client's copy of a since-idle entity permanently wrong. There
   is no protocol to acknowledge against yet. Fixing it needs a pending mark
   beside the acknowledged one, growing a ghost record from 12 bytes to 16.
@@ -2558,8 +2751,6 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
   is a panic in a library.
 - `MAX_CELL_RADIUS` of 4 sizes every `CellList` inline at 81 cells.
 - Region-local coordinates only. A global coordinate space would need `i64`.
-- British spellings in `config.rs` method names, 15 occurrences of
-  `quantise`/`dequantise`.
 - Stale `CellSet` in a panic message at `subscription.rs:136`.
 - Axis convention: `pos.rs` uses z-up. An earlier Elixir design used Y-up to match
   Unity and Unreal. Never resolved deliberately.

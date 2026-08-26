@@ -22,6 +22,14 @@ opt-level = 3
 [dev-dependencies]
 criterion = "0.8.2"
 
+[[example]]
+name = "herd-sim"
+path = "examples/herd-sim.rs"
+
+[[example]]
+name = "herd-edge"
+path = "examples/herd-edge.rs"
+
 [[bench]]
 name = "subscription"
 harness = false

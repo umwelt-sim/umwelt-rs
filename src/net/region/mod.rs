@@ -19,14 +19,18 @@ mod client;
 pub mod edges;
 pub mod protocol;
 mod server;
+pub mod session;
 mod wire;
 
 pub use auth::{AllowAll, Authorizer, Denied, MAX_CREDENTIAL_BYTES, SharedSecret};
-pub use client::{Decision, Offer, RegionClient};
+pub use client::{Decision, Incoming, Offer, RegionClient};
 pub use edges::{ClaimError, Edge, EdgeId, Edges};
 pub use protocol::{
-    ClientIdentification, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION, ProtocolVersion, RegionId,
-    Rejection, ServerInfo, ServerVersion, WorldParams,
+    ClientIdentification, DespawnEntities, EntitiesSpawned, EntityKind, HANDSHAKE_TIMEOUT,
+    MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities,
+    PROTOCOL_VERSION, PositionUpdates, ProtocolVersion, RegionId, Rejection, ServerInfo,
+    ServerVersion, SpawnEntities, WorldParams,
 };
 pub use server::{RegionServer, Shutdown};
+pub use session::{Applied, EdgeSink, Inbound, Settled};
 pub use wire::MAX_FRAME_BYTES;

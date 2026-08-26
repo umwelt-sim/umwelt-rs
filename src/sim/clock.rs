@@ -119,10 +119,13 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// out, discarding per-viewer selections.
     /// The observer is handed the world alongside the report, since deciding
     /// whether to keep going, or what to record, usually means looking at it.
+    /// It is handed over mutably because between ticks is the only safe point
+    /// to add or drop a viewer, and a server driven by connections has to do
+    /// that whenever a client arrives or leaves.
     pub fn run(
         &mut self,
         pacing: Pacing,
-        on_tick: impl FnMut(TickReport, &WorldSimulation<G, S>) -> Flow,
+        on_tick: impl FnMut(TickReport, &mut WorldSimulation<G, S>) -> Flow,
     ) -> RunSummary {
         self.run_with(pacing, &|_| {}, on_tick)
     }
@@ -138,14 +141,14 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         &mut self,
         pacing: Pacing,
         on_viewer: &(impl Fn(Outbound<'_>) + Sync),
-        mut on_tick: impl FnMut(TickReport, &WorldSimulation<G, S>) -> Flow,
+        mut on_tick: impl FnMut(TickReport, &mut WorldSimulation<G, S>) -> Flow,
     ) -> RunSummary {
         let period = Duration::from_millis(1_000 / self.config().tick_hz() as u64);
         let started = Instant::now();
         let mut summary = RunSummary::default();
 
-        // The origin of the schedule. Dilating moves it, which is the whole of
-        // what dilating means: every deadline after this one arrives later.
+        // The origin of the schedule. Dilating moves it forward, so every
+        // deadline after this one arrives later.
         let mut epoch = started;
         let mut slot: u32 = 0;
 

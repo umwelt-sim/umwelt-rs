@@ -26,7 +26,7 @@
 //! # Serde
 //!
 //! Do not derive `Deserialize` on [`WorldConfig`]. A derived impl constructs
-//! the struct field by field, bypassing validation entirely. Deserialise into
+//! the struct field by field, bypassing validation entirely. Deserialize into
 //! [`WorldConfigBuilder`] instead and call `build()`.
 
 use crate::fixed::{FIXED_SHIFT, Fixed};
@@ -81,7 +81,7 @@ pub enum ConfigError {
     /// A distance was zero or negative. [`Fixed`] is signed, so this has to be
     /// checked before any unsigned bit operation.
     NonPositive(&'static str),
-    /// Extent must be a power of two so wire quantisation divides evenly.
+    /// Extent must be a power of two so wire quantization divides evenly.
     ExtentNotPowerOfTwo { axis: Axis, extent: Fixed },
     /// View radius larger than the region makes subscription meaningless.
     RadiusExceedsRegion { radius: Fixed, region_size: Fixed },
@@ -108,7 +108,7 @@ impl fmt::Display for ConfigError {
             }            ExtentNotPowerOfTwo { axis, extent } => write!(
                 f,
                 "{axis} extent {extent} is not a power of two; \
-                 wire quantisation would not divide evenly"
+                 wire quantization would not divide evenly"
             ),            RadiusExceedsRegion {
                 radius,
                 region_size,
@@ -333,43 +333,43 @@ impl WorldConfig {
     // -- wire -------------------------------------------------------------
 
     #[inline(always)]
-    pub const fn quantise_horizontal(&self, v: Fixed) -> u32 {
+    pub const fn quantize_horizontal(&self, v: Fixed) -> u32 {
         (v.raw() as u32) >> self.horizontal_quant_shift
     }
 
     #[inline(always)]
-    pub const fn dequantise_horizontal(&self, wire: u32) -> Fixed {
+    pub const fn dequantize_horizontal(&self, wire: u32) -> Fixed {
         Fixed::from_raw((wire << self.horizontal_quant_shift) as i32)
     }
 
     #[inline(always)]
-    pub const fn quantise_vertical(&self, v: Fixed) -> u32 {
+    pub const fn quantize_vertical(&self, v: Fixed) -> u32 {
         (v.raw() as u32) >> self.vertical_quant_shift
     }
 
     #[inline(always)]
-    pub const fn dequantise_vertical(&self, wire: u32) -> Fixed {
+    pub const fn dequantize_vertical(&self, wire: u32) -> Fixed {
         Fixed::from_raw((wire << self.vertical_quant_shift) as i32)
     }
 
-    /// Quantise a full position for the wire, as `(x, y, z)`.
+    /// Quantize a full position for the wire, as `(x, y, z)`.
     #[inline(always)]
-    pub const fn quantise_pos(&self, pos: Pos3) -> (u32, u32, u32) {
+    pub const fn quantize_pos(&self, pos: Pos3) -> (u32, u32, u32) {
         (
-            self.quantise_horizontal(pos.x),
-            self.quantise_horizontal(pos.y),
-            self.quantise_vertical(pos.z),
+            self.quantize_horizontal(pos.x),
+            self.quantize_horizontal(pos.y),
+            self.quantize_vertical(pos.z),
         )
     }
 
-    /// Inverse of [`Self::quantise_pos`], landing at the low edge of each
-    /// quantisation bucket.
+    /// Inverse of [`Self::quantize_pos`], landing at the low edge of each
+    /// quantization bucket.
     #[inline(always)]
-    pub const fn dequantise_pos(&self, x: u32, y: u32, z: u32) -> Pos3 {
+    pub const fn dequantize_pos(&self, x: u32, y: u32, z: u32) -> Pos3 {
         Pos3::new(
-            self.dequantise_horizontal(x),
-            self.dequantise_horizontal(y),
-            self.dequantise_vertical(z),
+            self.dequantize_horizontal(x),
+            self.dequantize_horizontal(y),
+            self.dequantize_vertical(z),
         )
     }
 
@@ -724,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn quantisation_error_is_bounded_on_both_axes() {
+    fn quantization_error_is_bounded_on_both_axes() {
         let w = WorldConfig::default();
         for m in 0..1024i32 {
             let p = Pos3::new(
@@ -732,8 +732,8 @@ mod tests {
                 Fixed::from_meters(m),
                 Fixed::from_meters(m) + Fixed::from_raw(511),
             );
-            let (qx, qy, qz) = w.quantise_pos(p);
-            let back = w.dequantise_pos(qx, qy, qz);
+            let (qx, qy, qz) = w.quantize_pos(p);
+            let back = w.dequantize_pos(qx, qy, qz);
             assert!((p.x - back.x).abs() < w.horizontal_precision());
             assert!((p.z - back.z).abs() < w.vertical_precision());
             assert_eq!(p.y, back.y);

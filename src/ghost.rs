@@ -126,7 +126,7 @@ impl GhostTable {
     /// Records that `id` was sent on `tick` at odometer reading `mark`,
     /// creating the ghost if the client did not have one.
     ///
-    /// The mark advances on send rather than on acknowledgement, so a lost
+    /// The mark advances on send rather than on acknowledgment, so a lost
     /// packet leaves this client's copy of a since-idle entity permanently
     /// wrong. Unresolved; see §Open questions in the design document.
     ///

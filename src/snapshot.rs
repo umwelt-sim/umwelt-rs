@@ -404,7 +404,7 @@ impl CellSnapshot {
         self.zs.resize(n, Fixed::ZERO);
 
         // Pass 1: tally into starts[c + 1], so the running total below produces
-        // each cell's start offset with no shifting afterwards.
+        // each cell's start offset with no shifting afterward.
         self.starts.fill(0);
         for i in 0..slots {
             if !live.contains(EntityId::from_raw(i as u32)) {

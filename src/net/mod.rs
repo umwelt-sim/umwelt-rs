@@ -65,9 +65,12 @@ pub mod region;
 
 pub use error::{NetError, RejectCode};
 pub use region::{
-    AllowAll, Authorizer, ClaimError, ClientIdentification, Decision, Denied, Edge, EdgeId,
-    Edges,
-    HANDSHAKE_TIMEOUT, MAX_CREDENTIAL_BYTES, MAX_FRAME_BYTES, Offer, PROTOCOL_VERSION,
+    AllowAll, Applied, Authorizer, ClaimError, ClientIdentification, Decision, Denied,
+    DespawnEntities, Edge, EdgeId, EdgeSink, Edges, EntitiesSpawned, EntityKind,
+    HANDSHAKE_TIMEOUT,
+    Incoming, Inbound,
+    MAX_CREDENTIAL_BYTES, MAX_DESPAWN_PER_MESSAGE, MAX_FRAME_BYTES, MAX_MOVES_PER_MESSAGE,
+    MAX_SPAWN_PER_MESSAGE, MoveEntities, Offer, PROTOCOL_VERSION, PositionUpdates,
     ProtocolVersion, RegionClient, RegionId, RegionServer, Rejection, ServerInfo, ServerVersion,
-    SharedSecret, Shutdown, WorldParams,
+    Settled, SharedSecret, Shutdown, SpawnEntities, WorldParams,
 };

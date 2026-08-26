@@ -15,6 +15,11 @@
 //! # Ok::<(), umwelt::ConfigError>(())
 //! ```
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/umwelt-sim/umwelt-rs/main/assets/logo/umwelt-tile-small.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/umwelt-sim/umwelt-rs/main/assets/logo/favicon.svg"
+)]
+
 pub mod fixed;
 pub mod pos;
 pub mod config;

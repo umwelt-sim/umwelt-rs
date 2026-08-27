@@ -18,9 +18,10 @@ pub mod subjects;
 pub use client::{Incoming, Offer, RegionClient};
 pub use edges::{ClaimError, EdgeId, EdgeName, EdgeView, Edges};
 pub use protocol::{
-    DespawnEntities, EntitiesSpawned, EntityKind, MAX_DESPAWN_PER_MESSAGE, MAX_MESSAGE_BYTES,
+    DespawnEntities, EntityKind, MAX_DESPAWN_PER_MESSAGE, MAX_MESSAGE_BYTES,
     MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION,
-    ProtocolVersion, RegionId, ServerInfo, ServerVersion, SpawnEntities, WorldParams,
+    Presence, ProtocolVersion, RegionId, ServerInfo, ServerVersion, Spawn, SpawnEntities,
+    WorldParams,
 };
 pub use server::RegionServer;
 pub use session::{Applied, EdgeSink, Inbound, Settled};

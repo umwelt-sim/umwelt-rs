@@ -72,3 +72,14 @@ pub async fn connect(
         .collect::<Result<_, _>>()?;
     Ok(async_nats::connect_with_options(servers, options).await?)
 }
+
+/// A short, distinct token for one process run.
+///
+/// An edge names itself afresh every start; `docs/adr/0004` says why. Nothing
+/// scopes on the name, so anything short and unlikely to repeat will do.
+pub fn shortcode() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    format!("{:06x}", h.finish() & 0xff_ffff)
+}

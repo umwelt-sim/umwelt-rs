@@ -10,14 +10,15 @@
 //! region allocated, the region applies the positions the edge sends, and the
 //! payload that comes back carries those positions.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use umwelt::net::{
-    EdgeName, EdgeSink, EntityKind, Incoming, Inbound, RegionClient, RegionId, RegionServer,
+    EdgeName, EdgeSink, EntityKind, Incoming, Inbound, Presence, RegionClient, RegionId,
+    RegionServer, Spawn,
 };
-use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, ViewerId, Wait};
+use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, Wait};
 use umwelt::{EntityId, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
 
 const EDGES: usize = 3;
@@ -38,14 +39,29 @@ fn region_id() -> RegionId {
     RegionId::from_raw(1_000_000 + std::process::id() % 1000)
 }
 
-/// The region's game: everything it does is what the edges asked for.
+/// The region's game. It applies what the edges sent, and after a while
+/// despawns one entity of its own accord, which no edge asked for and which
+/// only a presence message can report.
 struct Applier {
     inbound: Arc<Inbound>,
+    ticks: u32,
+    culled: Arc<Mutex<Option<EntityId>>>,
 }
+
+/// Late enough that every edge has its population and is moving it.
+const CULL_AT: u32 = 200;
 
 impl Game for Applier {
     fn step(&mut self, step: &mut Step<'_>) {
         self.inbound.apply(step);
+        self.ticks += 1;
+        if self.ticks == CULL_AT {
+            // The first live slot will do; it belongs to some edge.
+            if let Some(id) = step.live().iter().next() {
+                step.despawn(id);
+                *self.culled.lock().expect("not poisoned") = Some(id);
+            }
+        }
     }
 }
 
@@ -104,13 +120,19 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
     let sink =
         EdgeSink::new(region, client.clone(), runtime.handle().clone(), Arc::clone(&edges));
 
-    let mut sim = WorldSimulation::new(cfg, Applier { inbound: Arc::clone(&inbound) })
-        .with_sink(Handoff::new(sink.clone()));
+    let culled: Arc<Mutex<Option<EntityId>>> = Arc::new(Mutex::new(None));
+    let mut sim = WorldSimulation::new(
+        cfg,
+        Applier { inbound: Arc::clone(&inbound), ticks: 0, culled: Arc::clone(&culled) },
+    )
+    .with_sink(Handoff::new(sink.clone()));
 
     let stop = AtomicBool::new(false);
     // Positions that made the whole round trip: sent by an edge, applied by the
     // region, replicated, and decoded back on the edge that sent them.
     let confirmed = AtomicU64::new(0);
+    // Entities the region reported gone, whoever caused it.
+    let removed: Mutex<Vec<EntityId>> = Mutex::new(Vec::new());
 
     std::thread::scope(|scope| {
         let sink_for_loop = sink.clone();
@@ -133,6 +155,7 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
         for e in 0..EDGES {
             let confirmed = &confirmed;
             let stop = &stop;
+            let removed = &removed;
             scope.spawn(move || {
                 let name = EdgeName::new(format!("test-{}-{e}", std::process::id()))
                     .expect("valid name");
@@ -148,38 +171,44 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                 assert_eq!(offer.region, region);
                 let codec = RecordCodec::new(&offer.config);
 
-                let mut asked: Vec<(Pos3, EntityKind)> =
-                    (0..OBSERVERS).map(|n| (home(e, n), EntityKind::Observer)).collect();
-                asked.extend(
-                    (0..UNATTENDED).map(|n| (home(e, OBSERVERS + n), EntityKind::Unattended)),
-                );
+                // The token is how an arrival is matched to the request that
+                // asked for it, since a presence subject says only which edge
+                // owns the entity.
+                let mut asked: Vec<Spawn> = (0..OBSERVERS)
+                    .map(|n| Spawn {
+                        position: home(e, n),
+                        kind: EntityKind::Observer,
+                        token: n as u64,
+                    })
+                    .collect();
+                asked.extend((0..UNATTENDED).map(|n| Spawn {
+                    position: home(e, OBSERVERS + n),
+                    kind: EntityKind::Unattended,
+                    token: (OBSERVERS + n) as u64,
+                }));
                 link.spawn(region, &asked).expect("asks for its crowd");
 
-                // The region allocates the ids; the edge finds out here.
-                let mut all: Vec<(EntityId, Option<ViewerId>)> = Vec::new();
-                while all.len() < PER_EDGE {
-                    match link.receive().expect("the region answers") {
-                        Incoming::Spawned { entities, .. } => all.extend(entities),
-                        Incoming::Updates { .. } => {}
+                // The region allocates the ids; the edge learns them here.
+                let mut mine: Vec<Option<EntityId>> = vec![None; PER_EDGE];
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while mine.iter().any(Option::is_none) {
+                    assert!(Instant::now() < deadline, "the region never reported the spawns");
+                    let Some(message) = link.receive_timeout(Duration::from_millis(200)) else {
+                        continue;
+                    };
+                    let Incoming::Presence { what, .. } = message else { continue };
+                    if let Presence::Added { entity, token } = what {
+                        let at = token as usize;
+                        assert!(at < PER_EDGE, "a token this edge never sent came back");
+                        mine[at] = Some(entity);
                     }
                 }
-                assert_eq!(all.len(), PER_EDGE, "every entity asked for came back");
+                let movable: Vec<EntityId> = mine.iter().map(|m| m.expect("filled")).collect();
 
-                let watched = all.iter().filter(|(_, v)| v.is_some()).count();
-                assert_eq!(watched, OBSERVERS, "only observers get a viewer");
-                assert!(
-                    all[OBSERVERS..].iter().all(|(_, v)| v.is_none()),
-                    "an unattended entity must not cost a viewer"
-                );
-
-                let mut sorted: Vec<u32> = all.iter().map(|(id, _)| id.raw()).collect();
+                let mut sorted: Vec<u32> = movable.iter().map(|id| id.raw()).collect();
                 sorted.sort_unstable();
                 sorted.dedup();
                 assert_eq!(sorted.len(), PER_EDGE, "the region handed out duplicate ids");
-
-                let mine: Vec<(EntityId, ViewerId)> =
-                    all.iter().filter_map(|(id, v)| v.map(|v| (*id, v))).collect();
-                let movable: Vec<EntityId> = all.iter().map(|(id, _)| *id).collect();
 
                 std::thread::scope(|inner| {
                     inner.spawn(|| {
@@ -209,18 +238,30 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                     });
 
                     while !stop.load(Ordering::Relaxed) {
-                        let Some(message) = link.receive() else { return };
-                        let Incoming::Updates { viewer, payload, .. } = message else { continue };
-                        let Some(reader) = PacketReader::new(&codec, &payload) else { continue };
-                        // A viewer always sees its own avatar: it is at distance
-                        // zero from itself.
-                        let Some(&(avatar, _)) = mine.iter().find(|(_, v)| *v == viewer) else {
+                        let Some(message) = link.receive_timeout(Duration::from_millis(200))
+                        else {
                             continue;
                         };
-                        for (id, pos) in reader.updates() {
-                            if id == avatar && pos.x.floor_meters() > 100 + e as i32 * 40 {
-                                confirmed.fetch_add(1, Ordering::Relaxed);
+                        match message {
+                            Incoming::State { entity, packet, .. } => {
+                                let Some(reader) = PacketReader::new(&codec, &packet) else {
+                                    continue;
+                                };
+                                // A packet is named by the avatar it was built
+                                // for, and that avatar always sees itself: it is
+                                // at distance zero from itself.
+                                for (id, pos) in reader.updates() {
+                                    if id == entity
+                                        && pos.x.floor_meters() > 100 + e as i32 * 40
+                                    {
+                                        confirmed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                             }
+                            Incoming::Presence { what: Presence::Removed { entity }, .. } => {
+                                removed.lock().expect("not poisoned").push(entity);
+                            }
+                            Incoming::Presence { .. } => {}
                         }
                     }
                 });
@@ -236,8 +277,14 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
             confirmed.load(Ordering::Relaxed) >= 100
         });
 
+        // The game despawned one entity that no edge asked about, and only a
+        // presence message can carry that. Nothing reported it before.
+        wait_until("the game's own despawn to be reported", || {
+            let culled = *culled.lock().expect("not poisoned");
+            culled.is_some_and(|id| removed.lock().expect("not poisoned").contains(&id))
+        });
+
         assert_eq!(edges.len(), EDGES);
-        assert_eq!(inbound.refused(), 0, "nothing an edge sent was declined");
         assert!(sink.sent() > 0, "payloads reached the edges");
         assert_eq!(sink.failed(), 0, "no publish failed");
 

@@ -23,8 +23,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EdgeName, EntityKind, Incoming, RegionClient, RegionId};
-use umwelt::sim::ViewerId;
+use umwelt::net::{EdgeName, EntityKind, Incoming, Presence, RegionClient, RegionId, Spawn};
 use umwelt::{EntityId, Fixed, PacketReader, Pos3, RecordCodec};
 
 /// Meters per second a walker covers. Well under the world's 40 m/s cap.
@@ -38,7 +37,9 @@ fn main() {
     let region = RegionId::from_raw(herd::arg_or("region", 7u32));
     // Distinct per process, so several edges against one region do not collide
     // on a subject.
-    let name = EdgeName::new(herd::arg_or("name", format!("herd-{}", std::process::id())))
+    // Fresh every start. An edge that reuses a name inherits entities the
+    // region still thinks it owns and cannot enumerate them; see docs/adr/0004.
+    let name = EdgeName::new(herd::arg_or("name", format!("herd-{}", herd::shortcode())))
         .unwrap_or_else(|e| {
             eprintln!("--name: {e}");
             std::process::exit(2);
@@ -82,17 +83,29 @@ fn main() {
     let lane = (std::process::id() % 64) as i32 * 60 + 64;
     let home = |n: usize| Pos3::from_meters(lane, 64 + (n as i32 % 3072), 0);
 
-    let mut asked: Vec<(Pos3, EntityKind)> =
-        (0..observers).map(|n| (home(n), EntityKind::Observer)).collect();
-    asked.extend((0..unattended).map(|n| (home(observers + n), EntityKind::Unattended)));
+    // The token is this edge's own handle for whatever asked. A real edge uses
+    // the handle it holds for the game client; herd has no clients, so it
+    // counts. Each token is spent once and never reused, so what was asked for
+    // can be looked up by it when the region reports the arrival.
+    let mut wanted: Vec<(Pos3, EntityKind)> = (0..observers)
+        .map(|n| (home(n), EntityKind::Observer))
+        .chain((0..unattended).map(|n| (home(observers + n), EntityKind::Unattended)))
+        .collect();
+    let asked: Vec<Spawn> = wanted
+        .iter()
+        .enumerate()
+        .map(|(token, &(position, kind))| Spawn { position, kind, token: token as u64 })
+        .collect();
     link.spawn(region, &asked).expect("asks for its population");
     println!(
         "herd-edge: asked for {observers} observers and {unattended} unattended \
          in lane x={lane}"
     );
 
-    // An entity the edge holds, and whether a viewer watches it.
-    let arrivals: Mutex<Vec<(EntityId, Option<ViewerId>)>> = Mutex::new(Vec::new());
+    // Entities the region reported, with the token each was asked for under,
+    // and ones it reported gone.
+    let arrivals: Mutex<Vec<(EntityId, u64)>> = Mutex::new(Vec::new());
+    let departures: Mutex<Vec<EntityId>> = Mutex::new(Vec::new());
     let stop = AtomicBool::new(false);
     let updates = AtomicU64::new(0);
     let records = AtomicU64::new(0);
@@ -101,27 +114,26 @@ fn main() {
     std::thread::scope(|scope| {
         // Receive: replication coming down, and the ids for anything spawned.
         scope.spawn(|| {
-            let mut roster: Vec<(EntityId, ViewerId)> = Vec::new();
             while !stop.load(Ordering::Relaxed) {
                 let Some(message) = link.receive() else { return };
                 match message {
-                    Incoming::Spawned { entities, .. } => {
-                        // Only observers have a viewer, and only viewers are
-                        // named by a payload coming down.
-                        roster.extend(entities.iter().filter_map(|(id, v)| v.map(|v| (*id, v))));
-                        arrivals.lock().expect("not poisoned").extend(entities);
+                    Incoming::Presence { what: Presence::Added { entity, token }, .. } => {
+                        arrivals.lock().expect("not poisoned").push((entity, token));
                     }
-                    Incoming::Updates { viewer, payload, .. } => {
+                    Incoming::Presence { what: Presence::Removed { entity }, .. } => {
+                        // Reported whatever caused it, including a despawn this
+                        // edge never asked for.
+                        departures.lock().expect("not poisoned").push(entity);
+                    }
+                    Incoming::State { entity, packet, .. } => {
                         updates.fetch_add(1, Ordering::Relaxed);
-                        let Some(reader) = PacketReader::new(&codec, &payload) else {
+                        let Some(reader) = PacketReader::new(&codec, &packet) else {
                             continue;
                         };
-                        let avatar =
-                            roster.iter().find(|(_, v)| *v == viewer).map(|(id, _)| *id);
                         let mut n = 0u64;
                         for (id, _) in reader.updates() {
                             n += 1;
-                            if Some(id) == avatar {
+                            if id == entity {
                                 own.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -144,9 +156,16 @@ fn main() {
         while !stop.load(Ordering::Relaxed) {
             let deadline = Instant::now() + period;
 
-            for (id, viewer) in arrivals.lock().expect("not poisoned").drain(..) {
-                let at = held.len();
-                held.push((id, home(at), 1, viewer.is_some()));
+            for (id, token) in arrivals.lock().expect("not poisoned").drain(..) {
+                // The token says which request this is the answer to, and so
+                // where the entity was asked for and what kind it is.
+                let Some(&(at, kind)) = wanted.get(token as usize) else { continue };
+                held.push((id, at, 1, kind.observes()));
+            }
+            // Anything the region says is gone stops being moved, however it
+            // went. Without this the edge would send refused moves forever.
+            for id in departures.lock().expect("not poisoned").drain(..) {
+                held.retain(|(held_id, _, _, _)| *held_id != id);
             }
 
             for (_, pos, heading, _) in held.iter_mut() {
@@ -190,11 +209,21 @@ fn main() {
                     }
                     given_back += leaving.len() as u64;
 
-                    // Clients arriving: ask for replacements.
-                    let coming: Vec<Pos3> =
-                        (0..churn).map(|k| home(next_home + k)).collect();
+                    // Clients arriving: ask for replacements, each under a
+                    // fresh token.
+                    let coming: Vec<Spawn> = (0..churn)
+                        .map(|k| {
+                            let position = home(next_home + k);
+                            wanted.push((position, EntityKind::Observer));
+                            Spawn {
+                                position,
+                                kind: EntityKind::Observer,
+                                token: (wanted.len() - 1) as u64,
+                            }
+                        })
+                        .collect();
                     next_home += churn;
-                    if link.spawn_observers(region, &coming).is_err() {
+                    if link.spawn(region, &coming).is_err() {
                         break;
                     }
                 }

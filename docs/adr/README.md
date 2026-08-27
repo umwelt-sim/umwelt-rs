@@ -11,7 +11,7 @@ work lands. If a decision is reversed, a new record supersedes it and says so.
 | [0001](0001-nats-for-the-region-edge-transport.md) | NATS for the region-to-edge transport | Accepted |
 | [0002](0002-control-plane-and-region-heartbeats.md) | Control plane and region heartbeats | Accepted, not built |
 | [0003](0003-ad-hoc-entity-migration.md) | Ad hoc entity migration between regions | Accepted, nothing to build |
-| [0004](0004-region-events-and-entity-addressing.md) | Region events, and entity ids on the wire | Accepted, not built |
+| [0004](0004-region-events-and-entity-addressing.md) | Region events, and entity ids on the wire | Accepted |
 
 ## Format
 

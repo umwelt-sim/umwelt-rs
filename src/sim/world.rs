@@ -74,6 +74,10 @@ pub struct Step<'a> {
     ys: &'a mut Vec<Fixed>,
     zs: &'a mut Vec<Fixed>,
     live: &'a mut LiveSet,
+    /// Ids despawned this tick, whoever asked. Recorded because a despawn the
+    /// game performs is otherwise invisible to anything outside the game, and
+    /// something has to tell the edge that owned it.
+    despawned: &'a mut Vec<EntityId>,
     cfg: &'a WorldConfig,
     tick: u32,
 }
@@ -120,7 +124,10 @@ impl Step<'_> {
 
     /// Removes an entity from the snapshot. The slot is not reclaimed.
     pub fn despawn(&mut self, id: EntityId) {
-        self.live.remove(id);
+        if self.live.contains(id) {
+            self.live.remove(id);
+            self.despawned.push(id);
+        }
     }
 }
 
@@ -321,6 +328,8 @@ pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     ys: Vec<Fixed>,
     zs: Vec<Fixed>,
     live: LiveSet,
+    /// Cleared at the start of every tick and filled by [`Step::despawn`].
+    despawned: Vec<EntityId>,
 
     odo: Odometer,
     snap: CellSnapshot,
@@ -375,6 +384,7 @@ impl<G: Game> WorldSimulation<G, NullSink> {
             ys: Vec::new(),
             zs: Vec::new(),
             live: LiveSet::new(),
+            despawned: Vec::new(),
             odo: Odometer::new(),
             snap,
             viewers: Vec::new(),
@@ -409,6 +419,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             ys: self.ys,
             zs: self.zs,
             live: self.live,
+            despawned: self.despawned,
             odo: self.odo,
             snap: self.snap,
             viewers: self.viewers,
@@ -483,6 +494,17 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     #[inline]
     pub fn odometer(&self) -> &Odometer {
         &self.odo
+    }
+
+    /// Entities despawned during the last tick, whoever asked for it.
+    ///
+    /// Cleared at the start of each tick, so this holds the last tick's only. A
+    /// despawn the consumer's game performs is otherwise invisible to anything
+    /// outside the game, and this is how a caller learns of one in time to act
+    /// between ticks.
+    #[inline]
+    pub fn despawned(&self) -> &[EntityId] {
+        &self.despawned
     }
 
     /// Entities currently alive.
@@ -587,11 +609,13 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         self.tick = self.tick.wrapping_add(1);
 
         {
+            self.despawned.clear();
             let mut step = Step {
                 xs: &mut self.xs,
                 ys: &mut self.ys,
                 zs: &mut self.zs,
                 live: &mut self.live,
+                despawned: &mut self.despawned,
                 cfg: &self.cfg,
                 tick: self.tick,
             };
@@ -710,6 +734,7 @@ mod tests {
             ys: &mut sim.ys,
             zs: &mut sim.zs,
             live: &mut sim.live,
+            despawned: &mut sim.despawned,
             cfg: &sim.cfg,
             tick: 0,
         };
@@ -890,6 +915,7 @@ mod tests {
             ys: &mut s.ys,
             zs: &mut s.zs,
             live: &mut s.live,
+            despawned: &mut s.despawned,
             cfg: &s.cfg,
             tick: 0,
         };

@@ -621,9 +621,9 @@ authored. Everything else in this table derives from those five.
 ## What is built
 
 `fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
-`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`. 306
-library tests pass, and one integration test drives a region and three edges end to
-end.
+`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`. 280
+library tests pass, and one integration test drives a region and three edges end
+to end.
 
 A tick runs end to end: the game moves entities, the odometer observes how far
 they went, the snapshot is rebuilt in cell order, and every due viewer is
@@ -1000,7 +1000,7 @@ they do.
 **Superseded in part by `docs/adr/0001` and `docs/adr/0004`.** The link was a
 TCP connection this crate implemented: its own framing, its own handshake, and a
 bearer secret. It is NATS now, 0001 holds the measurements and the reasoning,
-and 0004 revises the subjects: no reply subject, a region-wide events subject,
+and 0004 revises the subjects: no reply subject, a per-edge presence subject,
 and payloads addressed by entity rather than by viewer. What follows is what
 survived.
 
@@ -1031,6 +1031,20 @@ tier, which is what §Why per-client work stays in the simulation is about.
 belongs to the protocol, not to whichever end speaks it. `ServerInfo` describes
 a region, `SpawnEntities` asks for entities, `MoveEntities` carries positions.
 
+**A region reports, it does not answer.** `Presence` says an entity was added
+or removed, and it is published on the owning edge's `presence` subject
+whatever caused the change: the edge asked, the consumer's game despawned, or
+the edge was expired and its entities orphaned. An edge told only about what it
+asked for cannot know when something it owns has gone, which is the gap
+`docs/adr/0004` exists to close, and `WorldSimulation::despawned` is how a
+despawn inside `Game::step` reaches the reporting at all.
+
+An `Added` carries a `u64` token the edge chose on the `Spawn` and the region
+echoes without looking inside it. The subject says which edge owns the entity
+and nothing more, so an edge that asked for three avatars in one message has no
+other way to tell which arrival belongs to which of its game clients. In
+practice it is the handle the edge already holds for that client.
+
 **The config crosses as the five authored values, not the struct.** A
 `WorldConfig` is mostly derived, so `WorldParams` carries region size, vertical
 extent, view radius and max speed in whole meters, plus tick rate and
@@ -1060,7 +1074,8 @@ there is nothing for a stale reference to alias.
 **An edge's death stopped being observable when the socket went.** A closed
 connection used to say an edge had gone, which is what triggered despawning the
 entities it managed. Publish and subscribe carries no such signal, so silence
-does: an edge is dropped after `EDGE_TIMEOUT` without a word. An edge under load
+does: an edge is dropped after the timeout `RegionServer` was built with, without a
+word. An edge under load
 sends moves every tick and an idle one sends a keepalive, so the timeout only
 decides how long a quiet edge survives. Measured end to end: an edge killed with
 no warning is dropped about five seconds later, and its 640 entities despawn
@@ -1076,7 +1091,9 @@ the mapping, so the routing question belongs to it.
 
 An edge claims the entities it manages, and `Edges::edge_for` answers the routing
 question. A sink resolves a served `ViewerId` to its avatar through `avatar_of`,
-then that avatar to an edge through `edge_for`.
+then that avatar to an edge through `edge_for`. The avatar is also what it
+writes into the message, so a `ViewerId` never leaves the region and an edge
+keeps one map rather than two.
 
 **The lookup sits on the sink's path, which is on the tick's path.** Every served
 viewer costs one, from every worker thread at once. So `edge_for` takes a shared

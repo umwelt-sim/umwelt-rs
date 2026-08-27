@@ -1,6 +1,6 @@
 # 0004 — Region events, and entity ids on the wire
 
-Status: Accepted, 2026-08-27. Not built. Supersedes the subject scheme in
+Status: Accepted, 2026-08-27. Supersedes the subject scheme in
 `docs/adr/0001` and the reasoning about replies in `docs/adr/0003`.
 
 ## Context

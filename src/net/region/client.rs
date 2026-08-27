@@ -15,7 +15,7 @@
 //! This knows nothing about game clients, fan-out, or relaying.
 
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -27,13 +27,12 @@ use crate::entity::EntityId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{
-    DespawnEntities, EntitiesSpawned, EntityKind, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE,
-    MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, RegionId,
-    ServerInfo, ServerVersion, SpawnEntities,
+    DespawnEntities, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE,
+    MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, Presence, RegionId, ServerInfo,
+    ServerVersion, Spawn, SpawnEntities,
 };
 use crate::net::region::subjects;
 use crate::pos::Pos3;
-use crate::sim::ViewerId;
 
 /// What a region says it is, checked before an edge uses it.
 ///
@@ -51,12 +50,11 @@ pub struct Offer {
 /// What a region sent this edge.
 #[derive(Clone, Debug)]
 pub enum Incoming {
-    /// The entities a spawn asked for, and the viewer watching each. The region
-    /// allocated the ids.
-    Spawned { region: RegionId, entities: Vec<(EntityId, Option<ViewerId>)> },
-    /// One viewer's payload. Decode it with
+    /// One observer's packet, named by the entity it belongs to. Decode it with
     /// [`PacketReader`](crate::PacketReader).
-    Updates { region: RegionId, viewer: ViewerId, payload: bytes::Bytes },
+    State { region: RegionId, entity: EntityId, packet: bytes::Bytes },
+    /// An entity this edge owns appeared or left, whatever caused it.
+    Presence { region: RegionId, what: Presence },
 }
 
 /// One edge's connection to the region tier.
@@ -74,7 +72,7 @@ impl RegionClient {
     /// Subscribes to everything addressed to this edge, on a connection the
     /// caller made.
     ///
-    /// Two subscriptions, both wildcards over the region: payloads and replies.
+    /// Two subscriptions, both wildcards over the region: state and presence.
     /// Neither is ever taken again, whatever regions the edge later deals with.
     pub fn new(
         client: async_nats::Client,
@@ -82,9 +80,10 @@ impl RegionClient {
         edge: EdgeName,
     ) -> Result<RegionClient, NetError> {
         let (send, inbox) = channel();
-        let mut tasks = Vec::new();
-        tasks.push(runtime.block_on(Self::read_payloads(&client, &edge, send.clone()))?);
-        tasks.push(runtime.block_on(Self::read_replies(&client, &edge, send))?);
+        let tasks = vec![
+            runtime.block_on(Self::read_state(&client, &edge, send.clone()))?,
+            runtime.block_on(Self::read_presence(&client, &edge, send))?,
+        ];
         Ok(RegionClient { edge, client, runtime, inbox: Mutex::new(inbox), tasks })
     }
 
@@ -125,14 +124,11 @@ impl RegionClient {
 
     /// Asks a region to create entities and record this edge as managing them.
     ///
-    /// Each carries an [`EntityKind`], because whether a viewer is registered
-    /// for it is the difference between an entity that costs 12 bytes of
-    /// snapshot and one that costs the whole per-viewer pipeline every tick.
-    pub fn spawn(
-        &self,
-        region: RegionId,
-        spawns: &[(Pos3, EntityKind)],
-    ) -> Result<(), NetError> {
+    /// Each carries an [`EntityKind`](crate::net::EntityKind), because whether a
+    /// viewer is registered
+    /// for it is the difference between an entity that costs 12 bytes of snapshot
+    /// and one that costs the whole per-viewer pipeline every tick.
+    pub fn spawn(&self, region: RegionId, spawns: &[Spawn]) -> Result<(), NetError> {
         self.send_all(region, spawns.chunks(MAX_SPAWN_PER_MESSAGE).map(|chunk| {
             let mut body = Vec::new();
             SpawnEntities { spawns: chunk.to_vec() }.encode(&mut body);
@@ -189,12 +185,18 @@ impl RegionClient {
         self.inbox.lock().expect("not poisoned").recv().ok()
     }
 
+    /// Takes the next message, waiting no longer than `within`.
+    ///
+    /// `None` on timeout or once the link is closed. A caller that must not
+    /// block forever on a message that may never arrive wants this rather than
+    /// [`receive`](Self::receive).
+    pub fn receive_timeout(&self, within: Duration) -> Option<Incoming> {
+        self.inbox.lock().expect("not poisoned").recv_timeout(within).ok()
+    }
+
     /// Takes the next message if one is already here.
     pub fn try_receive(&self) -> Option<Incoming> {
-        match self.inbox.lock().expect("not poisoned").try_recv() {
-            Ok(message) => Some(message),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.inbox.lock().expect("not poisoned").try_recv().ok()
     }
 
     fn send_all(
@@ -214,45 +216,43 @@ impl RegionClient {
         })
     }
 
-    async fn read_payloads(
+    async fn read_state(
         client: &async_nats::Client,
         edge: &EdgeName,
         out: Sender<Incoming>,
     ) -> Result<JoinHandle<()>, NetError> {
-        let mut payloads = client.subscribe(subjects::to_edge(edge, "payload")).await?;
+        let mut packets = client.subscribe(subjects::to_edge(edge, "state")).await?;
         Ok(tokio::spawn(async move {
-            while let Some(message) = payloads.next().await {
+            while let Some(message) = packets.next().await {
                 let Ok(region) = subjects::origin(&message.subject) else { continue };
                 if message.payload.len() < 4 {
                     continue;
                 }
-                let viewer = ViewerId::from_raw(u32::from_le_bytes([
+                let entity = EntityId::from_raw(u32::from_le_bytes([
                     message.payload[0],
                     message.payload[1],
                     message.payload[2],
                     message.payload[3],
                 ]));
-                let payload = message.payload.slice(4..);
-                if out.send(Incoming::Updates { region, viewer, payload }).is_err() {
+                let packet = message.payload.slice(4..);
+                if out.send(Incoming::State { region, entity, packet }).is_err() {
                     return;
                 }
             }
         }))
     }
 
-    async fn read_replies(
+    async fn read_presence(
         client: &async_nats::Client,
         edge: &EdgeName,
         out: Sender<Incoming>,
     ) -> Result<JoinHandle<()>, NetError> {
-        let mut replies = client.subscribe(subjects::to_edge(edge, "reply")).await?;
+        let mut changes = client.subscribe(subjects::to_edge(edge, "presence")).await?;
         Ok(tokio::spawn(async move {
-            while let Some(message) = replies.next().await {
+            while let Some(message) = changes.next().await {
                 let Ok(region) = subjects::origin(&message.subject) else { continue };
-                let Some((_kind, body)) = message.payload.split_first() else { continue };
-                let Ok(spawned) = EntitiesSpawned::decode(body) else { continue };
-                let entities = spawned.entities;
-                if out.send(Incoming::Spawned { region, entities }).is_err() {
+                let Ok(what) = Presence::decode(&message.payload) else { continue };
+                if out.send(Incoming::Presence { region, what }).is_err() {
                     return;
                 }
             }

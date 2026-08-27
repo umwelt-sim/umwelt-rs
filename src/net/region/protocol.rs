@@ -14,23 +14,20 @@ use crate::config::WorldConfig;
 use crate::entity::EntityId;
 use crate::net::error::NetError;
 use crate::pos::Pos3;
-use crate::sim::ViewerId;
 
 // ---------------------------------------------------------------------------
 // Frame kinds
 // ---------------------------------------------------------------------------
 
 pub(crate) const KIND_SPAWN_ENTITIES: u8 = 1;
-pub(crate) const KIND_ENTITIES_SPAWNED: u8 = 2;
-pub(crate) const KIND_MOVE_ENTITIES: u8 = 3;
-pub(crate) const KIND_DESPAWN_ENTITIES: u8 = 5;
-pub(crate) const KIND_KEEPALIVE: u8 = 6;
+pub(crate) const KIND_MOVE_ENTITIES: u8 = 2;
+pub(crate) const KIND_DESPAWN_ENTITIES: u8 = 3;
+pub(crate) const KIND_KEEPALIVE: u8 = 4;
 
 /// Names a frame kind for an error message, without echoing the peer's bytes.
 pub(crate) fn kind_name(kind: u8) -> &'static str {
     match kind {
         KIND_SPAWN_ENTITIES => "spawn entities",
-        KIND_ENTITIES_SPAWNED => "entities spawned",
         KIND_MOVE_ENTITIES => "move entities",
         KIND_DESPAWN_ENTITIES => "despawn entities",
         KIND_KEEPALIVE => "keepalive",
@@ -46,7 +43,7 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
 ///
 /// Assigned by the control plane, which is not built. Until then a consumer
 /// picks one and passes it to
-/// [`RegionServer::bind`](crate::net::RegionServer::bind).
+/// [`RegionServer::new`](crate::net::RegionServer::new).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RegionId(u32);
@@ -299,13 +296,9 @@ impl ServerInfo {
 /// large spawn or move batch arrive as several messages rather than one.
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 
-/// Bytes one spawn request takes: three raw [`Fixed`](crate::Fixed) axes, and
-/// what kind of thing is being spawned.
-const SPAWN_BYTES: usize = 13;
-
-/// Bytes one spawned entity takes in the reply: its id, and the viewer
-/// watching it.
-const SPAWNED_BYTES: usize = 8;
+/// Bytes one spawn request takes: three raw [`Fixed`](crate::Fixed) axes, what
+/// kind of thing is being spawned, and the caller's token.
+const SPAWN_BYTES: usize = 21;
 
 /// Bytes one move takes: an id, and three raw [`Fixed`](crate::Fixed) axes.
 ///
@@ -316,8 +309,8 @@ const SPAWNED_BYTES: usize = 8;
 /// error on every round trip through the region.
 const MOVE_BYTES: usize = 16;
 
-/// Most entities one [`SpawnEntities`] may ask for, so its reply fits one
-/// message. The five bytes are the kind and the count.
+/// Most entities one [`SpawnEntities`] may ask for. The five bytes are the kind
+/// and the count.
 ///
 /// An edge wanting more sends more messages. The cap bounds the buffer a
 /// decoder allocates for a claimed count, so it does not move to suit a
@@ -326,13 +319,6 @@ pub const MAX_SPAWN_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / SPAWN_BYTES;
 
 /// Most moves one [`MoveEntities`] may carry. Same bargain.
 pub const MAX_MOVES_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / MOVE_BYTES;
-
-/// A full spawn request's reply has to fit a frame too, or the region could
-/// accept a request it cannot answer.
-const _: () = assert!(
-    5 + MAX_SPAWN_PER_MESSAGE * SPAWNED_BYTES <= MAX_MESSAGE_BYTES,
-    "a reply to a full spawn request does not fit a frame"
-);
 
 /// Most entities one [`DespawnEntities`] may give up. Same bargain.
 pub const MAX_DESPAWN_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / 4;
@@ -393,11 +379,25 @@ impl fmt::Display for EntityKind {
     }
 }
 
-/// Asks the region to create entities this edge will manage, at these
-/// positions.
+/// One entity an edge is asking for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spawn {
+    pub position: Pos3,
+    pub kind: EntityKind,
+    /// Opaque to the region, echoed back on the presence message that reports
+    /// the entity. It exists because a presence subject says which edge owns an
+    /// entity and nothing more: an edge that asked for three avatars in one
+    /// message has no other way to tell which arrival belongs to which of its
+    /// game clients. In practice it is the handle the edge already holds for
+    /// that client. See `docs/adr/0004`.
+    pub token: u64,
+}
+
+/// Asks the region to create entities this edge will manage.
 ///
 /// The region allocates the ids, since entity identity is its to hand out, and
-/// records the asking edge as their owner in the same step.
+/// records the asking edge as their owner in the same step. The ids come back
+/// as presence, not as a reply.
 ///
 /// Positions travel with the request rather than the edge spawning at a default
 /// and moving afterward. A crowd that appears at one point and scatters on the
@@ -406,22 +406,40 @@ impl fmt::Display for EntityKind {
 /// [`max_horizontal_speed`](crate::WorldConfig::max_horizontal_speed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnEntities {
-    pub spawns: Vec<(Pos3, EntityKind)>,
+    pub spawns: Vec<Spawn>,
 }
 
 impl SpawnEntities {
-    /// Every entity an observer, which is what a crowd of players is.
+    /// Every entity an observer, which is what a crowd of players is. Each is
+    /// tokened with its index in `positions`, which is enough to match up one
+    /// batch and no use across two.
     pub fn observers(positions: &[Pos3]) -> SpawnEntities {
         SpawnEntities {
-            spawns: positions.iter().map(|p| (*p, EntityKind::Observer)).collect(),
+            spawns: positions
+                .iter()
+                .enumerate()
+                .map(|(n, p)| Spawn {
+                    position: *p,
+                    kind: EntityKind::Observer,
+                    token: n as u64,
+                })
+                .collect(),
         }
     }
 
     /// Every entity unattended, which is what a flight of projectiles or a
-    /// herd of wildlife is.
+    /// herd of wildlife is. Tokened like [`observers`](Self::observers).
     pub fn unattended(positions: &[Pos3]) -> SpawnEntities {
         SpawnEntities {
-            spawns: positions.iter().map(|p| (*p, EntityKind::Unattended)).collect(),
+            spawns: positions
+                .iter()
+                .enumerate()
+                .map(|(n, p)| Spawn {
+                    position: *p,
+                    kind: EntityKind::Unattended,
+                    token: n as u64,
+                })
+                .collect(),
         }
     }
 
@@ -429,11 +447,12 @@ impl SpawnEntities {
         out.clear();
         out.push(KIND_SPAWN_ENTITIES);
         out.extend_from_slice(&(self.spawns.len() as u32).to_le_bytes());
-        for (pos, kind) in &self.spawns {
-            out.extend_from_slice(&pos.x.raw().to_le_bytes());
-            out.extend_from_slice(&pos.y.raw().to_le_bytes());
-            out.extend_from_slice(&pos.z.raw().to_le_bytes());
-            out.push(kind.as_u8());
+        for s in &self.spawns {
+            out.extend_from_slice(&s.position.x.raw().to_le_bytes());
+            out.extend_from_slice(&s.position.y.raw().to_le_bytes());
+            out.extend_from_slice(&s.position.z.raw().to_le_bytes());
+            out.push(s.kind.as_u8());
+            out.extend_from_slice(&s.token.to_le_bytes());
         }
     }
 
@@ -445,66 +464,67 @@ impl SpawnEntities {
         }
         let mut spawns = Vec::with_capacity(len);
         for _ in 0..len {
-            let pos = Pos3::new(
+            let position = Pos3::new(
                 crate::Fixed::from_raw(c.i32()?),
                 crate::Fixed::from_raw(c.i32()?),
                 crate::Fixed::from_raw(c.i32()?),
             );
-            let kind = EntityKind::from_u8(c.u8()?)
-                .ok_or(NetError::Malformed("spawn entity kind"))?;
-            spawns.push((pos, kind));
+            let kind =
+                EntityKind::from_u8(c.u8()?).ok_or(NetError::Malformed("spawn entity kind"))?;
+            spawns.push(Spawn { position, kind, token: c.u64()? });
         }
         c.finish()?;
         Ok(SpawnEntities { spawns })
     }
 }
 
-/// The entities created, in the order they were asked for, and the viewer
-/// watching each one where there is a viewer at all.
+/// An entity appearing in or leaving a region.
 ///
-/// An unattended entity has no viewer, and its slot carries `None`. An
-/// observer's viewer id
-/// travels because it is what arrives on a [`PositionUpdates`], and the edge
-/// has no way to work out that pairing for itself.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntitiesSpawned {
-    pub entities: Vec<(EntityId, Option<ViewerId>)>,
+/// Published on the presence subject of the edge that owns it, whatever caused
+/// the change: an edge asking, the consumer's game despawning, or an edge being
+/// expired and its entities orphaned. An edge that only ever hears about what it
+/// asked for cannot know when something it owns has gone. See `docs/adr/0004`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// Now exists and is managed by the edge this was published for. `token`
+    /// is what that edge sent on the [`Spawn`] that asked for it.
+    Added { entity: EntityId, token: u64 },
+    /// No longer exists.
+    Removed { entity: EntityId },
 }
 
-/// No viewer watches this entity. Viewer ids are dense from zero, so the top of
-/// the range is free to reserve.
-const NO_VIEWER: u32 = u32::MAX;
+impl Presence {
+    pub const BYTES: usize = 13;
 
-impl EntitiesSpawned {
-    /// The observers among them, which is what an edge tracks for routing.
-    pub fn observers(&self) -> impl Iterator<Item = (EntityId, ViewerId)> + '_ {
-        self.entities.iter().filter_map(|(id, v)| v.map(|v| (*id, v)))
-    }
+    const ADDED: u8 = 1;
+    const REMOVED: u8 = 2;
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
-        out.push(KIND_ENTITIES_SPAWNED);
-        out.extend_from_slice(&(self.entities.len() as u32).to_le_bytes());
-        for (entity, viewer) in &self.entities {
-            out.extend_from_slice(&entity.raw().to_le_bytes());
-            out.extend_from_slice(&viewer.map_or(NO_VIEWER, ViewerId::raw).to_le_bytes());
+        match self {
+            Presence::Added { entity, token } => {
+                out.push(Presence::ADDED);
+                out.extend_from_slice(&entity.raw().to_le_bytes());
+                out.extend_from_slice(&token.to_le_bytes());
+            }
+            Presence::Removed { entity } => {
+                out.push(Presence::REMOVED);
+                out.extend_from_slice(&entity.raw().to_le_bytes());
+            }
         }
     }
 
-    pub(crate) fn decode(body: &[u8]) -> Result<EntitiesSpawned, NetError> {
-        let mut c = Cursor::new(body, "entities spawned");
-        let len = c.u32()? as usize;
-        if len > MAX_SPAWN_PER_MESSAGE {
-            return Err(NetError::Malformed("entities spawned count"));
-        }
-        let mut entities = Vec::with_capacity(len);
-        for _ in 0..len {
-            let entity = EntityId::from_raw(c.u32()?);
-            let raw = c.u32()?;
-            entities.push((entity, (raw != NO_VIEWER).then(|| ViewerId::from_raw(raw))));
-        }
+    pub fn decode(body: &[u8]) -> Result<Presence, NetError> {
+        let mut c = Cursor::new(body, "presence");
+        let what = c.u8()?;
+        let entity = EntityId::from_raw(c.u32()?);
+        let got = match what {
+            Presence::ADDED => Presence::Added { entity, token: c.u64()? },
+            Presence::REMOVED => Presence::Removed { entity },
+            _ => return Err(NetError::Malformed("presence kind")),
+        };
         c.finish()?;
-        Ok(EntitiesSpawned { entities })
+        Ok(got)
     }
 }
 
@@ -701,12 +721,16 @@ mod tests {
         EntityId::from_raw(n)
     }
 
+    fn want(x: i32, kind: EntityKind, token: u64) -> Spawn {
+        Spawn { position: Pos3::from_meters(x, 2, 3), kind, token }
+    }
+
     #[test]
     fn a_spawn_request_round_trips() {
         let m = SpawnEntities {
             spawns: vec![
-                (Pos3::from_meters(1, 2, 3), EntityKind::Observer),
-                (Pos3::from_meters(4095, 4095, 1023), EntityKind::Unattended),
+                want(1, EntityKind::Observer, 0xDEAD_BEEF_CAFE_F00D),
+                want(4095, EntityKind::Unattended, 0),
             ],
         };
         let mut buf = Vec::new();
@@ -717,8 +741,8 @@ mod tests {
     #[test]
     fn a_spawn_request_says_what_observes() {
         let at = [Pos3::from_meters(1, 1, 0), Pos3::from_meters(2, 2, 0)];
-        assert!(SpawnEntities::observers(&at).spawns.iter().all(|(_, k)| k.observes()));
-        assert!(SpawnEntities::unattended(&at).spawns.iter().all(|(_, k)| !k.observes()));
+        assert!(SpawnEntities::observers(&at).spawns.iter().all(|s| s.kind.observes()));
+        assert!(SpawnEntities::unattended(&at).spawns.iter().all(|s| !s.kind.observes()));
     }
 
     #[test]
@@ -727,6 +751,7 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&[0u8; 12]);
         buf.push(9);
+        buf.extend_from_slice(&0u64.to_le_bytes());
         assert!(matches!(
             SpawnEntities::decode(&buf),
             Err(NetError::Malformed("spawn entity kind"))
@@ -754,41 +779,11 @@ mod tests {
     #[test]
     fn a_full_spawn_request_fits_one_message() {
         let m = SpawnEntities {
-            spawns: vec![(Pos3::ZERO, EntityKind::Observer); MAX_SPAWN_PER_MESSAGE],
+            spawns: vec![want(0, EntityKind::Observer, 7); MAX_SPAWN_PER_MESSAGE],
         };
         let mut buf = Vec::new();
         m.encode(&mut buf);
         assert!(buf.len() <= MAX_MESSAGE_BYTES, "{} bytes is past the cap", buf.len());
-    }
-
-    #[test]
-    fn a_spawn_reply_round_trips() {
-        let m = EntitiesSpawned {
-            entities: vec![
-                (ent(0), Some(ViewerId::from_raw(0))),
-                (ent(41), None),
-                (ent(42), Some(ViewerId::from_raw(7))),
-            ],
-        };
-        let mut buf = Vec::new();
-        m.encode(&mut buf);
-        assert_eq!(EntitiesSpawned::decode(&buf[1..]).expect("well formed"), m);
-    }
-
-    #[test]
-    fn a_spawn_reply_names_only_the_observers_as_watchable() {
-        let m = EntitiesSpawned {
-            entities: vec![
-                (ent(0), Some(ViewerId::from_raw(0))),
-                (ent(41), None),
-                (ent(42), Some(ViewerId::from_raw(7))),
-            ],
-        };
-        assert_eq!(
-            m.observers().collect::<Vec<_>>(),
-            vec![(ent(0), ViewerId::from_raw(0)), (ent(42), ViewerId::from_raw(7))],
-            "an unattended entity has no viewer to route to"
-        );
     }
 
     #[test]
@@ -861,10 +856,39 @@ mod tests {
     }
 
     #[test]
+    fn presence_round_trips_in_both_directions() {
+        for m in [
+            Presence::Added { entity: ent(41), token: 0x0123_4567_89AB_CDEF },
+            Presence::Added { entity: ent(41), token: 0 },
+            Presence::Removed { entity: ent(9) },
+        ] {
+            let mut buf = Vec::new();
+            m.encode(&mut buf);
+            assert!(buf.len() <= Presence::BYTES);
+            assert_eq!(Presence::decode(&buf).expect("well formed"), m);
+        }
+    }
+
+    #[test]
+    fn an_unknown_presence_kind_is_refused() {
+        let mut buf = vec![9u8];
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(Presence::decode(&buf), Err(NetError::Malformed("presence kind"))));
+    }
+
+    #[test]
+    fn a_truncated_presence_is_refused() {
+        let mut buf = Vec::new();
+        Presence::Added { entity: ent(1), token: 2 }.encode(&mut buf);
+        for cut in 0..buf.len() {
+            assert!(Presence::decode(&buf[..cut]).is_err(), "{cut} bytes must not parse");
+        }
+    }
+
+    #[test]
     fn every_kind_has_a_name() {
         for kind in [
             KIND_SPAWN_ENTITIES,
-            KIND_ENTITIES_SPAWNED,
             KIND_MOVE_ENTITIES,
             KIND_DESPAWN_ENTITIES,
             KIND_KEEPALIVE,

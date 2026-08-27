@@ -72,8 +72,8 @@ pub use control::{Heartbeat, RegionLoad};
 pub use error::NetError;
 pub use region::{
     Applied, ClaimError, DespawnEntities, EdgeId, EdgeName, EdgeSink, EdgeView,
-    Edges, EntitiesSpawned, EntityKind, Incoming, Inbound, MAX_DESPAWN_PER_MESSAGE,
+    Edges, EntityKind, Incoming, Inbound, MAX_DESPAWN_PER_MESSAGE,
     MAX_MESSAGE_BYTES, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, Offer,
-    PROTOCOL_VERSION, ProtocolVersion, RegionClient, RegionId, RegionServer,
+    PROTOCOL_VERSION, Presence, ProtocolVersion, RegionClient, RegionId, RegionServer, Spawn,
     ServerInfo, ServerVersion, Settled, SpawnEntities, WorldParams, subjects,
 };

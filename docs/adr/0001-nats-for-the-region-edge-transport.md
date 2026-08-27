@@ -2,7 +2,7 @@
 
 Status: Accepted, 2026-08-27. Supersedes the TCP transport in `net::region`.
 The subject scheme below is itself superseded by `docs/adr/0004`, which drops
-the reply subject, adds a region-wide events subject, and addresses payloads by
+the reply subject, adds a per-edge presence subject, and addresses payloads by
 entity.
 
 ## Context

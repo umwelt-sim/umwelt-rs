@@ -9,7 +9,7 @@
 //! Inbound work cannot all happen in one place, because the two things it needs
 //! are available at different moments.
 //!
-//! - [`Inbound::serve`] runs on the edge's own thread and only queues. It never
+//! - [`Inbound::accept`] runs on the reader task and only queues. It never
 //!   touches the simulation, because the simulation is mid-tick as often as not.
 //! - [`Inbound::apply`] runs inside [`Game::step`], which is the only place a
 //!   [`Step`] exists, so it is the only place an entity can be spawned,
@@ -33,7 +33,6 @@
 //! Ids are unique within one region. An edge relaying for several regions sees
 //! the same numbers from each and has to key by `(RegionId, EntityId)`.
 
-use std::cmp::Ordering as Ordering2;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -43,9 +42,8 @@ use crate::entity::EntityId;
 use crate::net::error::NetError;
 use crate::net::region::edges::{EdgeId, EdgeStats, Edges};
 use crate::net::region::protocol::{
-    RegionId,
-    DespawnEntities, EntitiesSpawned, EntityKind, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE,
-    KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MAX_SPAWN_PER_MESSAGE, MoveEntities, SpawnEntities,
+    DespawnEntities, EntityKind, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE, KIND_MOVE_ENTITIES,
+    KIND_SPAWN_ENTITIES, MoveEntities, Presence, RegionId, Spawn, SpawnEntities,
 };
 use crate::net::region::subjects;
 use crate::pos::Pos3;
@@ -62,7 +60,7 @@ const NO_AVATAR: u32 = u32::MAX;
 /// What an edge asked the region to do.
 #[derive(Clone, Debug)]
 enum Command {
-    Spawn { edge: EdgeId, spawns: Vec<(Pos3, EntityKind)> },
+    Spawn { edge: EdgeId, spawns: Vec<Spawn> },
     Move { edge: EdgeId, moves: Vec<(EntityId, Pos3)> },
     Despawn { edge: EdgeId, ids: Vec<EntityId> },
 }
@@ -85,8 +83,8 @@ pub struct Applied {
 pub struct Settled {
     pub registered: u32,
     pub unregistered: u32,
-    /// [`EntitiesSpawned`] messages sent back.
-    pub replies: u32,
+    /// Presence messages published, additions and removals together.
+    pub reported: u32,
 }
 
 /// Commands from every edge, and the bookkeeping that outlives one tick.
@@ -96,7 +94,7 @@ pub struct Inbound {
     queue: Mutex<Vec<Command>>,
     /// Spawned during the last apply, waiting to be answered for. An observer
     /// also gets a viewer; an unattended entity is only reported back.
-    fresh: Mutex<Vec<(EdgeId, EntityId, EntityKind)>>,
+    fresh: Mutex<Vec<(EdgeId, EntityId, EntityKind, u64)>>,
     /// Despawned during the last apply, waiting for its viewer to be dropped.
     /// `None` for an entity orphaned by its edge detaching, since that edge's
     /// counters have already gone with it.
@@ -194,7 +192,7 @@ impl Inbound {
         let mut out = Applied::default();
         // Collected here and handed over once. Locking per entity would take a
         // mutex several hundred times for one spawn message.
-        let mut fresh: Vec<(EdgeId, EntityId, EntityKind)> = Vec::new();
+        let mut fresh: Vec<(EdgeId, EntityId, EntityKind, u64)> = Vec::new();
         let mut gone: Vec<(Option<EdgeId>, EntityId)> = Vec::new();
 
         // Orphans first, so a stale command later in this same batch cannot
@@ -215,19 +213,19 @@ impl Inbound {
             match command {
                 Command::Spawn { edge, spawns } => {
                     let stats = self.edges.stats(edge);
-                    for (pos, kind) in spawns {
-                        if !cfg.contains(pos) {
+                    for want in spawns {
+                        if !cfg.contains(want.position) {
                             refuse(&mut out, &stats);
                             continue;
                         }
-                        let id = step.spawn(pos);
+                        let id = step.spawn(want.position);
                         if self.edges.claim(edge, id).is_err() {
-                            // The edge detached between sending and now.
+                            // The edge went away between sending and now.
                             step.despawn(id);
                             refuse(&mut out, &stats);
                             continue;
                         }
-                        fresh.push((edge, id, kind));
+                        fresh.push((edge, id, want.kind, want.token));
                         out.spawned += 1;
                     }
                 }
@@ -238,6 +236,8 @@ impl Inbound {
                             refuse(&mut out, &stats);
                             continue;
                         }
+                        // Released first, so the reconciliation in `settle`
+                        // sees no owner and does not report this twice.
                         self.edges.release(id);
                         step.despawn(id);
                         gone.push((Some(edge), id));
@@ -294,61 +294,70 @@ impl Inbound {
 
         // Teardown first. Viewer ids are reusable, so registering before
         // dropping could hand out an id this batch then clears.
-        //
-        // Both loops group their work by edge, so each edge's counter is
-        // touched once rather than once per entity.
-        let mut per_edge: Vec<Pending> = Vec::new();
-
         for (edge, id) in gone {
-            let Some(viewer) = self.take_watcher(id) else { continue };
-            sim.unregister_viewer(viewer);
-            sink.unbind(viewer);
-            if let Some(edge) = edge {
-                let at = group(&mut per_edge, edge);
-                per_edge[at].1 -= 1;
-            }
-            out.unregistered += 1;
+            self.retire(sim, sink, edge, id, &mut out);
         }
 
-        for (edge, id, kind) in fresh {
+        // A despawn the game performed reaches nothing else: `apply` knows only
+        // the ones it did itself. Left alone the ownership record would outlive
+        // the entity, its viewer would never be dropped, and the edge would go
+        // on sending moves that are refused for as long as it ran.
+        //
+        // An entity `apply` despawned is released before it is despawned, so it
+        // has no owner here and is not reported twice.
+        for id in sim.despawned().to_vec() {
+            let Some(edge) = self.edges.edge_for(id) else { continue };
+            self.edges.release(id);
+            self.retire(sim, sink, Some(edge), id, &mut out);
+        }
+
+        for (edge, id, kind, token) in fresh {
             // Only an observer costs a viewer. An unattended entity is
             // replicated to whoever can see it and receives nothing itself, so
             // it never enters the per-viewer pipeline at all.
-            let viewer = kind.observes().then(|| {
+            if kind.observes() {
                 let viewer = sim.register_viewer(id, limits);
                 sink.bind(viewer, id);
                 self.set_watcher(id, viewer);
+                if let Some(stats) = self.edges.stats(edge) {
+                    stats.observers.fetch_add(1, Ordering::Relaxed);
+                }
                 out.registered += 1;
-                viewer
-            });
-            let at = group(&mut per_edge, edge);
-            per_edge[at].1 += i32::from(viewer.is_some());
-            per_edge[at].2.push((id, viewer));
+            }
+            let added = Presence::Added { entity: id, token };
+            if sink.presence(edge, added).is_ok() {
+                out.reported += 1;
+            }
         }
 
-        let replies = per_edge;
-        let mut body = Vec::new();
-        for (edge, observers, list) in replies {
-            if let Some(stats) = self.edges.stats(edge) {
-                match observers.cmp(&0) {
-                    Ordering2::Greater => {
-                        stats.observers.fetch_add(observers as usize, Ordering::Relaxed);
-                    }
-                    Ordering2::Less => {
-                        stats.observers.fetch_sub(observers.unsigned_abs() as usize, Ordering::Relaxed);
-                    }
-                    Ordering2::Equal => {}
-                }
-            }
-            for chunk in list.chunks(MAX_SPAWN_PER_MESSAGE) {
-                EntitiesSpawned { entities: chunk.to_vec() }.encode(&mut body);
-                // An edge that went away mid-tick is already being torn down.
-                if sink.reply(edge, &body).is_ok() {
-                    out.replies += 1;
-                }
-            }
-        }
         out
+    }
+
+    /// Drops one entity's viewer and tells its edge the entity is gone.
+    ///
+    /// `edge` is `None` for an orphan, whose edge has already detached and so
+    /// has nothing left to tell and no counters left to adjust.
+    fn retire<G: Game, S: PayloadSink>(
+        &self,
+        sim: &mut WorldSimulation<G, S>,
+        sink: &EdgeSink,
+        edge: Option<EdgeId>,
+        id: EntityId,
+        out: &mut Settled,
+    ) {
+        if let Some(viewer) = self.take_watcher(id) {
+            sim.unregister_viewer(viewer);
+            sink.unbind(viewer);
+            if let Some(stats) = edge.and_then(|e| self.edges.stats(e)) {
+                stats.observers.fetch_sub(1, Ordering::Relaxed);
+            }
+            out.unregistered += 1;
+        }
+        if let Some(edge) = edge
+            && sink.presence(edge, Presence::Removed { entity: id }).is_ok()
+        {
+            out.reported += 1;
+        }
     }
 
     fn set_watcher(&self, entity: EntityId, viewer: ViewerId) {
@@ -364,22 +373,6 @@ impl Inbound {
         let slot = watchers.get_mut(entity.index())?;
         let raw = std::mem::replace(slot, NO_WATCHER);
         (raw != NO_WATCHER).then(|| ViewerId::from_raw(raw))
-    }
-}
-
-/// One edge's share of a settle: how its observer count moved, and the
-/// entities to report back with the viewer registered for each.
-type Pending = (EdgeId, i32, Vec<(EntityId, Option<ViewerId>)>);
-
-/// Index of `edge`'s row, appending one if it has none yet. Regions hold a
-/// handful of edges, so a scan beats a map.
-fn group(rows: &mut Vec<Pending>, edge: EdgeId) -> usize {
-    match rows.iter().position(|(at, _, _)| *at == edge) {
-        Some(at) => at,
-        None => {
-            rows.push((edge, 0, Vec::new()));
-            rows.len() - 1
-        }
     }
 }
 
@@ -413,9 +406,9 @@ struct SinkShared {
     /// Viewer index to avatar entity raw. A payload arrives named by its
     /// viewer, and the routing question is asked about an entity.
     avatars: RwLock<Vec<AtomicU32>>,
-    /// One subject per edge, rebuilt when the set changes. Formatting a subject
-    /// per payload would allocate half a million times a second; taking the
-    /// set's lock instead would serialize on it.
+    /// Two subjects per edge, rebuilt when the set changes. Formatting one per
+    /// payload would allocate half a million times a second; taking the set's
+    /// lock instead would serialize on it.
     subjects: RwLock<Cached>,
     sent: AtomicU64,
     undeliverable: AtomicU64,
@@ -425,8 +418,8 @@ struct SinkShared {
 #[derive(Default)]
 struct Cached {
     generation: u64,
-    payload: Vec<Option<async_nats::Subject>>,
-    reply: Vec<Option<async_nats::Subject>>,
+    state: Vec<Option<async_nats::Subject>>,
+    presence: Vec<Option<async_nats::Subject>>,
 }
 
 impl EdgeSink {
@@ -484,11 +477,13 @@ impl EdgeSink {
         self.shared.failed.load(Ordering::Relaxed)
     }
 
-    /// Answers one edge's command, on its reply subject.
-    pub(crate) fn reply(&self, edge: EdgeId, body: &[u8]) -> Result<(), NetError> {
+    /// Reports one entity appearing or leaving, on the owning edge's presence
+    /// subject.
+    pub(crate) fn presence(&self, edge: EdgeId, what: Presence) -> Result<(), NetError> {
         let Some(subject) = self.subject(edge, false) else { return Err(NetError::BadSubject) };
-        let bytes = bytes::Bytes::copy_from_slice(body);
-        self.shared.runtime.block_on(self.shared.client.publish(subject, bytes))?;
+        let mut body = Vec::with_capacity(Presence::BYTES);
+        what.encode(&mut body);
+        self.shared.runtime.block_on(self.shared.client.publish(subject, body.into()))?;
         Ok(())
     }
 
@@ -501,31 +496,31 @@ impl EdgeSink {
     }
 
     /// One edge's subject, rebuilding the table if the set has changed since it
-    /// was built.
-    fn subject(&self, edge: EdgeId, payload: bool) -> Option<async_nats::Subject> {
+    /// was built. `state` picks which of the two.
+    fn subject(&self, edge: EdgeId, state: bool) -> Option<async_nats::Subject> {
         let generation = self.shared.edges.generation();
         {
             let cached = self.shared.subjects.read().expect("not poisoned");
             if cached.generation == generation {
-                let table = if payload { &cached.payload } else { &cached.reply };
+                let table = if state { &cached.state } else { &cached.presence };
                 return table.get(edge.index()).cloned().flatten();
             }
         }
         let mut cached = self.shared.subjects.write().expect("not poisoned");
-        cached.payload.clear();
-        cached.reply.clear();
+        cached.state.clear();
+        cached.presence.clear();
         for view in self.shared.edges.view() {
             let at = view.id.index();
-            if cached.payload.len() <= at {
-                cached.payload.resize(at + 1, None);
-                cached.reply.resize(at + 1, None);
+            if cached.state.len() <= at {
+                cached.state.resize(at + 1, None);
+                cached.presence.resize(at + 1, None);
             }
-            cached.payload[at] =
-                Some(subjects::payload(self.shared.region, &view.name).into());
-            cached.reply[at] = Some(subjects::reply(self.shared.region, &view.name).into());
+            cached.state[at] = Some(subjects::state(self.shared.region, &view.name).into());
+            cached.presence[at] =
+                Some(subjects::presence(self.shared.region, &view.name).into());
         }
         cached.generation = generation;
-        let table = if payload { &cached.payload } else { &cached.reply };
+        let table = if state { &cached.state } else { &cached.presence };
         table.get(edge.index()).cloned().flatten()
     }
 }
@@ -553,8 +548,10 @@ impl PayloadSink for EdgeSink {
             self.shared.undeliverable.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        // Addressed by the avatar, so an edge holds one map rather than two.
+        // ViewerId stays inside the region; see `docs/adr/0004`.
         let mut body = Vec::with_capacity(4 + payload.len());
-        body.extend_from_slice(&viewer.raw().to_le_bytes());
+        body.extend_from_slice(&avatar.raw().to_le_bytes());
         body.extend_from_slice(payload);
         let published = self
             .shared

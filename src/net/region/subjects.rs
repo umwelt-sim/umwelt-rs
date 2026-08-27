@@ -5,14 +5,16 @@
 //! | subject | direction |
 //! |---|---|
 //! | `umwelt.{region}.info` | request and reply |
-//! | `umwelt.{region}.edge.{edge}.payload` | region to edge |
-//! | `umwelt.{region}.edge.{edge}.reply` | region to edge |
+//! | `umwelt.{region}.edge.{edge}.state` | region to edge |
+//! | `umwelt.{region}.edge.{edge}.presence` | region to anyone |
 //! | `umwelt.{region}.edge.{edge}.command` | edge to region |
 //!
-//! An edge subscribes to `umwelt.*.edge.{edge}.payload` once and never again:
-//! payloads from a region it has never heard of match a subscription it already
+//! An edge subscribes to `umwelt.*.edge.{edge}.state` and `.presence` once and
+//! never again: a region it has never heard of matches subscriptions it already
 //! holds. That is why migrating an entity between regions costs the edge
-//! nothing. See `docs/adr/0001`.
+//! nothing. `{edge}` names the edge that *owns* an entity, not whoever is
+//! listening, so presence reaches one edge rather than all of them. See
+//! `docs/adr/0001` and `docs/adr/0004`.
 
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
@@ -22,12 +24,14 @@ pub fn info(region: RegionId) -> String {
     format!("umwelt.{}.info", region.raw())
 }
 
-pub fn payload(region: RegionId, edge: &EdgeName) -> String {
-    format!("umwelt.{}.edge.{edge}.payload", region.raw())
+/// One observer's assembled packet.
+pub fn state(region: RegionId, edge: &EdgeName) -> String {
+    format!("umwelt.{}.edge.{edge}.state", region.raw())
 }
 
-pub fn reply(region: RegionId, edge: &EdgeName) -> String {
-    format!("umwelt.{}.edge.{edge}.reply", region.raw())
+/// Entities appearing and leaving, for the edge that owns them.
+pub fn presence(region: RegionId, edge: &EdgeName) -> String {
+    format!("umwelt.{}.edge.{edge}.presence", region.raw())
 }
 
 pub fn command(region: RegionId, edge: &EdgeName) -> String {
@@ -52,10 +56,10 @@ pub fn sender(subject: &str) -> Result<EdgeName, NetError> {
     }
 }
 
-/// The region a payload or reply came from, read out of its subject.
+/// The region a state or presence message came from, read out of its subject.
 pub fn origin(subject: &str) -> Result<RegionId, NetError> {
     match subject.split('.').collect::<Vec<_>>()[..] {
-        ["umwelt", region, "edge", _, "payload" | "reply"] => {
+        ["umwelt", region, "edge", _, "state" | "presence"] => {
             region.parse().map(RegionId::from_raw).map_err(|_| NetError::BadSubject)
         }
         _ => Err(NetError::BadSubject),
@@ -74,19 +78,20 @@ mod tests {
     fn subjects_have_the_shape_the_wildcards_expect() {
         let r = RegionId::from_raw(7);
         assert_eq!(info(r), "umwelt.7.info");
-        assert_eq!(payload(r, &edge()), "umwelt.7.edge.edge-3.payload");
+        assert_eq!(state(r, &edge()), "umwelt.7.edge.edge-3.state");
+        assert_eq!(presence(r, &edge()), "umwelt.7.edge.edge-3.presence");
         assert_eq!(command(r, &edge()), "umwelt.7.edge.edge-3.command");
         assert_eq!(commands_to(r), "umwelt.7.edge.*.command");
-        assert_eq!(to_edge(&edge(), "payload"), "umwelt.*.edge.edge-3.payload");
+        assert_eq!(to_edge(&edge(), "state"), "umwelt.*.edge.edge-3.state");
     }
 
     #[test]
     fn an_edges_subscription_matches_every_region() {
         // The property the whole migration story rests on: one subscription,
         // taken at startup, matches regions that did not exist then.
-        let pattern = to_edge(&edge(), "payload");
+        let pattern = to_edge(&edge(), "state");
         for region in [1u32, 7, 4_000_000] {
-            let concrete = payload(RegionId::from_raw(region), &edge());
+            let concrete = state(RegionId::from_raw(region), &edge());
             let (p, c): (Vec<_>, Vec<_>) =
                 (pattern.split('.').collect(), concrete.split('.').collect());
             assert_eq!(p.len(), c.len());
@@ -97,16 +102,16 @@ mod tests {
     #[test]
     fn a_command_subject_names_its_sender() {
         assert_eq!(sender("umwelt.7.edge.edge-3.command").expect("parses").as_str(), "edge-3");
-        assert!(sender("umwelt.7.edge.edge-3.payload").is_err());
+        assert!(sender("umwelt.7.edge.edge-3.state").is_err());
         assert!(sender("umwelt.7.info").is_err());
         assert!(sender("nonsense").is_err());
     }
 
     #[test]
     fn a_payload_subject_names_its_region() {
-        assert_eq!(origin("umwelt.7.edge.e.payload").expect("parses"), RegionId::from_raw(7));
-        assert_eq!(origin("umwelt.12.edge.e.reply").expect("parses"), RegionId::from_raw(12));
-        assert!(origin("umwelt.seven.edge.e.payload").is_err());
+        assert_eq!(origin("umwelt.7.edge.e.state").expect("parses"), RegionId::from_raw(7));
+        assert_eq!(origin("umwelt.12.edge.e.presence").expect("parses"), RegionId::from_raw(12));
+        assert!(origin("umwelt.seven.edge.e.state").is_err());
         assert!(origin("umwelt.7.edge.e.command").is_err());
     }
 }

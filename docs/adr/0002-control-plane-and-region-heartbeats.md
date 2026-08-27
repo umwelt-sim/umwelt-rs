@@ -64,27 +64,22 @@ and nothing else on this page would show it.
 ### Authentication
 
 NATS accounts, with user JWTs and `.creds` files. The library accepts a client
-that was connected with whatever credentials the deployment chose, so account
-layout is not decided here.
+that was connected with whatever credentials the deployment chose, and that is
+the whole of its involvement. It enforces no authorization, assumes none, and
+describes no account layout: which principal may publish or subscribe where is
+the broker's to enforce and the operator's to decide.
 
-One property is worth naming, because a piece of the protocol depends on it.
+What the library owes an operator writing those rules is a complete list of the
+subjects each side touches. `docs/adr/0004` holds it.
+
+One consequence of that division, so nobody mistakes it for a guarantee.
 `RegionServer` reads the sending edge out of the subject a command arrived on
-and treats that as the sender's identity. That is convention unless the broker
-enforces it. Permissions along these lines are one way to make it true:
-
-| principal | may publish | may subscribe |
-|---|---|---|
-| region `{r}` | `umwelt.{r}.>`, `umwelt.control.region.{r}.heartbeat` | `umwelt.{r}.info`, `umwelt.{r}.edge.*.command` |
-| edge `{e}` | `umwelt.*.edge.{e}.command`, `umwelt.*.info` | `umwelt.*.edge.{e}.payload`, `umwelt.*.edge.{e}.reply` |
-| an operator | nothing | `umwelt.control.>` |
-
-With permissions of that shape, an edge cannot publish on another edge's command
-subject, so it cannot move another edge's entities even by trying. Under the
-bearer secret 0001 deleted, any edge holding the secret could have published
-anything.
-
-A single account, an account per tenant, leaf nodes for a remote site: all of
-those work, and which one is right is not something this record can know.
+and treats it as the sender's identity. Whether an edge can publish under
+another edge's name depends entirely on how the operator scoped credentials, and
+the library neither knows nor checks. What it does check is ownership: a command
+naming an entity the sending edge does not manage is refused, which keeps an
+edge's own stale ids from moving somebody else's entity. That is a consistency
+check, not an authorization one.
 
 ### What umwelt does and does not do
 

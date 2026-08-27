@@ -1,6 +1,9 @@
 # 0001 — NATS for the region-to-edge transport
 
 Status: Accepted, 2026-08-27. Supersedes the TCP transport in `net::region`.
+The subject scheme below is itself superseded by `docs/adr/0004`, which drops
+the reply subject, adds a region-wide events subject, and addresses payloads by
+entity.
 
 ## Context
 
@@ -100,7 +103,8 @@ long to wait for a region to answer, are parameters rather than constants.
 
 Authorization moves to NATS accounts, JWT and `.creds` files. That replaces
 `auth.rs`, whose bearer secret its own documentation describes as second lock
-rather than first.
+rather than first. `docs/adr/0002` scopes those permissions by role rather than
+by instance, and says what that does and does not enforce.
 
 The world parameters still have to reach the edge, since `RecordCodec` derives
 from them, so `ServerInfo` survives as the reply on `umwelt.{region}.info`. The

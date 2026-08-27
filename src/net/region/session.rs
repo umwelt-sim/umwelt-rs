@@ -182,10 +182,12 @@ impl Inbound {
 
     /// Applies what edges sent. Call from inside [`Game::step`].
     ///
-    /// Every command naming an entity is checked against who manages it, so an
-    /// edge cannot move or despawn another edge's entity. That check is what
-    /// stands between the edges, since entity ids are region-wide and an edge
-    /// can name any of them.
+    /// Every command naming an entity is checked against who manages it, and a
+    /// command for an entity the sender does not manage is counted and dropped.
+    /// That is a consistency check rather than an authorization one: it keeps an
+    /// edge's own stale ids, left over from a despawn or a migration, from
+    /// moving somebody else's entity. Who may publish what is the broker's,
+    /// and nothing here knows or asks.
     pub fn apply(&self, step: &mut Step<'_>) -> Applied {
         let cfg = *step.config();
         let commands = std::mem::take(&mut *self.queue.lock().expect("not poisoned"));

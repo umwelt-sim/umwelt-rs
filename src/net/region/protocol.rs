@@ -252,8 +252,8 @@ impl WorldParams {
 // Messages
 // ---------------------------------------------------------------------------
 
-/// Describes the server and the region it owns. Sent once an identification
-/// has authorized.
+/// Describes the server and the region it owns. The reply on the info
+/// subject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerInfo {
     /// What this region speaks. There is no handshake to check it in, so it
@@ -319,8 +319,9 @@ const MOVE_BYTES: usize = 16;
 /// Most entities one [`SpawnEntities`] may ask for, so its reply fits one
 /// message. The five bytes are the kind and the count.
 ///
-/// An edge wanting more sends more messages. The frame cap is what bounds an
-/// unauthorized peer's allocation, so it does not move to suit a caller.
+/// An edge wanting more sends more messages. The cap bounds the buffer a
+/// decoder allocates for a claimed count, so it does not move to suit a
+/// caller.
 pub const MAX_SPAWN_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / SPAWN_BYTES;
 
 /// Most moves one [`MoveEntities`] may carry. Same bargain.

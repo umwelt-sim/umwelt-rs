@@ -5,12 +5,11 @@
 //! separate modules and this one holds only what is genuinely common.
 //!
 //! **Region to edge** — [`region`], built, over NATS. A region simulation and
-//! the edges relaying for it. Few peers, mutually trusted, deployed together.
-//! See `docs/adr/0001`.
+//! the edges relaying for it: few peers, deployed together and updated
+//! together. See `docs/adr/0001`.
 //!
 //! **Edge to game client** — not built, and it will be its own module. Many
-//! peers, none of them trusted, deployed on someone else's machine and updated
-//! on their schedule. Game clients do not speak NATS. The payloads
+//! peers, running on someone else's machine and updated on their schedule. Game clients do not speak NATS. The payloads
 //! [`PacketWriter`](crate::PacketWriter) assembles belong to that link:
 //! latest-only, lossy, unordered, MTU-sized.
 //!

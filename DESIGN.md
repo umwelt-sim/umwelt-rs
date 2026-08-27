@@ -997,10 +997,12 @@ they do.
 
 ### The region link
 
-**Superseded in part by `docs/adr/0001`.** The link was a TCP connection this
-crate implemented: its own framing, its own handshake, and a bearer secret. It
-is NATS now, and that record holds the measurements and the reasoning. What
-follows is what survived the change.
+**Superseded in part by `docs/adr/0001` and `docs/adr/0004`.** The link was a
+TCP connection this crate implemented: its own framing, its own handshake, and a
+bearer secret. It is NATS now, 0001 holds the measurements and the reasoning,
+and 0004 revises the subjects: no reply subject, a region-wide events subject,
+and payloads addressed by entity rather than by viewer. What follows is what
+survived.
 
 `net` holds two protocols, and keeping them apart is what the module is for.
 

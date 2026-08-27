@@ -9,7 +9,7 @@ work lands. If a decision is reversed, a new record supersedes it and says so.
 | # | Decision | Status |
 |---|---|---|
 | [0001](0001-nats-for-the-region-edge-transport.md) | NATS for the region-to-edge transport | Accepted |
-| 0002 | Control plane and region heartbeats | Planned |
+| [0002](0002-control-plane-and-region-heartbeats.md) | Control plane and region heartbeats | Accepted, not built |
 | 0003 | Ad hoc entity migration between regions | Planned |
 
 ## Format

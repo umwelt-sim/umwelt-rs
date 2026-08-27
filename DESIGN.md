@@ -2694,17 +2694,20 @@ A standby simulation cannot be fed by the client stream. Two designs:
 - Avoid: `Arc<Mutex<World>>` in the tick path, a task per entity, channels in the
   fan-out path, any allocation inside a tick.
 - `io_uring` is a later step, after `sendmmsg` is measured as the bottleneck.
-- **`#[inline(always)]` was on 170 items and four of them earn it.** Measured by
-  downgrading and re-running the benchmarks back to back. The 164 public items
-  cost nothing measurable at plain `#[inline]`, which is the attribute a library
-  wants there anyway, since without it a downstream crate cannot inline a
-  non-generic function at all. Four private helpers do earn it: `gather::take`
-  is 9% of `gather/uniform`, `ghost::home` and `ghost::find` are 9% of
-  `ghost/seen/hot` together, and `config::axis_to_cell` is 2% of
-  `gather/uniform`. Each carries a comment saying so. The `axis_to_cell` figure
-  is the weakest of the three: it was taken in one direction only, and a later
-  run on a busier machine showed an 18% noise floor, so it is worth re-measuring
-  on a quiet machine before anyone relies on it.
+- **`#[inline(always)]` was on 170 items and three of them earn it.** Measured
+  by downgrading and re-running the benchmarks. The 167 others cost nothing
+  measurable at plain `#[inline]`, which is the attribute a library wants there
+  anyway, since without it a downstream crate cannot inline a non-generic
+  function at all. Three private helpers do earn it, and each carries a comment
+  saying so: `gather::take` is 9% of `gather/uniform`, and `ghost::home` with
+  `ghost::find` are 9% of `ghost/seen/hot` together.
+
+  **Measure the restore as well as the removal.** A fourth,
+  `config::axis_to_cell`, first measured at 2% and was kept on that basis. Run
+  again against a saved baseline it read +0.76% downgraded and +0.86% restored,
+  the same figure in both states, against a +0.15% floor from re-running
+  unchanged code. The machine was drifting upward across the runs and the
+  attribute did nothing. A one-directional measurement cannot tell those apart.
 - Debug builds do not inline the `Fixed` operators. `Cargo.toml` carries
   `[profile.dev] opt-level = 1` and `[profile.dev.package."*"] opt-level = 3`.
   The magnitude of the debug slowdown is unmeasured.

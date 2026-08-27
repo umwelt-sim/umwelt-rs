@@ -280,8 +280,7 @@ impl WorldConfig {
         CellCoord::new(self.axis_to_cell(pos.x), self.axis_to_cell(pos.y))
     }
 
-    // inline(always) rather than inline: downgrading costs 2% of gather/uniform.
-    #[inline(always)]
+    #[inline]
     fn axis_to_cell(&self, v: Fixed) -> u16 {
         let raw = v.raw().max(0) as u32;
         let idx = raw >> self.cell_shift;

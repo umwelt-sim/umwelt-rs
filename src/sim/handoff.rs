@@ -186,7 +186,7 @@ impl<S: PayloadSink + Send + Sync + 'static> Handoff<S> {
     /// The sink being fed. Payloads reach it from the I/O thread, not from a
     /// tick, so a reader must expect to be behind by up to one poll interval,
     /// which is a millisecond.
-    #[inline(always)]
+    #[inline]
     pub fn inner(&self) -> &S {
         &self.shared.inner
     }

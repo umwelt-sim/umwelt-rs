@@ -124,7 +124,7 @@ fn equal_without_short_circuit(a: &[u8], b: &[u8]) -> bool {
 pub struct AllowAll;
 
 impl Authorizer for AllowAll {
-    #[inline(always)]
+    #[inline]
     fn authorize(&self, _credential: &[u8]) -> Result<(), Denied> {
         Ok(())
     }

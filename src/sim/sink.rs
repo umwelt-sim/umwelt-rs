@@ -46,7 +46,7 @@ pub trait PayloadSink: Sync {
 pub struct NullSink;
 
 impl PayloadSink for NullSink {
-    #[inline(always)]
+    #[inline]
     fn send(&self, _viewer: ViewerId, _payload: &[u8]) {}
 }
 

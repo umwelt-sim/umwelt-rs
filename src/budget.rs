@@ -17,9 +17,11 @@ use crate::codec::RecordCodec;
 /// mandates as its minimum datagram size.
 pub const DEFAULT_PAYLOAD_BYTES: u16 = 1200;
 
-/// Sequence number, ack or ack bitfield, tick identifier, flags.
+/// Sequence number, acknowledgment and its bitfield, tick, and the two record
+/// counts.
 ///
-/// **A guess.** No packet format is designed.
+/// Matches [`PacketHeader::BYTES`](crate::PacketHeader::BYTES), which a test
+/// pins.
 pub const DEFAULT_HEADER_BYTES: u16 = 16;
 
 /// Held back for events, and only while events are pending.
@@ -82,22 +84,22 @@ impl PacketBudget {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn payload_bytes(&self) -> usize {
         self.payload_bytes as usize
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn header_bytes(&self) -> usize {
         self.header_bytes as usize
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn event_reserve_bytes(&self) -> usize {
         self.event_reserve_bytes as usize
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn record_bytes(&self) -> usize {
         self.record_bytes as usize
     }
@@ -121,13 +123,13 @@ impl PacketBudget {
     }
 
     /// The most records that can fit, with nothing queued.
-    #[inline(always)]
+    #[inline]
     pub fn max_slots(&self) -> usize {
         self.slots(0)
     }
 
     /// The fewest, under a backlog at or past the reserve.
-    #[inline(always)]
+    #[inline]
     pub fn min_slots(&self) -> usize {
         self.slots(self.event_reserve_bytes as usize)
     }

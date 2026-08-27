@@ -10,18 +10,18 @@ use core::fmt;
 pub struct EntityId(u32);
 
 impl EntityId {
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: u32) -> EntityId {
         EntityId(raw)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }
 
     /// The id as an array index.
-    #[inline(always)]
+    #[inline]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -86,18 +86,18 @@ impl LiveSet {
 
     /// Highest slot count seen, live or not. Matches the length of the position
     /// arrays.
-    #[inline(always)]
+    #[inline]
     pub fn slots(&self) -> usize {
         self.slots
     }
 
     /// How many slots currently hold a live entity.
-    #[inline(always)]
+    #[inline]
     pub fn live(&self) -> usize {
         self.live
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.live == 0
     }
@@ -113,7 +113,7 @@ impl LiveSet {
         LiveIter { words: &self.words, at: 0, current: self.words.first().copied().unwrap_or(0) }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn contains(&self, id: EntityId) -> bool {
         let i = id.index();
         if i >= self.slots {

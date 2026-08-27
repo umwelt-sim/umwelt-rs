@@ -271,7 +271,7 @@ impl WorldConfig {
     /// Requires `pos` to be within the region; check with [`Self::contains_2d`]
     /// if the caller cannot guarantee it. Out-of-range input is clamped in
     /// release builds and asserted in debug.
-    #[inline(always)]
+    #[inline]
     pub fn cell_of(&self, pos: Pos2) -> CellCoord {
         debug_assert!(
             self.contains_2d(pos),
@@ -280,6 +280,7 @@ impl WorldConfig {
         CellCoord::new(self.axis_to_cell(pos.x), self.axis_to_cell(pos.y))
     }
 
+    // inline(always) rather than inline: downgrading costs 2% of gather/uniform.
     #[inline(always)]
     fn axis_to_cell(&self, v: Fixed) -> u16 {
         let raw = v.raw().max(0) as u32;
@@ -288,7 +289,7 @@ impl WorldConfig {
     }
 
     /// Offset of a coordinate within its own cell.
-    #[inline(always)]
+    #[inline]
     pub const fn offset_in_cell(&self, v: Fixed) -> Fixed {
         Fixed::from_raw(v.raw() & self.cell_mask)
     }
@@ -298,13 +299,13 @@ impl WorldConfig {
     /// Row-major today. If cells are later ordered along a Hilbert curve for
     /// cross-node partitioning only this function changes, so treat [`CellId`]
     /// as opaque and do not assume `y * width + x` anywhere else.
-    #[inline(always)]
+    #[inline]
     pub const fn cell_id(&self, c: CellCoord) -> CellId {
         CellId::from_raw(c.y as u32 * self.cells_per_axis + c.x as u32)
     }
 
     /// Inverse of [`Self::cell_id`].
-    #[inline(always)]
+    #[inline]
     pub const fn cell_coord(&self, id: CellId) -> CellCoord {
         let raw = id.raw();
         CellCoord::new(
@@ -314,7 +315,7 @@ impl WorldConfig {
     }
 
     /// Whether a horizontal position lies inside the region.
-    #[inline(always)]
+    #[inline]
     pub const fn contains_2d(&self, pos: Pos2) -> bool {
         pos.x.raw() >= 0
             && pos.y.raw() >= 0
@@ -323,7 +324,7 @@ impl WorldConfig {
     }
 
     /// Whether a full position lies inside the region and vertical range.
-    #[inline(always)]
+    #[inline]
     pub const fn contains(&self, pos: Pos3) -> bool {
         self.contains_2d(pos.horizontal())
             && pos.z.raw() >= 0
@@ -332,28 +333,28 @@ impl WorldConfig {
 
     // -- wire -------------------------------------------------------------
 
-    #[inline(always)]
+    #[inline]
     pub const fn quantize_horizontal(&self, v: Fixed) -> u32 {
         (v.raw() as u32) >> self.horizontal_quant_shift
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn dequantize_horizontal(&self, wire: u32) -> Fixed {
         Fixed::from_raw((wire << self.horizontal_quant_shift) as i32)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn quantize_vertical(&self, v: Fixed) -> u32 {
         (v.raw() as u32) >> self.vertical_quant_shift
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn dequantize_vertical(&self, wire: u32) -> Fixed {
         Fixed::from_raw((wire << self.vertical_quant_shift) as i32)
     }
 
     /// Quantize a full position for the wire, as `(x, y, z)`.
-    #[inline(always)]
+    #[inline]
     pub const fn quantize_pos(&self, pos: Pos3) -> (u32, u32, u32) {
         (
             self.quantize_horizontal(pos.x),
@@ -364,7 +365,7 @@ impl WorldConfig {
 
     /// Inverse of [`Self::quantize_pos`], landing at the low edge of each
     /// quantization bucket.
-    #[inline(always)]
+    #[inline]
     pub const fn dequantize_pos(&self, x: u32, y: u32, z: u32) -> Pos3 {
         Pos3::new(
             self.dequantize_horizontal(x),

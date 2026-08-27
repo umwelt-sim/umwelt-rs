@@ -106,7 +106,7 @@ impl Weights {
 
     /// The weight one band carries. A table is data, so a caller sweeping one
     /// can report what it swept.
-    #[inline(always)]
+    #[inline]
     pub fn at(&self, band: usize) -> u32 {
         self.0[band] as u32
     }
@@ -162,19 +162,19 @@ pub struct Ranked {
 impl Ranked {
     /// Index into the [`DiscoveredEntities`] this selection was made from.
     /// Means nothing against any other list.
-    #[inline(always)]
+    #[inline]
     pub fn index(&self) -> usize {
         (self.at & !NEW_BIT) as usize
     }
 
     /// Whether the client holds no ghost of this entity yet, so the record is
     /// an introduction rather than an update.
-    #[inline(always)]
+    #[inline]
     pub fn is_new(&self) -> bool {
         self.at & NEW_BIT != 0
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn score(&self) -> u32 {
         self.score
     }
@@ -206,7 +206,7 @@ impl Selection {
     }
 
     /// The viewer's ghost set, ranked. Highest score first.
-    #[inline(always)]
+    #[inline]
     pub fn ranked(&self) -> &[Ranked] {
         &self.ranked
     }
@@ -215,13 +215,13 @@ impl Selection {
     ///
     /// Never includes an update that scored zero, since an entity whose client
     /// copy is already correct has nothing to send.
-    #[inline(always)]
+    #[inline]
     pub fn records(&self) -> &[Ranked] {
         &self.ranked[..self.sent]
     }
 
     /// Ghosts the client should drop.
-    #[inline(always)]
+    #[inline]
     pub fn departed(&self) -> &[EntityId] {
         &self.departed
     }
@@ -291,14 +291,12 @@ pub fn select(
 }
 
 /// `drift x weight(band)`, saturating.
-#[inline(always)]
 fn score_of(drift: u32, dist_sq: DistSq, w: &Weights) -> u32 {
     drift.saturating_mul(w.at(band_of(dist_sq)))
 }
 
 /// `| 1` guards `ilog2` against a viewer scoring its own entity at zero
 /// separation, which the gather does not exclude.
-#[inline(always)]
 fn band_of(dist_sq: DistSq) -> usize {
     (dist_sq.raw() | 1).ilog2() as usize
 }

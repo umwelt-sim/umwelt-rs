@@ -50,6 +50,8 @@ pub struct GhostTable {
 
 /// Fibonacci hash. The high bits of a multiplicative hash are the mixed ones,
 /// so they are shifted down rather than the low bits masked.
+// inline(always) rather than inline: downgrading home and find together
+// costs 9% of ghost/seen/hot.
 #[inline(always)]
 fn home(id: u32, bits: u32) -> usize {
     (id.wrapping_mul(0x9E37_79B1) >> (32 - bits)) as usize
@@ -70,30 +72,30 @@ impl GhostTable {
     }
 
     /// How many ghosts this client holds.
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Ghosts this table holds before it grows.
-    #[inline(always)]
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.slots.len() / 2
     }
 
     /// Allocated slots. Twice [`capacity`](Self::capacity).
-    #[inline(always)]
+    #[inline]
     pub fn slots(&self) -> usize {
         self.slots.len()
     }
 
     /// The mark for `id`, or `None` if the client holds no ghost of it.
-    #[inline(always)]
+    #[inline]
     pub fn mark(&self, id: EntityId) -> Option<u32> {
         if self.slots.is_empty() {
             return None;
@@ -189,6 +191,7 @@ impl GhostTable {
     /// `Ok` at the entry, `Err` at the empty slot it would occupy.
     ///
     /// Terminates because the table is never more than half full.
+    // inline(always) rather than inline: see the note on `home`.
     #[inline(always)]
     fn find(&self, id: u32) -> Result<usize, usize> {
         let bits = self.slots.len().trailing_zeros();

@@ -33,6 +33,7 @@
 //! Ids are unique within one region. An edge relaying for several regions sees
 //! the same numbers from each and has to key by `(RegionId, EntityId)`.
 
+use std::cmp::Ordering as Ordering2;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -48,11 +49,13 @@ use crate::net::region::wire::read_frame;
 use crate::pos::Pos3;
 use crate::sim::{ClientLimits, Game, PayloadSink, Step, ViewerId, WorldSimulation};
 
-/// No viewer watches this entity, and no avatar belongs to this viewer.
+/// No viewer watches this entity. Reserved in the entity-to-viewer map.
+const NO_WATCHER: u32 = u32::MAX;
+
+/// No avatar belongs to this viewer. Reserved in the viewer-to-entity map.
 ///
-/// Both maps below reserve the top of the range. Ids are dense from zero, so it
-/// is unreachable.
-const NONE: u32 = u32::MAX;
+/// Both ids are dense from zero, so the top of the range is unreachable.
+const NO_AVATAR: u32 = u32::MAX;
 
 /// What an edge asked the region to do.
 #[derive(Clone, Debug)]
@@ -66,8 +69,6 @@ enum Command {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Applied {
     pub spawned: u32,
-    /// Of those, the ones a viewer will be registered for.
-    pub observers: u32,
     pub moved: u32,
     pub despawned: u32,
     /// Despawned because the edge managing them detached.
@@ -128,17 +129,6 @@ impl Inbound {
         self.refused.load(Ordering::Relaxed)
     }
 
-    /// The viewer watching an entity, if one does.
-    ///
-    /// The simulation holds viewer to avatar; this is the direction back.
-    pub fn viewer_of(&self, entity: EntityId) -> Option<ViewerId> {
-        let watchers = self.watchers.lock().expect("not poisoned");
-        match watchers.get(entity.index()).copied() {
-            Some(raw) if raw != NONE => Some(ViewerId::from_raw(raw)),
-            _ => None,
-        }
-    }
-
     /// Reads from one edge until it closes, queueing what it sends.
     ///
     /// Blocks, so this is what [`RegionServer::run`](crate::net::RegionServer::run)
@@ -188,13 +178,17 @@ impl Inbound {
         let cfg = *step.config();
         let commands = std::mem::take(&mut *self.queue.lock().expect("not poisoned"));
         let mut out = Applied::default();
+        // Collected here and handed over once. Locking per entity would take a
+        // mutex several hundred times for one spawn message.
+        let mut fresh: Vec<(EdgeId, EntityId, EntityKind)> = Vec::new();
+        let mut gone: Vec<(Option<EdgeId>, EntityId)> = Vec::new();
 
         // Orphans first, so a stale command later in this same batch cannot
         // move an entity whose edge has already gone.
         for id in self.edges.take_detached() {
             if step.live().contains(id) {
                 step.despawn(id);
-                self.gone.lock().expect("not poisoned").push((None, id));
+                gone.push((None, id));
                 out.orphaned += 1;
             }
         }
@@ -219,9 +213,8 @@ impl Inbound {
                             refuse(&mut out, &stats);
                             continue;
                         }
-                        self.fresh.lock().expect("not poisoned").push((edge, id, kind));
+                        fresh.push((edge, id, kind));
                         out.spawned += 1;
-                        out.observers += u32::from(kind.observes());
                     }
                 }
                 Command::Despawn { edge, ids } => {
@@ -233,7 +226,7 @@ impl Inbound {
                         }
                         self.edges.release(id);
                         step.despawn(id);
-                        self.gone.lock().expect("not poisoned").push((Some(edge), id));
+                        gone.push((Some(edge), id));
                         out.despawned += 1;
                     }
                 }
@@ -261,6 +254,12 @@ impl Inbound {
             out.moved += 1;
         }
 
+        if !fresh.is_empty() {
+            self.fresh.lock().expect("not poisoned").append(&mut fresh);
+        }
+        if !gone.is_empty() {
+            self.gone.lock().expect("not poisoned").append(&mut gone);
+        }
         self.refused.fetch_add(out.refused as u64, Ordering::Relaxed);
         out
     }
@@ -281,17 +280,22 @@ impl Inbound {
 
         // Teardown first. Viewer ids are reusable, so registering before
         // dropping could hand out an id this batch then clears.
+        //
+        // Both loops group their work by edge, so each edge's counter is
+        // touched once rather than once per entity.
+        let mut per_edge: Vec<Pending> = Vec::new();
+
         for (edge, id) in gone {
             let Some(viewer) = self.take_watcher(id) else { continue };
             sim.unregister_viewer(viewer);
             sink.unbind(viewer);
-            if let Some(stats) = edge.and_then(|e| self.edges.stats(e)) {
-                stats.observers.fetch_sub(1, Ordering::Relaxed);
+            if let Some(edge) = edge {
+                let at = group(&mut per_edge, edge);
+                per_edge[at].1 -= 1;
             }
             out.unregistered += 1;
         }
 
-        let mut replies: Vec<(EdgeId, Vec<(EntityId, Option<ViewerId>)>)> = Vec::new();
         for (edge, id, kind) in fresh {
             // Only an observer costs a viewer. An unattended entity is
             // replicated to whoever can see it and receives nothing itself, so
@@ -300,20 +304,28 @@ impl Inbound {
                 let viewer = sim.register_viewer(id, limits);
                 sink.bind(viewer, id);
                 self.set_watcher(id, viewer);
-                if let Some(stats) = self.edges.stats(edge) {
-                    stats.observers.fetch_add(1, Ordering::Relaxed);
-                }
                 out.registered += 1;
                 viewer
             });
-            match replies.iter_mut().find(|(at, _)| *at == edge) {
-                Some((_, list)) => list.push((id, viewer)),
-                None => replies.push((edge, vec![(id, viewer)])),
-            }
+            let at = group(&mut per_edge, edge);
+            per_edge[at].1 += i32::from(viewer.is_some());
+            per_edge[at].2.push((id, viewer));
         }
 
+        let replies = per_edge;
         let mut body = Vec::new();
-        for (edge, list) in replies {
+        for (edge, observers, list) in replies {
+            if let Some(stats) = self.edges.stats(edge) {
+                match observers.cmp(&0) {
+                    Ordering2::Greater => {
+                        stats.observers.fetch_add(observers as usize, Ordering::Relaxed);
+                    }
+                    Ordering2::Less => {
+                        stats.observers.fetch_sub(observers.unsigned_abs() as usize, Ordering::Relaxed);
+                    }
+                    Ordering2::Equal => {}
+                }
+            }
             for chunk in list.chunks(MAX_SPAWN_PER_MESSAGE) {
                 EntitiesSpawned { entities: chunk.to_vec() }.encode(&mut body);
                 // An edge that went away mid-tick is already being torn down.
@@ -328,7 +340,7 @@ impl Inbound {
     fn set_watcher(&self, entity: EntityId, viewer: ViewerId) {
         let mut watchers = self.watchers.lock().expect("not poisoned");
         if watchers.len() <= entity.index() {
-            watchers.resize(entity.index() + 1, NONE);
+            watchers.resize(entity.index() + 1, NO_WATCHER);
         }
         watchers[entity.index()] = viewer.raw();
     }
@@ -336,8 +348,24 @@ impl Inbound {
     fn take_watcher(&self, entity: EntityId) -> Option<ViewerId> {
         let mut watchers = self.watchers.lock().expect("not poisoned");
         let slot = watchers.get_mut(entity.index())?;
-        let raw = std::mem::replace(slot, NONE);
-        (raw != NONE).then(|| ViewerId::from_raw(raw))
+        let raw = std::mem::replace(slot, NO_WATCHER);
+        (raw != NO_WATCHER).then(|| ViewerId::from_raw(raw))
+    }
+}
+
+/// One edge's share of a settle: how its observer count moved, and the
+/// entities to report back with the viewer registered for each.
+type Pending = (EdgeId, i32, Vec<(EntityId, Option<ViewerId>)>);
+
+/// Index of `edge`'s row, appending one if it has none yet. Regions hold a
+/// handful of edges, so a scan beats a map.
+fn group(rows: &mut Vec<Pending>, edge: EdgeId) -> usize {
+    match rows.iter().position(|(at, _, _)| *at == edge) {
+        Some(at) => at,
+        None => {
+            rows.push((edge, 0, Vec::new()));
+            rows.len() - 1
+        }
     }
 }
 
@@ -392,7 +420,7 @@ impl EdgeSink {
     pub fn bind(&self, viewer: ViewerId, avatar: EntityId) {
         let mut avatars = self.shared.avatars.write().expect("not poisoned");
         if avatars.len() <= viewer.index() {
-            avatars.resize_with(viewer.index() + 1, || AtomicU32::new(NONE));
+            avatars.resize_with(viewer.index() + 1, || AtomicU32::new(NO_AVATAR));
         }
         avatars[viewer.index()].store(avatar.raw(), Ordering::Relaxed);
     }
@@ -401,7 +429,7 @@ impl EdgeSink {
     pub fn unbind(&self, viewer: ViewerId) {
         let avatars = self.shared.avatars.read().expect("not poisoned");
         if let Some(slot) = avatars.get(viewer.index()) {
-            slot.store(NONE, Ordering::Relaxed);
+            slot.store(NO_AVATAR, Ordering::Relaxed);
         }
     }
 
@@ -424,7 +452,7 @@ impl EdgeSink {
     fn avatar_of(&self, viewer: ViewerId) -> Option<EntityId> {
         let avatars = self.shared.avatars.read().expect("not poisoned");
         match avatars.get(viewer.index()).map(|slot| slot.load(Ordering::Relaxed)) {
-            Some(raw) if raw != NONE => Some(EntityId::from_raw(raw)),
+            Some(raw) if raw != NO_AVATAR => Some(EntityId::from_raw(raw)),
             _ => None,
         }
     }
@@ -546,15 +574,14 @@ mod tests {
 
     #[test]
     fn the_watcher_map_is_the_direction_the_simulation_lacks() {
+        // Dropping a viewer when its entity despawns needs entity to viewer,
+        // and `WorldSimulation` only answers the other way.
         let inbound = Inbound::new(Arc::new(Edges::new()));
-        assert_eq!(inbound.viewer_of(ent(4)), None);
+        assert_eq!(inbound.take_watcher(ent(4)), None);
 
         inbound.set_watcher(ent(4), ViewerId::from_raw(9));
-        assert_eq!(inbound.viewer_of(ent(4)), Some(ViewerId::from_raw(9)));
-
         assert_eq!(inbound.take_watcher(ent(4)), Some(ViewerId::from_raw(9)));
-        assert_eq!(inbound.viewer_of(ent(4)), None, "taken once");
-        assert_eq!(inbound.take_watcher(ent(4)), None);
+        assert_eq!(inbound.take_watcher(ent(4)), None, "taken once");
     }
 
     #[test]

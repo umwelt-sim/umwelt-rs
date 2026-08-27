@@ -34,13 +34,11 @@ use crate::subscription::Subscription;
 
 /// Entities a viewer's client knows about: the nearest this many.
 ///
-/// Measured, against a 1,200-byte payload that holds 98 records. Below about
-/// 160 a client's packet does not fill, since only a ghost that moved consumes
-/// a slot: a cap of 64 sends 42 records of the 98 it paid for. Above 256 every
-/// ghost is refreshed less often and error grows in every distance band, while
-/// the tick cost stays linear in the cap. Quality is flat from 160 to 384, and
-/// this sits at the top of that with room for a denser crowd to still fill a
-/// packet. See §Quality harness in the design document.
+/// Below about 160 a client's packet does not fill, since only a ghost that
+/// moved consumes a slot. Above 256 every ghost is refreshed less often and
+/// error grows in every distance band. Quality is flat between the two, and
+/// this sits at the top of that range. The sweep behind those figures is
+/// §Quality harness in the design document.
 pub const DEFAULT_GHOST_CAP: usize = 256;
 
 /// Entities a viewer's gather examines before it stops.
@@ -54,12 +52,10 @@ pub const DEFAULT_WALK_CAP: usize = DEFAULT_GHOST_CAP;
 
 /// Ticks a ghost survives after leaving the ghost set.
 ///
-/// One tick, which absorbs a rank flapping across the edge of the set without
-/// keeping anything longer. Measured: against a viewer crossing a crowd at
-/// 30 m/s, one tick of grace is the least client-side error of any value swept,
-/// 1.4% fewer first sightings than no grace at all, and 1.5% more ghosts held.
-/// Every value above it trades error for churn at a worsening rate: 20 ticks
-/// costs 7% more error and holds 21% more ghosts to take 9% off the churn.
+/// One tick absorbs a rank flapping across the edge of the set without keeping
+/// anything longer, and gives the least client-side error of any value swept.
+/// Larger values trade error for churn at a worsening rate. The sweep is
+/// §Quality harness in the design document.
 ///
 /// A ghost is only aged when its viewer is served, so a grace below a client's
 /// [`send_period`](ClientLimits::send_period) behaves as zero.
@@ -83,30 +79,30 @@ pub struct Step<'a> {
 }
 
 impl Step<'_> {
-    #[inline(always)]
+    #[inline]
     pub fn tick(&self) -> u32 {
         self.tick
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn config(&self) -> &WorldConfig {
         self.cfg
     }
 
     /// Every slot ever allocated, live or not. Entity id is the index.
-    #[inline(always)]
+    #[inline]
     pub fn slots(&self) -> usize {
         self.xs.len()
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn live(&self) -> &LiveSet {
         self.live
     }
 
     /// The position arrays, to be moved in place. Struct of arrays, so there is
     /// no per-tick marshaling pass.
-    #[inline(always)]
+    #[inline]
     pub fn positions_mut(&mut self) -> (&mut [Fixed], &mut [Fixed], &mut [Fixed]) {
         (self.xs.as_mut_slice(), self.ys.as_mut_slice(), self.zs.as_mut_slice())
     }
@@ -427,7 +423,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     }
 
     /// Where payloads are going.
-    #[inline(always)]
+    #[inline]
     pub fn sink(&self) -> &S {
         &self.sink
     }
@@ -437,7 +433,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// Defaults to [`std::thread::available_parallelism`]. It is configurable
     /// because the right number is not obvious: hyperthreading or efficiency
     /// cores help an evenly spread region and hurt a crowded one.
-    #[inline(always)]
+    #[inline]
     pub fn thread_count(&self) -> usize {
         self.threads
     }
@@ -464,33 +460,33 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         });
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn config(&self) -> &WorldConfig {
         &self.cfg
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn tick_count(&self) -> u32 {
         self.tick
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn game(&self) -> &G {
         &self.game
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn snapshot(&self) -> &CellSnapshot {
         &self.snap
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn odometer(&self) -> &Odometer {
         &self.odo
     }
 
     /// Entities currently alive.
-    #[inline(always)]
+    #[inline]
     pub fn entity_count(&self) -> usize {
         self.live.live()
     }
@@ -500,7 +496,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// Positions are stored by entity id, so this is a direct index. It answers
     /// "where is entity N" for the simulation's own arrays; the snapshot, which
     /// is ordered by cell, still cannot.
-    #[inline(always)]
+    #[inline]
     pub fn position(&self, id: EntityId) -> Option<Pos3> {
         if !self.live.contains(id) {
             return None;
@@ -510,7 +506,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     }
 
     /// Viewer slots ever allocated, registered or not.
-    #[inline(always)]
+    #[inline]
     pub fn viewer_slots(&self) -> usize {
         self.viewers.len()
     }

@@ -70,23 +70,23 @@ impl RegionServer {
 
     /// The address actually bound, which is what a caller that asked for port
     /// zero needs.
-    #[inline(always)]
+    #[inline]
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn region(&self) -> RegionId {
         self.region
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn config(&self) -> &WorldConfig {
         &self.config
     }
 
     /// The edges relaying for this region.
-    #[inline(always)]
+    #[inline]
     pub fn edges(&self) -> &Arc<Edges> {
         &self.edges
     }
@@ -377,7 +377,7 @@ mod tests {
             assert_eq!(s.edges().accepted(), EDGES as u64);
             assert_eq!(s.refused(), 0);
             assert_eq!(
-                s.edges().connected().len(),
+                s.edges().view().len(),
                 EDGES,
                 "the region can say who is relaying for it"
             );

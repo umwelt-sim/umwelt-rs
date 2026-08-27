@@ -26,7 +26,7 @@ pub struct DiscoveredEntity {
 }
 
 impl DiscoveredEntity {
-    #[inline(always)]
+    #[inline]
     pub const fn new(id: EntityId, snapshot_index: u32, dist_sq: DistSq) -> DiscoveredEntity {
         DiscoveredEntity { id, snapshot_index, dist_sq }
     }
@@ -57,44 +57,44 @@ impl DiscoveredEntities {
         DiscoveredEntities { items: Vec::with_capacity(n) }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn push(&mut self, found: DiscoveredEntity) {
         self.items.push(found);
     }
 
     /// Empties the buffer without releasing its allocation.
-    #[inline(always)]
+    #[inline]
     pub fn clear(&mut self) {
         self.items.clear();
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// Entries the buffer holds before it reallocates.
-    #[inline(always)]
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.items.capacity()
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn as_slice(&self) -> &[DiscoveredEntity] {
         &self.items
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [DiscoveredEntity] {
         &mut self.items
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, DiscoveredEntity> {
         self.items.iter()
     }
@@ -184,6 +184,7 @@ impl CellSnapshot {
 }
 
 /// Tests one run of entities against the view radius and appends survivors.
+// inline(always) rather than inline: downgrading costs 9% of gather/uniform.
 #[inline(always)]
 fn take(
     viewer: Pos3,

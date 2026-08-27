@@ -3,11 +3,10 @@
 //! A frame is a one-byte kind, a `u32` length, then that many bytes of body.
 //! Little-endian throughout, matching [`packet`](crate::packet).
 //!
-//! **The length is bounded before anything is allocated.** A handshake frame is
+//! The length is bounded before anything is allocated. A handshake frame is
 //! tens of bytes and the cap is [`MAX_FRAME_BYTES`], so a peer claiming more is
-//! refused rather than believed. This matters more here than it looks: the
-//! length is read from a peer that has not authorized yet, because the
-//! credential is inside the frame being sized.
+//! refused. The length is read from a peer that has not authorized yet, since
+//! the credential is inside the frame being sized.
 //!
 //! This carries control messages only. The state payloads
 //! [`PacketWriter`](crate::PacketWriter) assembles are latest-only and lossy,

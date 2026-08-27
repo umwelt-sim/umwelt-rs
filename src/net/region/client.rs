@@ -4,15 +4,13 @@
 //! answers. It connects, presents a credential, reads what the region says it
 //! is, and either takes the offer or leaves.
 //!
-//! **This is not an edge server.** An edge server will take a `RegionClient`
-//! and start its own socket server on the other side of itself, speaking the
-//! client-facing protocol to game clients. A `RegionClient` is one link to one
-//! region and knows nothing about game clients, fan-out, or relaying. Combining
-//! the two would return per-client work to the edge tier; see §Why per-client
-//! work stays in the simulation.
+//! A `RegionClient` is not an edge server. An edge server will take one of
+//! these and start its own socket server on the other side of itself, speaking
+//! the client-facing protocol to game clients. A `RegionClient` is one link to
+//! one region and knows nothing about game clients, fan-out, or relaying.
 
 use std::io::{BufWriter, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 
 use crate::config::WorldConfig;
@@ -156,34 +154,30 @@ impl RegionClient {
         Ok(RegionClient { stream: sock, writer, offer })
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn offer(&self) -> &Offer {
         &self.offer
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn region(&self) -> RegionId {
         self.offer.region
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn server_version(&self) -> ServerVersion {
         self.offer.server
     }
 
     /// The world this region runs, rebuilt from what it advertised.
-    #[inline(always)]
+    #[inline]
     pub fn config(&self) -> &WorldConfig {
         &self.offer.config
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn stream(&self) -> &TcpStream {
         &self.stream
-    }
-
-    pub fn peer_addr(&self) -> Result<SocketAddr, NetError> {
-        Ok(self.stream.peer_addr()?)
     }
 
     // -- the session ------------------------------------------------------
@@ -212,12 +206,6 @@ impl RegionClient {
     /// [`spawn`](Self::spawn) where every entity has a client behind it.
     pub fn spawn_observers(&self, positions: &[Pos3]) -> Result<(), NetError> {
         self.spawn(&SpawnEntities::observers(positions).spawns)
-    }
-
-    /// [`spawn`](Self::spawn) where nothing observes: projectiles, wildlife,
-    /// NPCs. Static scenery does not belong in a region at all.
-    pub fn spawn_unattended(&self, positions: &[Pos3]) -> Result<(), NetError> {
-        self.spawn(&SpawnEntities::unattended(positions).spawns)
     }
 
     /// Sends new absolute positions for entities this edge manages.
@@ -266,20 +254,6 @@ impl RegionClient {
             KIND_POSITION_UPDATES => Ok(Incoming::Updates(PositionUpdates::decode(body)?)),
             other => Err(NetError::Unexpected { expected: "a session message", got: other }),
         }
-    }
-
-    /// Tells the region this edge is finished. Everything it manages is
-    /// despawned, whether it said so or not.
-    pub fn quit(&self) -> Result<(), NetError> {
-        self.send(KIND_QUIT, &[])
-    }
-
-    /// Writes one frame and pushes it out.
-    fn send(&self, kind: u8, body: &[u8]) -> Result<(), NetError> {
-        let mut sock = self.writer.lock().expect("not poisoned");
-        write_frame(&mut *sock, kind, body)?;
-        sock.flush()?;
-        Ok(())
     }
 
     /// Writes every chunk of one logical message, then pushes once.

@@ -15,10 +15,8 @@
 //!    world parameters.
 //! 4. The client accepts, or quits. Both are empty frames.
 //!
-//! **The identification comes first and the server info comes after it.** A
-//! peer that cannot authorize never learns the region's size, its tick rate, or
-//! its id. Putting the info first would have been friendlier to write and would
-//! hand the shape of the world to anyone able to open a socket.
+//! The identification comes first and the server info second, so a peer that
+//! cannot authorize never learns the region's size, its tick rate, or its id.
 //!
 //! The client accepts or quits rather than the server assuming it will stay. A
 //! client that reads the parameters and finds a world it cannot render, or a
@@ -90,12 +88,12 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct RegionId(u32);
 
 impl RegionId {
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: u32) -> RegionId {
         RegionId(raw)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }
@@ -124,12 +122,12 @@ impl fmt::Display for RegionId {
 pub struct ProtocolVersion(u16);
 
 impl ProtocolVersion {
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: u16) -> ProtocolVersion {
         ProtocolVersion(raw)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> u16 {
         self.0
     }
@@ -419,21 +417,18 @@ pub const MAX_DESPAWN_PER_MESSAGE: usize = (MAX_FRAME_BYTES - 4) / 4;
 
 /// What is behind an entity, which decides whether it observes.
 ///
-/// **An entity is a thing with a position; a viewer is a thing that receives.**
-/// Every entity can be seen by whoever is near it. Only an observer is sent
-/// what it can see, and only an observer costs the per-viewer pipeline: a
-/// subscription, a gather, a score, a selection and a packet every tick it is
-/// served, plus a [`GhostTable`](crate::GhostTable) of its own.
+/// An entity has a position and can be seen by whoever is near it. A viewer
+/// receives: only an observer is sent what it can see, and only an observer
+/// costs a subscription, a gather, a score, a selection and a packet every tick
+/// it is served, plus a [`GhostTable`](crate::GhostTable) of its own. Measured
+/// at a constant 8,192 entities, a viewer costs about 1.6 µs a tick against
+/// 0.4 ms of work paid per entity regardless of who observes.
 ///
-/// The difference is large enough that it cannot be implicit. A region holding
-/// 8,192 unattended entities with one observer among them, and a region holding
-/// 8,192 observers, are the same snapshot and nothing like the same tick.
-///
-/// **Static scenery is not a kind here. It is never spawned at all.** A rock
-/// that never moves is in the client's content package already, and putting it
-/// in the region would pay 12 bytes of snapshot and a gather-walk visit every
-/// tick, forever, to tell clients something they were shipped. What belongs in
-/// a region is what is authoritative and moves.
+/// Static scenery has no kind here, because it is never spawned. A rock that
+/// never moves is already in the client's content package, and holding it in a
+/// region would cost snapshot bytes and a gather-walk visit every tick to
+/// replicate a position the client has. A region holds state that is
+/// authoritative and changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EntityKind {
@@ -448,7 +443,7 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    #[inline(always)]
+    #[inline]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
@@ -461,7 +456,7 @@ impl EntityKind {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn observes(self) -> bool {
         matches!(self, EntityKind::Observer)
     }

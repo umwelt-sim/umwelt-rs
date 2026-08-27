@@ -1,65 +1,40 @@
 //! The edges connected to one region, and the entities each one manages.
 //!
-//! A region simulation does not think about sockets one at a time. It has a set
-//! of edges relaying for it, that set changes as edges come and go, and the
-//! things that need to address one — a payload sink choosing where to write, an
-//! operator asking who is attached — need something to ask. [`Edges`] is that
-//! something.
+//! [`Edges`] is the set. [`Edge`] is one connected edge: holding one keeps it
+//! attached, and dropping it closes the link, frees the id, and releases every
+//! entity it managed.
 //!
-//! [`Edge`] is one connected edge. Holding one keeps it attached; dropping it
-//! closes the link, frees the id, and releases every entity it managed.
+//! An edge claims the entities whose game clients it holds the connections for.
+//! [`Edges::edge_for`] answers which edge manages a given entity, which is what
+//! a [`PayloadSink`](crate::PayloadSink) needs in order to send a viewer's
+//! payload to the right place. It is called once per served viewer per tick, so
+//! it takes a read lock and no more; claiming and releasing take the write lock
+//! and happen when a game client arrives or leaves.
 //!
-//! # Why an edge owns entities
-//!
-//! A game client connects to an edge, and the edge registers a viewer with the
-//! region for that client's avatar. The region then produces a payload per
-//! viewer per tick and hands each to a
-//! [`PayloadSink`](crate::PayloadSink) — which has to send it to the edge
-//! holding that client's connection, and to no other. Which edge that is, is a
-//! fact only this set knows.
-//!
-//! So each edge claims the entities it manages, and [`Edges::edge_for`]
-//! answers the routing question. A sink resolves a served
-//! [`ViewerId`](crate::ViewerId) to its avatar with
-//! [`WorldSimulation::avatar_of`](crate::WorldSimulation::avatar_of), then
-//! that avatar to an edge with `edge_for`.
-//!
-//! **The lookup is on the sink's path, which is on the tick's path.** Every
-//! served viewer costs one, from every worker thread at once, so `edge_for`
-//! reads an atomic under a shared lock and takes no exclusive lock at all.
-//! Claiming and releasing do take one, and they happen when a game client
-//! arrives or leaves rather than per tick. None of this is measured; §Payloads
-//! leave through a sink is why the shape was chosen that way regardless.
-//!
-//! Ids are dense and reusable, the same bargain [`ViewerId`](crate::ViewerId)
-//! makes and for the same reason: a recycled [`EdgeId`] names a different
-//! connection with no state carried over, so there is nothing for a stale
-//! reference to alias.
+//! [`EdgeId`] is dense and reusable. A recycled id names a different connection
+//! carrying nothing over from the last one.
 
 use core::fmt;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::entity::EntityId;
 use crate::net::error::NetError;
-use crate::net::region::wire::{write_frame_parts};
+use crate::net::region::wire::write_frame_parts;
 
-/// No edge manages this entity.
-///
-/// Edge ids are dense from zero, so the top of the range is unreachable and
-/// free to reserve. [`GhostTable`](crate::GhostTable) reserves the same value
-/// for the same reason.
+/// No edge manages this entity. Edge ids are dense from zero, so the top of
+/// the range is unreachable.
 const UNOWNED: u32 = u32::MAX;
 
 /// Bytes held per edge before a write reaches the socket.
 ///
 /// A payload is at most a packet, so this holds a couple of hundred of them.
-/// **This is the difference between a syscall per payload and a syscall per
-/// batch**, which §The smoke test measured as the thing that stopped delivery
-/// scaling. Held per edge, so eight edges cost two megabytes of buffer.
+/// Writing every payload straight to the socket cost three syscalls each and
+/// held delivery to about 170,000 payloads a second; buffering trades two
+/// megabytes across eight edges for one syscall a batch.
 const OUTBOUND_BYTES: usize = 256 * 1024;
 
 /// One connected edge's identity within one region server.
@@ -71,18 +46,18 @@ const OUTBOUND_BYTES: usize = 256 * 1024;
 pub struct EdgeId(u32);
 
 impl EdgeId {
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: u32) -> EdgeId {
         EdgeId(raw)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }
 
     /// The id as an array index.
-    #[inline(always)]
+    #[inline]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -127,17 +102,17 @@ impl std::error::Error for ClaimError {}
 /// differences between samples. An operator watching a region needs to know
 /// which edge is carrying what, not only the region's total.
 #[derive(Debug, Default)]
-pub struct EdgeStats {
+pub(crate) struct EdgeStats {
     /// Frames written to this edge, payloads and replies together.
-    pub frames: AtomicU64,
+    pub(crate) frames: AtomicU64,
     /// Bytes of frame body written, excluding the five-byte frame header.
-    pub bytes: AtomicU64,
+    pub(crate) bytes: AtomicU64,
     /// Frames read from this edge.
-    pub messages: AtomicU64,
+    pub(crate) messages: AtomicU64,
     /// Entities this edge manages that have a viewer watching them.
-    pub observers: AtomicUsize,
+    pub(crate) observers: AtomicUsize,
     /// Commands from this edge the region declined.
-    pub refused: AtomicU64,
+    pub(crate) refused: AtomicU64,
 }
 
 /// One edge's state, sampled together under a single lock.
@@ -158,6 +133,9 @@ pub struct EdgeView {
     pub refused: u64,
 }
 
+/// One edge's buffered write half, shared by whatever needs to write to it.
+type Outbound = Arc<Mutex<BufWriter<TcpStream>>>;
+
 /// What one attached edge is, from the region's side.
 #[derive(Debug)]
 struct EdgeRecord {
@@ -173,7 +151,7 @@ struct EdgeRecord {
     ///
     /// Buffered: the bulk path writes many payloads and pays its syscalls when
     /// something flushes, rather than one per payload.
-    writer: Arc<Mutex<BufWriter<TcpStream>>>,
+    writer: Outbound,
 }
 
 /// The edges relaying for one region, and what each of them manages.
@@ -186,7 +164,7 @@ pub struct Edges {
     slots: Mutex<Vec<Option<EdgeRecord>>>,
     /// Indexed by entity slot, holding an edge id raw or [`UNOWNED`]. Separate
     /// from `slots` so a routing lookup never waits on a claim.
-    owners: RwLock<Vec<AtomicU32>>,
+    owners: RwLock<Vec<u32>>,
     /// Entities orphaned by an edge detaching, waiting for the tick loop to
     /// despawn them and drop their viewers.
     ///
@@ -196,6 +174,10 @@ pub struct Edges {
     detached: Mutex<Vec<EntityId>>,
     live: AtomicUsize,
     accepted: AtomicU64,
+    /// Set when a frame is queued, cleared by a flush. `Handoff` calls
+    /// [`flush`](Self::flush) about a thousand times a second and most of those
+    /// have nothing waiting, so this keeps them from taking the set's lock.
+    buffered: AtomicBool,
 }
 
 impl Edges {
@@ -206,19 +188,19 @@ impl Edges {
     // -- the set ----------------------------------------------------------
 
     /// Edges attached right now.
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.live.load(Ordering::Relaxed)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Edges admitted since this region server was bound, including those that
     /// have since gone.
-    #[inline(always)]
+    #[inline]
     pub fn accepted(&self) -> u64 {
         self.accepted.load(Ordering::Relaxed)
     }
@@ -231,7 +213,7 @@ impl Edges {
     }
 
     /// One edge's counters, shared so a caller can hold them across ticks.
-    pub fn stats(&self, edge: EdgeId) -> Option<Arc<EdgeStats>> {
+    pub(crate) fn stats(&self, edge: EdgeId) -> Option<Arc<EdgeStats>> {
         let slots = self.slots.lock().expect("not poisoned");
         slots.get(edge.index()).and_then(|held| held.as_ref()).map(|r| Arc::clone(&r.stats))
     }
@@ -262,21 +244,6 @@ impl Edges {
             .collect()
     }
 
-    /// Every edge attached right now, for an operator view.
-    ///
-    /// Allocates and takes the lock, so this is a reporting path rather than
-    /// something to call per tick.
-    pub fn connected(&self) -> Vec<(EdgeId, SocketAddr)> {
-        let slots = self.slots.lock().expect("not poisoned");
-        slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, held)| {
-                held.as_ref().map(|rec| (EdgeId::from_raw(i as u32), rec.peer))
-            })
-            .collect()
-    }
-
     // -- who manages what -------------------------------------------------
 
     /// Records that `edge` manages `entity`.
@@ -292,16 +259,16 @@ impl Edges {
 
         let mut owners = self.owners.write().expect("not poisoned");
         if owners.len() <= entity.index() {
-            owners.resize_with(entity.index() + 1, || AtomicU32::new(UNOWNED));
+            owners.resize(entity.index() + 1, UNOWNED);
         }
-        let held_by = owners[entity.index()].load(Ordering::Relaxed);
+        let held_by = owners[entity.index()];
         if held_by == edge.raw() {
             return Ok(());
         }
         if held_by != UNOWNED {
             return Err(ClaimError::AlreadyClaimed { entity, by: EdgeId::from_raw(held_by) });
         }
-        owners[entity.index()].store(edge.raw(), Ordering::Relaxed);
+        owners[entity.index()] = edge.raw();
         rec.entities.push(entity);
         Ok(())
     }
@@ -312,8 +279,8 @@ impl Edges {
     /// game client disconnects, or when the entity despawns.
     pub fn release(&self, entity: EntityId) -> Option<EdgeId> {
         let mut slots = self.slots.lock().expect("not poisoned");
-        let owners = self.owners.read().expect("not poisoned");
-        let held_by = owners.get(entity.index())?.swap(UNOWNED, Ordering::Relaxed);
+        let mut owners = self.owners.write().expect("not poisoned");
+        let held_by = std::mem::replace(owners.get_mut(entity.index())?, UNOWNED);
         drop(owners);
         if held_by == UNOWNED {
             return None;
@@ -327,28 +294,13 @@ impl Edges {
 
     /// Which edge manages this entity, if any.
     ///
-    /// **This is the routing question**, and the reason the mapping exists: a
-    /// payload built for a viewer goes to the edge holding that viewer's client
-    /// connection. Takes a shared lock and one relaxed load, and never waits on
-    /// a claim.
+    /// A payload built for a viewer goes to the edge holding that viewer's
+    /// client connection, and this is that lookup. Takes a read lock only.
     #[inline]
     pub fn edge_for(&self, entity: EntityId) -> Option<EdgeId> {
         let owners = self.owners.read().expect("not poisoned");
-        let held_by = owners.get(entity.index())?.load(Ordering::Relaxed);
+        let held_by = *owners.get(entity.index())?;
         (held_by != UNOWNED).then(|| EdgeId::from_raw(held_by))
-    }
-
-    /// The entities one edge manages.
-    ///
-    /// Allocates and takes the lock. A reporting and handoff path, not a
-    /// per-tick one.
-    pub fn entities(&self, edge: EdgeId) -> Vec<EntityId> {
-        let slots = self.slots.lock().expect("not poisoned");
-        slots
-            .get(edge.index())
-            .and_then(|held| held.as_ref())
-            .map(|rec| rec.entities.clone())
-            .unwrap_or_default()
     }
 
     /// How many entities one edge manages, without building the list.
@@ -377,12 +329,9 @@ impl Edges {
     /// The control path: replies an edge is waiting on, which are few and want
     /// no latency. Returns [`NetError::Closed`] if that id names nobody.
     pub(crate) fn send(&self, edge: EdgeId, kind: u8, body: &[u8]) -> Result<(), NetError> {
-        let (writer, stats) = self.writer_for(edge)?;
-        let mut sock = writer.lock().expect("not poisoned");
-        write_frame_parts(&mut *sock, kind, &[body])?;
-        sock.flush()?;
-        stats.frames.fetch_add(1, Ordering::Relaxed);
-        stats.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+        self.send_parts(edge, kind, &[body])?;
+        let (writer, _) = self.writer_for(edge)?;
+        writer.lock().expect("not poisoned").flush()?;
         Ok(())
     }
 
@@ -399,6 +348,7 @@ impl Edges {
         let (writer, stats) = self.writer_for(edge)?;
         let mut sock = writer.lock().expect("not poisoned");
         write_frame_parts(&mut *sock, kind, parts)?;
+        self.buffered.store(true, Ordering::Release);
         stats.frames.fetch_add(1, Ordering::Relaxed);
         stats.bytes.fetch_add(parts.iter().map(|p| p.len() as u64).sum::<u64>(), Ordering::Relaxed);
         Ok(())
@@ -409,7 +359,10 @@ impl Edges {
     /// Returns how many edges had anything waiting. Called at the end of a
     /// batch: [`Handoff`](crate::Handoff) does it once per drain pass.
     pub fn flush(&self) -> usize {
-        let writers: Vec<Arc<Mutex<BufWriter<TcpStream>>>> = {
+        if !self.buffered.swap(false, Ordering::Acquire) {
+            return 0;
+        }
+        let writers: Vec<Outbound> = {
             let slots = self.slots.lock().expect("not poisoned");
             slots.iter().filter_map(|held| held.as_ref()).map(|r| Arc::clone(&r.writer)).collect()
         };
@@ -429,11 +382,7 @@ impl Edges {
         pushed
     }
 
-    #[allow(clippy::type_complexity)]
-    fn writer_for(
-        &self,
-        edge: EdgeId,
-    ) -> Result<(Arc<Mutex<BufWriter<TcpStream>>>, Arc<EdgeStats>), NetError> {
+    fn writer_for(&self, edge: EdgeId) -> Result<(Outbound, Arc<EdgeStats>), NetError> {
         let slots = self.slots.lock().expect("not poisoned");
         slots
             .get(edge.index())
@@ -443,7 +392,7 @@ impl Edges {
     }
 
     /// Takes the lowest free id, so the set stays dense.
-    fn register(&self, peer: SocketAddr, writer: Arc<Mutex<BufWriter<TcpStream>>>) -> EdgeId {
+    fn register(&self, peer: SocketAddr, writer: Outbound) -> EdgeId {
         let mut slots = self.slots.lock().expect("not poisoned");
         let at = match slots.iter().position(|held| held.is_none()) {
             Some(free) => free,
@@ -484,17 +433,14 @@ impl Edges {
         let Some(Some(rec)) = slots.get_mut(id.index()).map(|held| held.take()) else {
             return;
         };
-        let owners = self.owners.read().expect("not poisoned");
+        let mut owners = self.owners.write().expect("not poisoned");
         for entity in &rec.entities {
-            if let Some(slot) = owners.get(entity.index()) {
-                // Only clear what this edge still held: a claim may have moved
-                // on after a release this list has not seen.
-                let _ = slot.compare_exchange(
-                    id.raw(),
-                    UNOWNED,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
+            // Only clear what this edge still held: a claim may have moved on
+            // after a release this list has not seen.
+            if let Some(slot) = owners.get_mut(entity.index())
+                && *slot == id.raw()
+            {
+                *slot = UNOWNED;
             }
         }
         drop(owners);
@@ -537,23 +483,23 @@ pub struct Edge {
 }
 
 impl Edge {
-    #[inline(always)]
+    #[inline]
     pub fn id(&self) -> EdgeId {
         self.id
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn peer(&self) -> SocketAddr {
         self.peer
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn stream(&self) -> &TcpStream {
         &self.stream
     }
 
     /// The set this edge belongs to.
-    #[inline(always)]
+    #[inline]
     pub fn edges(&self) -> &Arc<Edges> {
         &self.edges
     }
@@ -568,9 +514,9 @@ impl Edge {
         self.edges.release(entity) == Some(self.id)
     }
 
-    /// The entities this edge manages.
-    pub fn entities(&self) -> Vec<EntityId> {
-        self.edges.entities(self.id)
+    /// How many entities this edge manages.
+    pub fn entity_count(&self) -> usize {
+        self.edges.entity_count(self.id)
     }
 
     /// Holds the link open until the edge closes it.
@@ -622,7 +568,7 @@ mod tests {
         let edges = Edges::new();
         assert!(edges.is_empty());
         assert_eq!(edges.accepted(), 0);
-        assert!(edges.connected().is_empty());
+        assert!(edges.view().is_empty());
         assert_eq!(edges.peer(EdgeId::from_raw(0)), None);
         assert_eq!(edges.edge_for(ent(0)), None);
     }
@@ -673,10 +619,10 @@ mod tests {
         assert_eq!(edges.peer(EdgeId::from_raw(0)), Some(addr(9000)));
         assert_eq!(edges.peer(second), None, "a freed id names nobody");
 
-        let attached = edges.connected();
+        let attached = edges.view();
         assert_eq!(attached.len(), 2);
-        assert_eq!(attached[0], (EdgeId::from_raw(0), addr(9000)));
-        assert_eq!(attached[1], (EdgeId::from_raw(2), addr(9002)));
+        assert_eq!((attached[0].id, attached[0].peer), (EdgeId::from_raw(0), addr(9000)));
+        assert_eq!((attached[1].id, attached[1].peer), (EdgeId::from_raw(2), addr(9002)));
     }
 
     #[test]
@@ -689,9 +635,8 @@ mod tests {
         edges.claim(a, ent(11)).expect("unclaimed");
         edges.claim(b, ent(20)).expect("unclaimed");
 
-        assert_eq!(edges.entities(a), vec![ent(10), ent(11)]);
-        assert_eq!(edges.entities(b), vec![ent(20)]);
         assert_eq!(edges.entity_count(a), 2);
+        assert_eq!(edges.entity_count(b), 1);
     }
 
     #[test]
@@ -720,7 +665,7 @@ mod tests {
             Err(ClaimError::AlreadyClaimed { entity: ent(10), by: a })
         );
         assert_eq!(edges.edge_for(ent(10)), Some(a), "the first claim stands");
-        assert!(edges.entities(b).is_empty());
+        assert_eq!(edges.entity_count(b), 0);
     }
 
     #[test]
@@ -729,7 +674,7 @@ mod tests {
         let a = edges.register_for_test(addr(9000));
         edges.claim(a, ent(10)).expect("unclaimed");
         edges.claim(a, ent(10)).expect("the same edge may repeat itself");
-        assert_eq!(edges.entities(a), vec![ent(10)], "and it is not listed twice");
+        assert_eq!(edges.entity_count(a), 1, "and it is not counted twice");
     }
 
     #[test]
@@ -750,7 +695,7 @@ mod tests {
 
         assert_eq!(edges.release(ent(10)), Some(a));
         assert_eq!(edges.edge_for(ent(10)), None);
-        assert_eq!(edges.entities(a), vec![ent(11)], "the rest are untouched");
+        assert_eq!(edges.entity_count(a), 1, "the rest are untouched");
 
         assert_eq!(edges.release(ent(10)), None, "releasing twice reports nobody");
         assert_eq!(edges.release(ent(99)), None, "so does releasing what nobody held");
@@ -766,7 +711,7 @@ mod tests {
         edges.release(ent(10));
         edges.claim(b, ent(10)).expect("free again");
         assert_eq!(edges.edge_for(ent(10)), Some(b));
-        assert!(edges.entities(a).is_empty());
+        assert_eq!(edges.entity_count(a), 0);
     }
 
     #[test]
@@ -782,7 +727,7 @@ mod tests {
         assert_eq!(edges.edge_for(ent(10)), None);
         assert_eq!(edges.edge_for(ent(11)), None);
         assert_eq!(edges.edge_for(ent(20)), Some(b), "another edge is unaffected");
-        assert!(edges.entities(a).is_empty());
+        assert_eq!(edges.entity_count(a), 0);
     }
 
     #[test]
@@ -821,7 +766,7 @@ mod tests {
 
         let reused = edges.register_for_test(addr(9001));
         assert_eq!(reused, a, "the same slot came back");
-        assert!(edges.entities(reused).is_empty(), "with none of the old claims");
+        assert_eq!(edges.entity_count(reused), 0, "with none of the old claims");
         assert_eq!(edges.edge_for(ent(10)), None);
     }
 
@@ -865,6 +810,6 @@ mod tests {
         });
         assert_eq!(edges.len(), 0);
         assert_eq!(edges.accepted(), 400);
-        assert!(edges.connected().is_empty());
+        assert!(edges.view().is_empty());
     }
 }

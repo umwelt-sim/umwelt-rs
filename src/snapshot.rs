@@ -41,24 +41,24 @@ pub struct CellOccupants<'a> {
 }
 
 impl<'a> CellOccupants<'a> {
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.ids.len()
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
 
     /// The full position of the entity at slot `i`.
-    #[inline(always)]
+    #[inline]
     pub fn pos(&self, i: usize) -> Pos3 {
         Pos3::new(self.xs[i], self.ys[i], self.zs[i])
     }
 
     /// The horizontal position of the entity at slot `i`.
-    #[inline(always)]
+    #[inline]
     pub fn horizontal(&self, i: usize) -> Pos2 {
         Pos2::new(self.xs[i], self.ys[i])
     }
@@ -67,7 +67,7 @@ impl<'a> CellOccupants<'a> {
     ///
     /// Valid only for the snapshot this run came from, and only until its next
     /// [`CellSnapshot::update`].
-    #[inline(always)]
+    #[inline]
     pub fn snapshot_index(&self, i: usize) -> u32 {
         debug_assert!(i < self.len());
         self.base + i as u32
@@ -130,13 +130,13 @@ pub struct SubCells<'a> {
 
 impl<'a> SubCells<'a> {
     /// Sub-cells per axis. The grid is `axis * axis`.
-    #[inline(always)]
+    #[inline]
     pub fn axis(&self) -> u32 {
         self.axis
     }
 
     /// The entities in one sub-cell, ascending by entity id.
-    #[inline(always)]
+    #[inline]
     pub fn occupants(&self, sx: u32, sy: u32) -> CellOccupants<'a> {
         debug_assert!(sx < self.axis && sy < self.axis);
         let b = (sy * self.axis + sx) as usize;
@@ -153,7 +153,7 @@ impl<'a> SubCells<'a> {
 
     /// The entities in the sub-cell at linear index `b`, as yielded by
     /// [`CellSnapshot::sub_cell_order`].
-    #[inline(always)]
+    #[inline]
     pub fn occupants_at(&self, b: usize) -> CellOccupants<'a> {
         let lo = self.starts[b] as usize;
         let hi = self.starts[b + 1] as usize;
@@ -167,13 +167,13 @@ impl<'a> SubCells<'a> {
     }
 
     /// How many entities occupy the sub-cell at linear index `b`.
-    #[inline(always)]
+    #[inline]
     pub fn count_at(&self, b: usize) -> usize {
         (self.starts[b + 1] - self.starts[b]) as usize
     }
 
     /// How many entities occupy one sub-cell.
-    #[inline(always)]
+    #[inline]
     pub fn count(&self, sx: u32, sy: u32) -> usize {
         let b = (sy * self.axis + sx) as usize;
         (self.starts[b + 1] - self.starts[b]) as usize
@@ -309,7 +309,7 @@ impl CellSnapshot {
     }
 
     /// The configuration this snapshot was built for.
-    #[inline(always)]
+    #[inline]
     pub fn config(&self) -> &WorldConfig {
         &self.cfg
     }
@@ -332,7 +332,7 @@ impl CellSnapshot {
     /// The entities occupying one cell, ascending by entity id.
     ///
     /// An empty cell yields empty slices.
-    #[inline(always)]
+    #[inline]
     pub fn entities_for_cell(&self, id: CellId) -> CellOccupants<'_> {
         let c = id.index();
         debug_assert!(c < self.cells, "cell {c} out of range for {} cells", self.cells);
@@ -349,20 +349,20 @@ impl CellSnapshot {
 
     /// The id at `i` in the snapshot's entity arrays, as yielded by
     /// [`CellOccupants::snapshot_index`].
-    #[inline(always)]
+    #[inline]
     pub fn id_at(&self, i: usize) -> EntityId {
         self.ids[i]
     }
 
     /// The position at `i` in the snapshot's entity arrays, as yielded by
     /// [`CellOccupants::snapshot_index`].
-    #[inline(always)]
+    #[inline]
     pub fn pos_at(&self, i: usize) -> Pos3 {
         Pos3::new(self.xs[i], self.ys[i], self.zs[i])
     }
 
     /// How many entities occupy one cell.
-    #[inline(always)]
+    #[inline]
     pub fn count(&self, id: CellId) -> usize {
         let c = id.index();
         (self.starts[c + 1] - self.starts[c]) as usize

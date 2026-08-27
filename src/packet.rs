@@ -19,9 +19,10 @@ pub const DESPAWN_BYTES: usize = 4;
 
 /// Fixed-size preamble.
 ///
-/// Sixteen bytes, which the packet budget has assumed since before there was a
-/// format. The acknowledgment fields are carried but not yet populated: nothing
-/// acknowledges anything until there is a transport.
+/// Sixteen bytes, matching
+/// [`DEFAULT_HEADER_BYTES`](crate::budget::DEFAULT_HEADER_BYTES). The
+/// acknowledgment fields are carried but never populated, since nothing
+/// acknowledges anything yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PacketHeader {
     /// Which tick's snapshot this was built from.
@@ -81,7 +82,7 @@ impl PacketWriter {
         PacketWriter { codec, buf: Vec::with_capacity(payload_bytes) }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn codec(&self) -> &RecordCodec {
         &self.codec
     }
@@ -138,7 +139,7 @@ impl PacketWriter {
     }
 
     /// The payload most recently built, until the next call overwrites it.
-    #[inline(always)]
+    #[inline]
     pub fn payload(&self) -> &[u8] {
         &self.buf
     }
@@ -169,7 +170,7 @@ impl<'a> PacketReader<'a> {
         Some(PacketReader { codec, header, body: &buf[PacketHeader::BYTES..want] })
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn header(&self) -> PacketHeader {
         self.header
     }

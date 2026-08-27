@@ -137,7 +137,7 @@ fn main() {
                     println!(
                         "herd-sim: {:?} detached, giving up {} entities",
                         edge.id(),
-                        edge.entities().len()
+                        edge.entity_count()
                     );
                 }
             });
@@ -166,8 +166,8 @@ fn main() {
                 inbound.settle(sim, &sink, ClientLimits::default());
 
                 ticks += 1;
-                served += report.stats.viewers as u64;
-                records += report.stats.records as u64;
+                served += report.stats.viewers;
+                records += report.stats.records;
                 spent += report.took;
                 worst = worst.max(report.took);
 

@@ -58,7 +58,7 @@ impl Pos3 {
         z: Fixed::ZERO,
     };
 
-    #[inline(always)]
+    #[inline]
     pub const fn from_meters(x: i32, y: i32, z: i32) -> Pos3 {
         Pos3 {
             x: Fixed::from_meters(x),
@@ -67,12 +67,12 @@ impl Pos3 {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn new(x: Fixed, y: Fixed, z: Fixed) -> Pos3 {
         Pos3 { x, y, z }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn horizontal(self) -> Pos2 {
         Pos2 {
             x: self.x,
@@ -84,7 +84,7 @@ impl Pos3 {
     ///
     /// Widened to `i64` before squaring: across a 4 km region the largest
     /// squared separation is ~5.3e13, well beyond `i32`.
-    #[inline(always)]
+    #[inline]
     pub const fn dist_sq(self, other: Pos3) -> DistSq {
         let dx = self.x.raw() as i64 - other.x.raw() as i64;
         let dy = self.y.raw() as i64 - other.y.raw() as i64;
@@ -95,7 +95,7 @@ impl Pos3 {
 
     /// Squared separation ignoring height. Use for subscription tests, which
     /// must agree with the 2D cell grid.
-    #[inline(always)]
+    #[inline]
     pub const fn horizontal_dist_sq(self, other: Pos3) -> DistSq {
         let dx = self.x.raw() as i64 - other.x.raw() as i64;
         let dy = self.y.raw() as i64 - other.y.raw() as i64;
@@ -105,7 +105,7 @@ impl Pos3 {
 
     /// Component-wise midpoint. Only meaningful for positions in the same
     /// region.
-    #[inline(always)]
+    #[inline]
     pub const fn midpoint(self, other: Pos3) -> Pos3 {
         Pos3 {
             x: Fixed::from_raw((self.x.raw() + other.x.raw()) / 2),
@@ -118,7 +118,7 @@ impl Pos3 {
 impl Add for Pos3 {
     type Output = Pos3;
 
-    #[inline(always)]
+    #[inline]
     fn add(self, rhs: Pos3) -> Pos3 {
         Pos3 {
             x: self.x + rhs.x,
@@ -131,7 +131,7 @@ impl Add for Pos3 {
 impl Sub for Pos3 {
     type Output = Pos3;
 
-    #[inline(always)]
+    #[inline]
     fn sub(self, rhs: Pos3) -> Pos3 {
         Pos3 {
             x: self.x - rhs.x,
@@ -143,7 +143,7 @@ impl Sub for Pos3 {
 
 // AddAssign is +=
 impl AddAssign for Pos3 {
-    #[inline(always)]
+    #[inline]
     fn add_assign(&mut self, rhs: Pos3) {
         self.x += rhs.x;
         self.y += rhs.y;
@@ -152,7 +152,7 @@ impl AddAssign for Pos3 {
 }
 
 impl SubAssign for Pos3 {
-    #[inline(always)]
+    #[inline]
     fn sub_assign(&mut self, rhs: Pos3) {
         self.x -= rhs.x;
         self.y -= rhs.y;
@@ -179,12 +179,12 @@ impl Pos2 {
         y: Fixed::ZERO,
     };
 
-    #[inline(always)]
+    #[inline]
     pub const fn new(x: Fixed, y: Fixed) -> Pos2 {
         Pos2 { x, y }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn from_meters(x: i32, y: i32) -> Pos2 {
         Pos2 {
             x: Fixed::from_meters(x),
@@ -192,7 +192,7 @@ impl Pos2 {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn dist_sq(self, other: Pos2) -> DistSq {
         let dx = self.x.raw() as i64 - other.x.raw() as i64;
         let dy = self.y.raw() as i64 - other.y.raw() as i64;
@@ -200,7 +200,7 @@ impl Pos2 {
     }
 
     /// Lift to 3D at the given height.
-    #[inline(always)]
+    #[inline]
     pub const fn at_height(self, z: Fixed) -> Pos3 {
         Pos3 {
             x: self.x,
@@ -228,7 +228,7 @@ pub struct CellCoord {
 }
 
 impl CellCoord {
-    #[inline(always)]
+    #[inline]
     pub const fn new(x: u16, y: u16) -> CellCoord {
         CellCoord { x, y }
     }
@@ -239,7 +239,7 @@ impl CellCoord {
     ///
     /// This is the metric the square subscription grid uses. A cell is subscribed
     /// when its Chebyshev distance from the viewer is within some threshold.
-    #[inline(always)]
+    #[inline]
     pub const fn chebyshev(self, other: CellCoord) -> u16 {
         let dx = self.x.abs_diff(other.x);
         let dy = self.y.abs_diff(other.y);
@@ -248,7 +248,7 @@ impl CellCoord {
 
     /// Whether two coordinates differ by at most one step per axis. This
     /// is used by rules and other configuration settings for move enforcement.
-    #[inline(always)]
+    #[inline]
     pub const fn is_adjacent_move(self, other: CellCoord) -> bool {
         self.x.abs_diff(other.x) <= 1 && self.y.abs_diff(other.y) <= 1
     }
@@ -270,17 +270,17 @@ impl fmt::Debug for CellCoord {
 pub struct CellId(u32);
 
 impl CellId {
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: u32) -> CellId {
         CellId(raw)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn index(self) -> usize {
         self.0 as usize
     }

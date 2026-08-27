@@ -23,17 +23,17 @@ use crate::subscription::Subscription;
 pub struct ViewerId(u32);
 
 impl ViewerId {
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: u32) -> ViewerId {
         ViewerId(raw)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -54,11 +54,10 @@ pub struct ClientLimits {
     ///
     /// A viewer's ghosts are stamped and aged only on the ticks it is served,
     /// so a period at or above the policy's `grace` leaves grace with nothing
-    /// to absorb and behaves as a grace of zero. Measured: it is not the
-    /// turnover an earlier note here claimed. At a period of 8, a client still
-    /// holds its 256 ghosts and takes 3.4 first sightings per packet, because
-    /// everything still in the ghost set is stamped on every serve. What the period does cost is accuracy, in proportion:
-    /// error and its 99th percentile both scale with it.
+    /// to absorb and behaves as a grace of zero. It does not churn the ghost
+    /// set: at a period of 8 a client still holds its 256 ghosts, because
+    /// everything in the set is stamped on every serve. What it costs is
+    /// accuracy, in proportion, on both mean and 99th-percentile error.
     pub send_period: u8,
 }
 
@@ -101,7 +100,7 @@ impl Viewer {
 
     /// Whether this viewer is served on `tick`. The phase comes from the id, so
     /// viewers on the same period spread across ticks rather than bunching.
-    #[inline(always)]
+    #[inline]
     pub(crate) fn due(&self, id: ViewerId, tick: u32) -> bool {
         let period = self.send_period as u32;
         period <= 1 || (tick.wrapping_add(id.raw()) % period) == 0

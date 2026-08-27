@@ -41,7 +41,7 @@ impl Odometer {
     }
 
     /// How many slots carry a reading.
-    #[inline(always)]
+    #[inline]
     pub fn slots(&self) -> usize {
         self.total.len()
     }
@@ -51,13 +51,13 @@ impl Odometer {
     /// # Panics
     ///
     /// If `id` names a slot this odometer has never covered.
-    #[inline(always)]
+    #[inline]
     pub fn reading(&self, id: EntityId) -> u32 {
         self.total[id.index()]
     }
 
     /// Every reading, indexed by entity id.
-    #[inline(always)]
+    #[inline]
     pub fn as_slice(&self) -> &[u32] {
         &self.total
     }

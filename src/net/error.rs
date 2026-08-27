@@ -23,7 +23,7 @@ pub enum RejectCode {
 }
 
 impl RejectCode {
-    #[inline(always)]
+    #[inline]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }

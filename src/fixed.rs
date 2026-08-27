@@ -41,59 +41,59 @@ impl Fixed {
     pub const EPSILON: Fixed = Fixed(1);
 
     /// From whole meters.
-    #[inline(always)]
+    #[inline]
     pub const fn from_meters(m: i32) -> Fixed {
         Fixed(m * FIXED_ONE)
     }
 
     /// From meters and thousandths, e.g. `from_millis(3, 500)` is 3.5 m.
     /// Rounds toward zero; 1/1000 is not exactly representable in binary.
-    #[inline(always)]
+    #[inline]
     pub const fn from_millis(m: i32, milli: i32) -> Fixed {
         Fixed(m * FIXED_ONE + (milli * FIXED_ONE) / 1000)
     }
 
     /// From raw internal units. Use when the value is already scaled.
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: i32) -> Fixed {
         Fixed(raw)
     }
 
     /// The underlying scaled integer.
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> i32 {
         self.0
     }
 
     /// Whole meters, truncated toward negative infinity.
-    #[inline(always)]
+    #[inline]
     pub const fn floor_meters(self) -> i32 {
         self.0 >> FIXED_SHIFT
     }
 
     /// Lossy conversion for display and tests. Never use in simulation state.
-    #[inline(always)]
+    #[inline]
     pub fn to_f32(self) -> f32 {
         self.0 as f32 / FIXED_ONE as f32
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn abs(self) -> Fixed {
         Fixed(self.0.abs())
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn min(self, other: Fixed) -> Fixed {
         if self.0 < other.0 { self } else { other }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn max(self, other: Fixed) -> Fixed {
         if self.0 > other.0 { self } else { other }
     }
 
     /// Clamp into `[lo, hi]`. Panics in debug if `lo > hi`.
-    #[inline(always)]
+    #[inline]
     pub const fn clamp(self, lo: Fixed, hi: Fixed) -> Fixed {
         debug_assert!(lo.0 <= hi.0);
         self.max(lo).min(hi)
@@ -105,7 +105,7 @@ impl Fixed {
     // state, pick explicitly: checked at boundaries where bad input can
     // arrive, plain ops in the hot path where ranges are already validated.
 
-    #[inline(always)]
+    #[inline]
     pub const fn checked_add(self, rhs: Fixed) -> Option<Fixed> {
         match self.0.checked_add(rhs.0) {
             Some(v) => Some(Fixed(v)),
@@ -113,7 +113,7 @@ impl Fixed {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn checked_sub(self, rhs: Fixed) -> Option<Fixed> {
         match self.0.checked_sub(rhs.0) {
             Some(v) => Some(Fixed(v)),
@@ -122,7 +122,7 @@ impl Fixed {
     }
 
     /// Multiply two fixed-point values, checked against `i32` range.
-    #[inline(always)]
+    #[inline]
     pub const fn checked_mul(self, rhs: Fixed) -> Option<Fixed> {
         let wide = (self.0 as i64 * rhs.0 as i64) >> FIXED_SHIFT;
         if wide < i32::MIN as i64 || wide > i32::MAX as i64 {
@@ -132,12 +132,12 @@ impl Fixed {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn saturating_add(self, rhs: Fixed) -> Fixed {
         Fixed(self.0.saturating_add(rhs.0))
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn saturating_sub(self, rhs: Fixed) -> Fixed {
         Fixed(self.0.saturating_sub(rhs.0))
     }
@@ -150,7 +150,7 @@ impl Fixed {
 impl Add for Fixed {
     type Output = Fixed;
     /// Scales already match, so this is a plain integer add.
-    #[inline(always)]
+    #[inline]
     fn add(self, rhs: Fixed) -> Fixed {
         Fixed(self.0 + rhs.0)
     }
@@ -158,7 +158,7 @@ impl Add for Fixed {
 
 impl Sub for Fixed {
     type Output = Fixed;
-    #[inline(always)]
+    #[inline]
     fn sub(self, rhs: Fixed) -> Fixed {
         Fixed(self.0 - rhs.0)
     }
@@ -166,21 +166,21 @@ impl Sub for Fixed {
 
 impl Neg for Fixed {
     type Output = Fixed;
-    #[inline(always)]
+    #[inline]
     fn neg(self) -> Fixed {
         Fixed(-self.0)
     }
 }
 
 impl AddAssign for Fixed {
-    #[inline(always)]
+    #[inline]
     fn add_assign(&mut self, rhs: Fixed) {
         self.0 += rhs.0;
     }
 }
 
 impl SubAssign for Fixed {
-    #[inline(always)]
+    #[inline]
     fn sub_assign(&mut self, rhs: Fixed) {
         self.0 -= rhs.0;
     }
@@ -191,7 +191,7 @@ impl Mul for Fixed {
     /// Fixed times fixed. The raw product carries 20 fractional bits, so it
     /// is shifted back down by 10. Widened to `i64` first because two 32-bit
     /// values overflow `i32` before the shift can bring them back in range.    
-    #[inline(always)]
+    #[inline]
     fn mul(self, rhs: Fixed) -> Fixed {
         Fixed(((self.0 as i64 * rhs.0 as i64) >> FIXED_SHIFT) as i32)
     }
@@ -200,7 +200,7 @@ impl Mul for Fixed {
 impl Mul<i32> for Fixed {
     type Output = Fixed;
     /// Scale up by a value. No shift needed.
-    #[inline(always)]
+    #[inline]
     fn mul(self, rhs: i32) -> Fixed {
         Fixed(self.0 * rhs)
     }
@@ -209,7 +209,7 @@ impl Mul<i32> for Fixed {
 impl Div for Fixed {
     type Output = Fixed;
     /// Fixed divided by fixed. Shifted up before dividing. Panics on division by zero.
-    #[inline(always)]
+    #[inline]
     fn div(self, rhs: Fixed) -> Fixed {
         Fixed((((self.0 as i64) << FIXED_SHIFT) / rhs.0 as i64) as i32)
     }
@@ -218,7 +218,7 @@ impl Div for Fixed {
 impl Div<i32> for Fixed {
     type Output = Fixed;
     /// Divide fixed by scalar (scale down)
-    #[inline(always)]
+    #[inline]
     fn div(self, rhs: i32) -> Fixed {
         Fixed(self.0 / rhs)
     }
@@ -270,30 +270,30 @@ impl DistSq {
     pub const ZERO: DistSq = DistSq(0);
 
     /// Square a radius so it can be compared against a [`DistSq`].
-    #[inline(always)]
+    #[inline]
     pub const fn from_radius(r: Fixed) -> DistSq {
         let raw = r.0 as i64;
         DistSq((raw * raw) as u64)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn from_raw(raw: u64) -> DistSq {
         DistSq(raw)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn raw(self) -> u64 {
         self.0
     }
 
     /// Approximate distance via integer square root. For display and coarse
     /// bucketing only. For comparison use the squared values.
-    pub const fn sqrt_approx(self) -> Fixed {        
+    pub const fn sqrt_approx(self) -> Fixed {
         if self.0 == 0 {
             return Fixed::ZERO;
         }
         let mut x = self.0;
-        let mut y = (x + 1) / 2;
+        let mut y = x.div_ceil(2);
         while y < x {
             x = y;
             y = (x + self.0 / x) / 2;

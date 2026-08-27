@@ -41,13 +41,13 @@ impl RecordCodec {
     }
 
     /// The number of bytes a record occupies
-    #[inline(always)]
+    #[inline]
     pub fn record_bytes(&self) -> usize {
         4 + self.pos_bytes
     }
 
     /// The number of bytes the encoded position occupies
-    #[inline(always)]
+    #[inline]
     pub fn position_bytes(&self) -> usize {
         self.pos_bytes
     }

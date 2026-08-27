@@ -622,8 +622,9 @@ authored. Everything else in this table derives from those five.
 
 `fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
 `odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`. 280
-library tests pass, and one integration test drives a region and three edges end
-to end.
+library tests pass, and two integration tests run against a live broker: one
+drives a region and three edges end to end, the other moves an entity from one
+region into another.
 
 A tick runs end to end: the game moves entities, the odometer observes how far
 they went, the snapshot is rebuilt in cell order, and every due viewer is
@@ -1195,11 +1196,52 @@ is reliable and ordered. Carrying payloads here is what lets the thing run end
 to end before the datagram path exists. It is not what §Architecture says should
 happen, and the smoke test below shows why in numbers.
 
+### Moving an entity between regions
+
+`docs/adr/0003` decides how, and decides that nothing in the library changes to
+allow it. The edge asks the destination for the entity, waits for the add
+carrying the id the destination allocated, and only then gives the origin's copy
+back. Spawn first, despawn second: ordered the other way there is a window where
+the entity exists nowhere, and nothing needs that window.
+
+**Reaching a second region costs no connect and no subscribe.** An edge's two
+subscriptions are wildcards over the region, so a destination it has never dealt
+with is already reachable. `tests/region_migration.rs` runs two regions in one
+process with one edge talking to both through a single `RegionClient`.
+
+**Measured**, at 100 Hz, with both regions, the edge and the broker on one M1,
+over ten runs. Asking the destination to the add coming back: 1.4 to 9.4 ms. The
+add to the first packet the destination addressed to that entity: 8.7 to 13.5 ms,
+which is the tick it takes to register the viewer and serve it. End to end: 10.5
+to 22.9 ms. Against a transport where a new destination meant a connect and a
+handshake, that difference is the case `docs/adr/0001` made.
+
+**The id is the destination's, and the origin's is refused there.** Ids are
+unique within a region, so the destination allocates its own and the consumer
+rekeys whatever state it holds against it. A move sent under the origin's id is
+counted and dropped rather than applied. That is the ownership check catching an
+edge's own stale ids, not an authorization decision.
+
+**Bystanders are told what happened, and nothing special-cases them.** Whoever
+could see the entity in the origin is sent a despawn for it, because that is what
+happened there. Whoever can see it in the destination is sent it as an arrival,
+because that is what happened here. Both fall out of the ghost table on each
+side. It is also why the seamless case is a separate record: crossing a field
+boundary this way would make every bystander drop the entity and re-add it, which
+is a visible flicker for people who did not move.
+
+**An edge stops moving an entity when it gives it back, not when the removal is
+reported.** A move already in flight for an entity just despawned is refused, and
+the round trip is a tick or more. Migrating 16 observers a second without this
+cost 16 refused moves a second, one per migration, which is how it was found.
+
 ### The smoke test
 
 `examples/herd-sim.rs` is a region whose game applies whatever its edges sent.
 `examples/herd-edge.rs` asks for a population, walks it, hands observers back and
-asks for replacements, and reads the replication that comes down.
+asks for replacements, and reads the replication that comes down. Given `--to`
+and `--migrate` it also walks part of that population into a second region and
+back, by the sequence above.
 
 `herd-sim` draws a card per attached edge when stdout is a terminal, adding and
 dropping cards as edges come and go, and writes one line a second when stdout is
@@ -1300,6 +1342,13 @@ hardware someone would rent, and still wants a definition of comfortable.
 **Payload volume.** 24,576 observers at 98 records each and 20 Hz is 48 million
 records per second, or 578 MB/s, across eight edges. That is what the reliable
 ordered stream is carrying in place of datagrams.
+
+**Two regions, measured.** One `herd-edge` holding 512 observers against two
+`herd-sim` regions at 20 Hz, migrating 16 observers a second and churning 8. After
+a minute the crowd had settled at 300 entities in one region and 212 in the other:
+512 in total, none lost and none duplicated, 960 migrations completed, and no
+command refused by either region. Mean tick was 1.22 ms in one and 0.91 ms in the
+other, which says the run is about the bookkeeping rather than the load.
 
 Not built: the datagram path, the ack path the ghost mark needs, the reliable
 event channel, and the edge server that holds game client sockets. `herd-edge`

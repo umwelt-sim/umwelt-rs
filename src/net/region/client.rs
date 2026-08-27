@@ -1,21 +1,25 @@
 //! An edge's side of the link, over NATS.
 //!
-//! [`RegionLink`] is one NATS connection and the edge's own name. Through it an
-//! edge talks to any number of regions, and reaching one it has never heard of
-//! costs nothing: its two subscriptions are wildcards taken at startup, so a
-//! payload from a region that did not exist then matches a subscription it
-//! already holds. See `docs/adr/0001`.
+//! [`RegionClient`] is the edge's own name plus a connection the caller made.
+//! Through it an edge talks to any number of regions, and reaching one it has
+//! never heard of costs nothing: its two subscriptions are wildcards taken at
+//! construction, so a payload from a region that did not exist then matches a
+//! subscription it already holds. See `docs/adr/0001`.
 //!
-//! A `RegionLink` is not an edge server. An edge server will hold one of these
-//! and run its own client-facing protocol on the other side of itself. This
-//! knows nothing about game clients, fan-out, or relaying.
+//! It connects to nothing itself. The caller supplies a connected
+//! [`async_nats::Client`] and a Tokio [`Handle`], so where and how the edge
+//! reaches the broker is the caller's to choose.
+//!
+//! A `RegionClient` is not an edge server. An edge server will hold one of
+//! these and run its own client-facing protocol on the other side of itself.
+//! This knows nothing about game clients, fan-out, or relaying.
 
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::config::WorldConfig;
@@ -30,9 +34,6 @@ use crate::net::region::protocol::{
 use crate::net::region::subjects;
 use crate::pos::Pos3;
 use crate::sim::ViewerId;
-
-/// How long an edge waits for a region to answer a request for its parameters.
-pub const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a region says it is, checked before an edge uses it.
 ///
@@ -59,31 +60,32 @@ pub enum Incoming {
 }
 
 /// One edge's connection to the region tier.
-pub struct RegionLink {
+pub struct RegionClient {
     edge: EdgeName,
     client: async_nats::Client,
-    runtime: Runtime,
+    runtime: Handle,
     /// Behind a lock so the link can be shared: one thread publishing while
     /// another receives is the ordinary shape, and only one should receive.
     inbox: Mutex<Receiver<Incoming>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
-impl RegionLink {
-    /// Connects to NATS and subscribes to everything addressed to this edge.
+impl RegionClient {
+    /// Subscribes to everything addressed to this edge, on a connection the
+    /// caller made.
     ///
     /// Two subscriptions, both wildcards over the region: payloads and replies.
     /// Neither is ever taken again, whatever regions the edge later deals with.
-    pub fn connect(url: &str, edge: EdgeName) -> Result<RegionLink, NetError> {
-        let runtime = Runtime::new()?;
-        let client = runtime.block_on(async_nats::connect(url))?;
+    pub fn new(
+        client: async_nats::Client,
+        runtime: Handle,
+        edge: EdgeName,
+    ) -> Result<RegionClient, NetError> {
         let (send, inbox) = channel();
-
         let mut tasks = Vec::new();
         tasks.push(runtime.block_on(Self::read_payloads(&client, &edge, send.clone()))?);
         tasks.push(runtime.block_on(Self::read_replies(&client, &edge, send))?);
-
-        Ok(RegionLink { edge, client, runtime, inbox: Mutex::new(inbox), tasks })
+        Ok(RegionClient { edge, client, runtime, inbox: Mutex::new(inbox), tasks })
     }
 
     #[inline]
@@ -94,11 +96,12 @@ impl RegionLink {
     /// Asks a region what world it runs, and checks the answer.
     ///
     /// Rebuilding the config is also the check that this end decodes the
-    /// region's packets the way the region encodes them.
-    pub fn info(&self, region: RegionId) -> Result<Offer, NetError> {
+    /// region's packets the way the region encodes them. How long to wait for
+    /// an answer depends on where the broker is, so it is the caller's.
+    pub fn info(&self, region: RegionId, within: Duration) -> Result<Offer, NetError> {
         let answer = self.runtime.block_on(async {
             tokio::time::timeout(
-                INFO_TIMEOUT,
+                within,
                 self.client.request(subjects::info(region), Vec::new().into()),
             )
             .await
@@ -170,9 +173,9 @@ impl RegionLink {
 
     /// Says nothing except that this edge is still here.
     ///
-    /// A region drops an edge silent past
-    /// [`EDGE_TIMEOUT`](crate::net::EDGE_TIMEOUT) and despawns what it managed.
-    /// An edge sending moves every tick never needs this; an idle one does.
+    /// A region drops an edge silent past the timeout it was built with, and
+    /// despawns what that edge managed. An edge sending moves every tick never
+    /// needs this; an idle one does.
     pub fn keepalive(&self, region: RegionId) -> Result<(), NetError> {
         self.send_all(region, std::iter::once(vec![KIND_KEEPALIVE]))
     }
@@ -257,7 +260,7 @@ impl RegionLink {
     }
 }
 
-impl Drop for RegionLink {
+impl Drop for RegionClient {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
@@ -265,8 +268,8 @@ impl Drop for RegionLink {
     }
 }
 
-impl core::fmt::Debug for RegionLink {
+impl core::fmt::Debug for RegionClient {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("RegionLink").field("edge", &self.edge).finish_non_exhaustive()
+        f.debug_struct("RegionClient").field("edge", &self.edge).finish_non_exhaustive()
     }
 }

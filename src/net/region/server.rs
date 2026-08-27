@@ -4,15 +4,18 @@
 //! the commands its edges send, and drops an edge that has gone quiet. It holds
 //! no world state and runs no tick.
 //!
-//! It owns a Tokio runtime on threads of its own. The tick loop never touches
-//! it: [`Handoff`](crate::Handoff) already moves payloads off the tick thread,
-//! and that thread is the one that publishes. See `docs/adr/0001`.
+//! It connects to nothing. The caller supplies a connected
+//! [`async_nats::Client`] and a Tokio [`Handle`] to drive it, so the broker
+//! address, credentials, TLS, cluster membership and reconnect policy are the
+//! caller's to choose. The tick loop never touches either:
+//! [`Handoff`](crate::Handoff) already moves payloads off the tick thread, and
+//! that thread is the one that publishes. See `docs/adr/0001`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::config::WorldConfig;
@@ -24,14 +27,7 @@ use crate::net::region::protocol::{
 use crate::net::region::session::Inbound;
 use crate::net::region::subjects;
 
-/// How long an edge may say nothing before the region drops it and despawns
-/// what it managed.
-///
-/// A closed socket used to carry this. An edge under load sends moves every
-/// tick, so this only decides how long an idle edge survives.
-pub const EDGE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How often silence is checked.
+/// How often silence is checked against the caller's timeout.
 const SWEEP: Duration = Duration::from_secs(1);
 
 /// A region's front door.
@@ -39,25 +35,30 @@ pub struct RegionServer {
     region: RegionId,
     config: WorldConfig,
     client: async_nats::Client,
-    runtime: Runtime,
     edges: Arc<Edges>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl RegionServer {
-    /// Connects to NATS and starts serving.
+    /// Starts serving on a connection the caller made.
     ///
     /// Three things run from here on: replies to `umwelt.{region}.info`,
     /// commands read off `umwelt.{region}.edge.*.command`, and a sweep that
-    /// drops edges silent past [`EDGE_TIMEOUT`].
-    pub fn connect(
-        url: &str,
+    /// drops edges silent for longer than `edge_timeout`.
+    ///
+    /// `edge_timeout` decides how long an edge that says nothing survives
+    /// before the region drops it and despawns what it managed. A closed socket
+    /// used to carry that. An edge under load sends moves every tick, so this
+    /// only decides how long an idle one lasts, and how long a dead one keeps
+    /// its entities alive.
+    pub fn new(
+        client: async_nats::Client,
+        runtime: Handle,
         region: RegionId,
         config: WorldConfig,
         inbound: Arc<Inbound>,
+        edge_timeout: Duration,
     ) -> Result<RegionServer, NetError> {
-        let runtime = Runtime::new()?;
-        let client = runtime.block_on(async_nats::connect(url))?;
         let edges = Arc::clone(inbound.edges());
 
         let mut tasks = Vec::new();
@@ -74,12 +75,12 @@ impl RegionServer {
                 let mut every = tokio::time::interval(SWEEP);
                 loop {
                     every.tick().await;
-                    edges.expire(EDGE_TIMEOUT);
+                    edges.expire(edge_timeout);
                 }
             }
         }));
 
-        Ok(RegionServer { region, config, client, runtime, edges, tasks })
+        Ok(RegionServer { region, config, client, edges, tasks })
     }
 
     #[inline]
@@ -102,13 +103,6 @@ impl RegionServer {
     #[inline]
     pub fn client(&self) -> &async_nats::Client {
         &self.client
-    }
-
-    /// A handle onto this server's runtime, so a synchronous thread can drive
-    /// a publish without a runtime of its own.
-    #[inline]
-    pub fn runtime(&self) -> Handle {
-        self.runtime.handle().clone()
     }
 
     async fn serve_info(

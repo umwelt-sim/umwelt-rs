@@ -89,6 +89,15 @@ subject.
 `{edge}` is a stable name the edge declares, not the dense per-region `EdgeId`,
 which stays internal to a region's own bookkeeping.
 
+**The library takes a connected client and never makes one.** `RegionServer` and
+`RegionClient` are built from an `async_nats::Client` and a Tokio handle the
+caller already holds. Flexible topology is a large part of why NATS was chosen —
+one server, a cluster, leaf nodes, credentials, TLS, whatever reconnect policy —
+and none of it is the library's to pick. What the library decides is the subject scheme
+and the message encodings, because both ends have to agree on those or nothing
+works. Durations follow the same rule: how long a silent edge survives, and how
+long to wait for a region to answer, are parameters rather than constants.
+
 Authorization moves to NATS accounts, JWT and `.creds` files. That replaces
 `auth.rs`, whose bearer secret its own documentation describes as second lock
 rather than first.

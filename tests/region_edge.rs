@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use umwelt::net::{
-    EdgeName, EdgeSink, EntityKind, Incoming, Inbound, RegionId, RegionLink, RegionServer,
+    EdgeName, EdgeSink, EntityKind, Incoming, Inbound, RegionClient, RegionId, RegionServer,
 };
 use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, ViewerId, Wait};
 use umwelt::{EntityId, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
@@ -86,9 +86,23 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
     let edges = Arc::new(umwelt::net::Edges::new());
     let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
 
-    let server = RegionServer::connect(&url(), region, cfg, Arc::clone(&inbound))
+    // The test owns the connection, as a deployment would.
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let client = runtime
+        .block_on(async_nats::connect(url()))
         .expect("a nats-server must be running; see the module doc");
-    let sink = EdgeSink::new(region, server.client().clone(), server.runtime(), Arc::clone(&edges));
+    // Held for the whole run: dropping it aborts the subscriptions.
+    let _server = RegionServer::new(
+        client.clone(),
+        runtime.handle().clone(),
+        region,
+        cfg,
+        Arc::clone(&inbound),
+        Duration::from_secs(5),
+    )
+    .expect("serves");
+    let sink =
+        EdgeSink::new(region, client.clone(), runtime.handle().clone(), Arc::clone(&edges));
 
     let mut sim = WorldSimulation::new(cfg, Applier { inbound: Arc::clone(&inbound) })
         .with_sink(Handoff::new(sink.clone()));
@@ -122,8 +136,15 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
             scope.spawn(move || {
                 let name = EdgeName::new(format!("test-{}-{e}", std::process::id()))
                     .expect("valid name");
-                let link = RegionLink::connect(&url(), name).expect("connects to nats");
-                let offer = link.info(region).expect("the region answers");
+                let edge_runtime = tokio::runtime::Runtime::new().expect("a runtime");
+                let edge_client = edge_runtime
+                    .block_on(async_nats::connect(url()))
+                    .expect("connects to nats");
+                let link =
+                    RegionClient::new(edge_client, edge_runtime.handle().clone(), name)
+                        .expect("subscribes");
+                let offer =
+                    link.info(region, Duration::from_secs(5)).expect("the region answers");
                 assert_eq!(offer.region, region);
                 let codec = RecordCodec::new(&offer.config);
 

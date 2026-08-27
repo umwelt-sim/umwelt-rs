@@ -53,4 +53,4 @@ pub use sim::{
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
 pub use subscription::{CellList, Subscription};
-pub use net::{RegionId, RegionLink, RegionServer};
+pub use net::{RegionClient, RegionId, RegionServer};

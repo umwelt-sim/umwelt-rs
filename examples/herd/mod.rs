@@ -51,3 +51,24 @@ pub fn world(tick_hz: u32) -> WorldConfig {
             std::process::exit(2);
         })
 }
+
+/// Connects to NATS, with credentials if a path was given.
+///
+/// Both binaries own their connection rather than handing an address to the
+/// library, so this is where a deployment's choices land: a comma-separated
+/// server list for a cluster, a `.creds` file, and whatever else
+/// `ConnectOptions` offers.
+pub async fn connect(
+    url: &str,
+    creds: Option<String>,
+) -> Result<async_nats::Client, Box<dyn std::error::Error + Send + Sync>> {
+    let options = match creds {
+        Some(path) => async_nats::ConnectOptions::with_credentials_file(path).await?,
+        None => async_nats::ConnectOptions::new(),
+    };
+    let servers: Vec<async_nats::ServerAddr> = url
+        .split(',')
+        .map(|one| one.trim().parse())
+        .collect::<Result<_, _>>()?;
+    Ok(async_nats::connect_with_options(servers, options).await?)
+}

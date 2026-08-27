@@ -83,12 +83,28 @@ fn main() {
 
     let edges = Arc::new(Edges::new());
     let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
-    let server = RegionServer::connect(&url, region, cfg, Arc::clone(&inbound))
-        .unwrap_or_else(|e| {
-            eprintln!("nats {url}: {e}");
-            std::process::exit(1);
-        });
-    let sink = EdgeSink::new(region, server.client().clone(), server.runtime(), Arc::clone(&edges));
+    // This binary owns its connection, so the broker address, credentials and
+    // cluster membership are set here rather than by the library.
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let client = runtime.block_on(herd::connect(&url, herd::arg("creds"))).unwrap_or_else(|e| {
+        eprintln!("nats {url}: {e}");
+        std::process::exit(1);
+    });
+    let edge_timeout = Duration::from_secs(herd::arg_or("edge-timeout", 5u64));
+    // Held for the whole run: dropping it aborts the subscriptions.
+    let _server = RegionServer::new(
+        client.clone(),
+        runtime.handle().clone(),
+        region,
+        cfg,
+        Arc::clone(&inbound),
+        edge_timeout,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("serving {region}: {e}");
+        std::process::exit(1);
+    });
+    let sink = EdgeSink::new(region, client, runtime.handle().clone(), Arc::clone(&edges));
 
     if plain {
         println!(

@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EdgeName, EntityKind, Incoming, RegionId, RegionLink};
+use umwelt::net::{EdgeName, EntityKind, Incoming, RegionClient, RegionId};
 use umwelt::sim::ViewerId;
 use umwelt::{EntityId, Fixed, PacketReader, Pos3, RecordCodec};
 
@@ -52,11 +52,19 @@ fn main() {
     // clients disconnecting and connecting.
     let churn: usize = herd::arg_or("churn", 0usize);
 
-    let link = RegionLink::connect(&url, name.clone()).unwrap_or_else(|e| {
+    // This binary owns its connection, so where and how it reaches the broker
+    // is set here rather than by the library.
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let client = runtime.block_on(herd::connect(&url, herd::arg("creds"))).unwrap_or_else(|e| {
         eprintln!("nats {url}: {e}");
         std::process::exit(1);
     });
-    let offer = link.info(region).unwrap_or_else(|e| {
+    let link = RegionClient::new(client, runtime.handle().clone(), name.clone())
+        .unwrap_or_else(|e| {
+            eprintln!("subscribing: {e}");
+            std::process::exit(1);
+        });
+    let offer = link.info(region, Duration::from_secs(5)).unwrap_or_else(|e| {
         eprintln!("asking {region} what it runs: {e}");
         std::process::exit(1);
     });

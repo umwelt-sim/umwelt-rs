@@ -29,10 +29,14 @@ out of band. Neither is changed by this record.
 
 ### What a region publishes
 
-Every region publishes a heartbeat once a second on
+A region publishes a heartbeat on
 `umwelt.control.region.{region}.heartbeat`. One subject per region, so a
 subscriber can watch one or watch `umwelt.control.region.*.heartbeat` and see
 the tier.
+
+How often is the caller's. The library publishes when asked and holds no timer,
+because how much resolution an operator wants, and how much traffic that is
+worth, depends on the deployment rather than on the protocol.
 
 The body carries:
 
@@ -49,9 +53,9 @@ The body carries:
 No address, no port, no neighbors. A heartbeat says what a region is and how it
 is doing, and nothing about how to reach it, because nothing needs to reach it.
 
-A region is considered gone after three missed heartbeats, three seconds. The
-same shape as `EDGE_TIMEOUT` in 0001 and for the same reason: with nothing to
-close, silence is the signal.
+What silence means is also the caller's. With nothing to close, absence is the
+only signal a region has stopped, and how long to wait before believing it is a
+judgment about the network rather than about umwelt.
 
 `protocol_hash` earns its place. Two regions built from configs that differ in
 any field affecting wire layout will decode each other's packets into nonsense,
@@ -59,8 +63,14 @@ and nothing else on this page would show it.
 
 ### Authentication
 
-NATS accounts, with user JWTs and `.creds` files. Subject permissions do the
-work the bearer secret did not:
+NATS accounts, with user JWTs and `.creds` files. The library accepts a client
+that was connected with whatever credentials the deployment chose, so account
+layout is not decided here.
+
+One property is worth naming, because a piece of the protocol depends on it.
+`RegionServer` reads the sending edge out of the subject a command arrived on
+and treats that as the sender's identity. That is convention unless the broker
+enforces it. Permissions along these lines are one way to make it true:
 
 | principal | may publish | may subscribe |
 |---|---|---|
@@ -68,15 +78,13 @@ work the bearer secret did not:
 | edge `{e}` | `umwelt.*.edge.{e}.command`, `umwelt.*.info` | `umwelt.*.edge.{e}.payload`, `umwelt.*.edge.{e}.reply` |
 | an operator | nothing | `umwelt.control.>` |
 
-This is stronger than what it replaces in a way worth naming. `RegionServer`
-reads the sending edge out of the subject a command arrived on, and treats that
-as the sender's identity. With these permissions the broker enforces it: an edge
-cannot publish on another edge's command subject, so it cannot move another
-edge's entities even by trying. Under the bearer secret, any edge holding the
-secret could have published anything.
+With permissions of that shape, an edge cannot publish on another edge's command
+subject, so it cannot move another edge's entities even by trying. Under the
+bearer secret 0001 deleted, any edge holding the secret could have published
+anything.
 
-The library accepts credentials and does nothing else about them. Issuing them,
-and the account layout the table implies, are deployment work.
+A single account, an account per tenant, leaf nodes for a remote site: all of
+those work, and which one is right is not something this record can know.
 
 ### What umwelt does and does not do
 

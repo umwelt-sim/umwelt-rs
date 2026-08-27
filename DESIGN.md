@@ -1012,11 +1012,17 @@ none of them trusted, deployed on someone else's machine and updated on their
 schedule. Game clients do not speak NATS, so that link is unaffected by the
 transport change.
 
+**Neither end connects to anything.** Both take a connected
+`async_nats::Client` and a Tokio handle, so the broker address, credentials,
+TLS and cluster membership stay with whoever is deploying. The library decides
+the subjects and the encodings, because both ends have to agree on those or
+nothing works, and nothing else.
+
 **Two ends, and deliberately not one type.** `RegionServer` is a region's side.
-`RegionLink` is an edge's: one NATS connection through which it talks to any
-number of regions. An edge server will hold a `RegionLink` and run its own
-client-facing protocol on the other side of itself; it is not built and it is
-not `RegionLink`. Collapsing the two would put per-client work back on the edge
+`RegionClient` is an edge's: its own name plus a connection the caller made,
+through which it talks to any number of regions. An edge server will hold a
+`RegionClient` and run its own client-facing protocol on the other side of
+itself; it is not built and it is not `RegionClient`. Collapsing the two would put per-client work back on the edge
 tier, which is what §Why per-client work stays in the simulation is about.
 
 **Messages are named for what they carry, not for who sends them.** A message

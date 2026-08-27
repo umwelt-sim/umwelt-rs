@@ -15,12 +15,12 @@ mod server;
 pub mod session;
 pub mod subjects;
 
-pub use client::{INFO_TIMEOUT, Incoming, Offer, RegionLink};
+pub use client::{Incoming, Offer, RegionClient};
 pub use edges::{ClaimError, EdgeId, EdgeName, EdgeView, Edges};
 pub use protocol::{
     DespawnEntities, EntitiesSpawned, EntityKind, MAX_DESPAWN_PER_MESSAGE, MAX_MESSAGE_BYTES,
     MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION,
     ProtocolVersion, RegionId, ServerInfo, ServerVersion, SpawnEntities, WorldParams,
 };
-pub use server::{EDGE_TIMEOUT, RegionServer};
+pub use server::RegionServer;
 pub use session::{Applied, EdgeSink, Inbound, Settled};

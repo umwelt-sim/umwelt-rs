@@ -19,6 +19,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::config::WorldConfig;
+use crate::net::control::{self, Heartbeat, RegionLoad};
 use crate::net::error::NetError;
 use crate::net::region::edges::Edges;
 use crate::net::region::protocol::{
@@ -35,6 +36,7 @@ pub struct RegionServer {
     region: RegionId,
     config: WorldConfig,
     client: async_nats::Client,
+    runtime: Handle,
     edges: Arc<Edges>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -80,7 +82,7 @@ impl RegionServer {
             }
         }));
 
-        Ok(RegionServer { region, config, client, edges, tasks })
+        Ok(RegionServer { region, config, client, runtime, edges, tasks })
     }
 
     #[inline]
@@ -97,6 +99,28 @@ impl RegionServer {
     #[inline]
     pub fn edges(&self) -> &Arc<Edges> {
         &self.edges
+    }
+
+    /// Publishes one heartbeat.
+    ///
+    /// Called by the consumer, as often as it wants. The library holds no timer
+    /// and defines no cadence; see `docs/adr/0002`. The consumer supplies what
+    /// only its loop knows, and this fills in the region, the versions, the
+    /// world digest and the edge count.
+    pub fn heartbeat(&self, load: RegionLoad) -> Result<(), NetError> {
+        let beat = Heartbeat {
+            region: self.region,
+            protocol: PROTOCOL_VERSION,
+            server: ServerVersion::CURRENT,
+            protocol_hash: self.config.protocol_hash(),
+            edges: self.edges.len() as u32,
+            load,
+        };
+        let mut body = Vec::with_capacity(Heartbeat::BYTES);
+        beat.encode(&mut body);
+        self.runtime
+            .block_on(self.client.publish(control::subject(self.region), body.into()))?;
+        Ok(())
     }
 
     /// The NATS client, for a sink that publishes payloads.

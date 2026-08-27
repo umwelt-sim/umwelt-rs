@@ -1,0 +1,224 @@
+//! What a region says about itself, for whoever is watching the tier.
+//!
+//! A separate protocol from `net::region`, and deliberately not sharing types
+//! with it. That one is how a region and its edges do their work; this one is
+//! how an operator sees that the work is happening. See `docs/adr/0002`.
+//!
+//! The library publishes and does not subscribe. Deciding anything from a
+//! heartbeat — rebalancing, draining, placing regions — belongs to a control
+//! plane tier that is a separate program and is not built.
+//!
+//! **No cadence is defined here.** A region publishes when its consumer asks it
+//! to. How often that is worth doing, and how long silence has to last before
+//! anyone believes a region has stopped, are deployment judgments rather than
+//! protocol ones.
+
+use core::fmt;
+use std::time::Duration;
+
+use crate::net::error::NetError;
+use crate::net::region::protocol::{Cursor, ProtocolVersion, RegionId, ServerVersion};
+
+/// One region's heartbeat subject.
+pub fn subject(region: RegionId) -> String {
+    format!("umwelt.control.region.{}.heartbeat", region.raw())
+}
+
+/// Every region's, for a watcher that wants the whole tier.
+pub fn all_subjects() -> &'static str {
+    "umwelt.control.region.*.heartbeat"
+}
+
+/// What only the region's own loop can report.
+///
+/// The tick figures cover the span since the previous heartbeat, not a fixed
+/// second: the interval is the consumer's, so the window is too. `late` and
+/// `dropped` are counts over that same span, which says more than a sample
+/// would.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegionLoad {
+    pub tick_count: u32,
+    pub entities: u32,
+    /// Slots ever allocated. Despawn does not reclaim, so this climbs with
+    /// churn while `entities` does not. See §Slot growth under churn.
+    pub slots: u32,
+    pub viewers: u32,
+    pub mean_tick: Duration,
+    pub worst_tick: Duration,
+    /// Ticks that started after their deadline.
+    pub late: u32,
+    /// Deadlines skipped under `Overrun::Drop`.
+    pub dropped: u32,
+}
+
+/// A region saying what it is and how it is doing.
+///
+/// No address, no port, no neighbors. Nothing needs to reach a region: an edge
+/// finds it by subject. See `docs/adr/0001`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub region: RegionId,
+    pub protocol: ProtocolVersion,
+    pub server: ServerVersion,
+    /// The world's wire layout. Two regions whose digests differ decode each
+    /// other's packets into nonsense, and nothing else here would show it.
+    pub protocol_hash: u64,
+    /// Edges this region has heard from and not yet expired.
+    pub edges: u32,
+    pub load: RegionLoad,
+}
+
+impl Heartbeat {
+    pub const BYTES: usize = 56;
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&self.region.raw().to_le_bytes());
+        out.extend_from_slice(&self.protocol.raw().to_le_bytes());
+        out.extend_from_slice(&self.server.major.to_le_bytes());
+        out.extend_from_slice(&self.server.minor.to_le_bytes());
+        out.extend_from_slice(&self.server.patch.to_le_bytes());
+        out.extend_from_slice(&self.protocol_hash.to_le_bytes());
+        out.extend_from_slice(&self.edges.to_le_bytes());
+        out.extend_from_slice(&self.load.tick_count.to_le_bytes());
+        out.extend_from_slice(&self.load.entities.to_le_bytes());
+        out.extend_from_slice(&self.load.slots.to_le_bytes());
+        out.extend_from_slice(&self.load.viewers.to_le_bytes());
+        out.extend_from_slice(&nanos(self.load.mean_tick).to_le_bytes());
+        out.extend_from_slice(&nanos(self.load.worst_tick).to_le_bytes());
+        out.extend_from_slice(&self.load.late.to_le_bytes());
+        out.extend_from_slice(&self.load.dropped.to_le_bytes());
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Heartbeat, NetError> {
+        let mut c = Cursor::new(body, "heartbeat");
+        let region = RegionId::from_raw(c.u32()?);
+        let protocol = ProtocolVersion::from_raw(c.u16()?);
+        let server = ServerVersion { major: c.u16()?, minor: c.u16()?, patch: c.u16()? };
+        let protocol_hash = c.u64()?;
+        let edges = c.u32()?;
+        let load = RegionLoad {
+            tick_count: c.u32()?,
+            entities: c.u32()?,
+            slots: c.u32()?,
+            viewers: c.u32()?,
+            mean_tick: Duration::from_nanos(u64::from(c.u32()?)),
+            worst_tick: Duration::from_nanos(u64::from(c.u32()?)),
+            late: c.u32()?,
+            dropped: c.u32()?,
+        };
+        c.finish()?;
+        Ok(Heartbeat { region, protocol, server, protocol_hash, edges, load })
+    }
+}
+
+impl fmt::Display for Heartbeat {
+    /// One line, for a watcher that has nothing more elaborate to do with it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} umwelt {} proto {} hash {:#018x} | {} edges | {} entities, {} slots, \
+             {} viewers | tick mean {:.2} ms worst {:.2} ms | {} late, {} dropped",
+            self.region,
+            self.server,
+            self.protocol,
+            self.protocol_hash,
+            self.edges,
+            self.load.entities,
+            self.load.slots,
+            self.load.viewers,
+            self.load.mean_tick.as_secs_f64() * 1_000.0,
+            self.load.worst_tick.as_secs_f64() * 1_000.0,
+            self.load.late,
+            self.load.dropped,
+        )
+    }
+}
+
+/// A tick longer than four seconds saturates rather than wrapping. Anything
+/// near it is already a failure the numbers beside it will show.
+fn nanos(d: Duration) -> u32 {
+    u32::try_from(d.as_nanos()).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::region::protocol::PROTOCOL_VERSION;
+
+    fn sample() -> Heartbeat {
+        Heartbeat {
+            region: RegionId::from_raw(7),
+            protocol: PROTOCOL_VERSION,
+            server: ServerVersion::CURRENT,
+            protocol_hash: 0x0123_4567_89AB_CDEF,
+            edges: 4,
+            load: RegionLoad {
+                tick_count: 1_234_567,
+                entities: 8_192,
+                slots: 63_712,
+                viewers: 8_188,
+                mean_tick: Duration::from_micros(15_540),
+                worst_tick: Duration::from_micros(17_420),
+                late: 3,
+                dropped: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_round_trips() {
+        let m = sample();
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(buf.len(), Heartbeat::BYTES);
+        assert_eq!(Heartbeat::decode(&buf).expect("well formed"), m);
+    }
+
+    #[test]
+    fn a_truncated_heartbeat_is_refused() {
+        let mut buf = Vec::new();
+        sample().encode(&mut buf);
+        for cut in 0..buf.len() {
+            assert!(Heartbeat::decode(&buf[..cut]).is_err(), "{cut} bytes must not parse");
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut buf = Vec::new();
+        sample().encode(&mut buf);
+        buf.push(0);
+        assert!(Heartbeat::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn an_absurd_tick_saturates_rather_than_wrapping() {
+        let mut m = sample();
+        m.load.worst_tick = Duration::from_secs(30);
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        let back = Heartbeat::decode(&buf).expect("well formed");
+        assert_eq!(back.load.worst_tick, Duration::from_nanos(u64::from(u32::MAX)));
+    }
+
+    #[test]
+    fn the_wildcard_matches_any_region() {
+        // What a watcher subscribes to once and never again.
+        for region in [1u32, 7, 4_000_000] {
+            let concrete = subject(RegionId::from_raw(region));
+            let (p, c): (Vec<_>, Vec<_>) =
+                (all_subjects().split('.').collect(), concrete.split('.').collect());
+            assert_eq!(p.len(), c.len());
+            assert!(p.iter().zip(&c).all(|(a, b)| *a == "*" || a == b), "{concrete}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_prints_one_line() {
+        let shown = sample().to_string();
+        assert!(shown.contains("region 7"), "{shown}");
+        assert!(shown.contains("8192 entities"), "{shown}");
+        assert!(!shown.contains('\n'), "a watcher prints one per line");
+    }
+}

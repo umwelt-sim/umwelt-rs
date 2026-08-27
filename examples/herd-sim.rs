@@ -29,12 +29,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EdgeSink, Edges, Inbound, RegionId, RegionServer};
+use umwelt::net::{EdgeSink, Edges, Inbound, RegionId, RegionLoad, RegionServer};
 use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
-/// The region's game. Everything it does is what the edges asked for, which is
-/// the point of the exercise: no world logic, only the wire.
+/// What a heartbeat reports, accumulated over the span since the last one.
+#[derive(Default)]
+struct Beat {
+    ticks: u32,
+    viewers: u64,
+    spent: Duration,
+    worst: Duration,
+    late: u32,
+    dropped: u32,
+}
+
+/// The region's game. Everything it does is what the edges asked for: no world
+/// logic, only the wire.
 struct Applier {
     inbound: Arc<Inbound>,
     /// Slots ever allocated, which is what the snapshot rebuild and the
@@ -91,6 +102,9 @@ fn main() {
         std::process::exit(1);
     });
     let edge_timeout = Duration::from_secs(herd::arg_or("edge-timeout", 5u64));
+    // The control plane runs at human timescales, so this is far slower than the
+    // display below it. Zero switches heartbeats off.
+    let heartbeat_every = Duration::from_secs(herd::arg_or("heartbeat", 30u64));
     // Held for the whole run: dropping it aborts the subscriptions.
     let _server = RegionServer::new(
         client.clone(),
@@ -132,6 +146,8 @@ fn main() {
     // Tick loop. settle runs between ticks, which is the only place a viewer
     // can be registered or dropped.
     let mut reported = Instant::now();
+    let mut beat_at = Instant::now();
+    let mut since_beat = Beat::default();
     let started = Instant::now();
     let mut dash = tui::Dashboard::new(width);
     let mut ticks = 0u32;
@@ -153,6 +169,31 @@ fn main() {
             records += report.stats.records;
             spent += report.took;
             worst = worst.max(report.took);
+
+            since_beat.ticks += 1;
+            since_beat.viewers += report.stats.viewers;
+            since_beat.spent += report.took;
+            since_beat.worst = since_beat.worst.max(report.took);
+            since_beat.late += u32::from(!report.late.is_zero());
+            since_beat.dropped += report.dropped;
+
+            // A separate branch from the display: what an operator wants to see
+            // every second is not what a control plane wants every half minute.
+            if !heartbeat_every.is_zero() && beat_at.elapsed() >= heartbeat_every {
+                let n = since_beat.ticks.max(1);
+                let _ = _server.heartbeat(RegionLoad {
+                    tick_count: sim.tick_count(),
+                    entities: sim.entity_count() as u32,
+                    slots: slots.load(Ordering::Relaxed) as u32,
+                    viewers: (since_beat.viewers / u64::from(n)) as u32,
+                    mean_tick: since_beat.spent / n,
+                    worst_tick: since_beat.worst,
+                    late: since_beat.late,
+                    dropped: since_beat.dropped,
+                });
+                beat_at = Instant::now();
+                since_beat = Beat::default();
+            }
 
             if reported.elapsed() >= Duration::from_secs(1) {
                 let mean_ms = spent.as_secs_f64() * 1_000.0 / ticks.max(1) as f64;

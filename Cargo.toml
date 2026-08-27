@@ -37,6 +37,10 @@ path = "examples/herd-sim.rs"
 name = "herd-edge"
 path = "examples/herd-edge.rs"
 
+[[example]]
+name = "herd-watch"
+path = "examples/herd-watch.rs"
+
 [[bench]]
 name = "subscription"
 harness = false

@@ -65,9 +65,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod control;
 mod error;
 pub mod region;
 
+pub use control::{Heartbeat, RegionLoad};
 pub use error::NetError;
 pub use region::{
     Applied, ClaimError, DespawnEntities, EdgeId, EdgeName, EdgeSink, EdgeView,

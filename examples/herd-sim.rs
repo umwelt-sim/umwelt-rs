@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EdgeSink, Inbound, RegionId, RegionServer, SharedSecret};
+use umwelt::net::{EdgeSink, Edges, Inbound, RegionId, RegionServer};
 use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
@@ -52,8 +52,7 @@ impl Game for Applier {
 }
 
 fn main() {
-    let addr: String = herd::arg_or("addr", herd::DEFAULT_ADDR.to_string());
-    let secret: String = herd::arg_or("secret", herd::DEFAULT_SECRET.to_string());
+    let url: String = herd::arg_or("nats", herd::DEFAULT_NATS.to_string());
     let region = RegionId::from_raw(herd::arg_or("region", 7u32));
     let cfg: WorldConfig = herd::world(herd::arg_or("hz", 20u32));
     // How the loop waits for its deadline. `sleep` is what a deployment wants;
@@ -82,21 +81,19 @@ fn main() {
         }
     };
 
-    let server = RegionServer::bind(
-        addr.as_str(),
-        region,
-        cfg,
-        Arc::new(SharedSecret::new(secret.into_bytes())),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("bind {addr}: {e}");
-        std::process::exit(1);
-    });
+    let edges = Arc::new(Edges::new());
+    let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
+    let server = RegionServer::connect(&url, region, cfg, Arc::clone(&inbound))
+        .unwrap_or_else(|e| {
+            eprintln!("nats {url}: {e}");
+            std::process::exit(1);
+        });
+    let sink = EdgeSink::new(region, server.client().clone(), server.runtime(), Arc::clone(&edges));
 
     if plain {
         println!(
-            "herd-sim: {region} on {} at {} Hz, {} m region, {} m view radius, wait {wait:?}",
-            server.local_addr(),
+            "herd-sim: {region} over {} at {} Hz, {} m region, {} m view radius, wait {wait:?}",
+            url,
             cfg.tick_hz(),
             cfg.region_size().floor_meters(),
             cfg.horizontal_view_radius().floor_meters(),
@@ -104,9 +101,6 @@ fn main() {
         println!("herd-sim: waiting for edges");
     }
 
-    let edges = Arc::clone(server.edges());
-    let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
-    let sink = EdgeSink::new(Arc::clone(&edges));
     let wait_name = match wait {
         Wait::Sleep => "sleep",
         Wait::Hold => "hold",
@@ -119,112 +113,84 @@ fn main() {
     )
     .with_sink(Handoff::new(sink.clone()));
 
-    std::thread::scope(|scope| {
-        // Accept loop. Each attached edge gets a thread that only queues what it
-        // reads; the tick loop is what applies it.
-        scope.spawn(|| {
-            let outcome = server.run(|edge| {
-                // Printing here would tear a dashboard frame, so the cards are
-                // the only report when one is running.
+    // Tick loop. settle runs between ticks, which is the only place a viewer
+    // can be registered or dropped.
+    let mut reported = Instant::now();
+    let started = Instant::now();
+    let mut dash = tui::Dashboard::new(width);
+    let mut ticks = 0u32;
+    let mut served = 0u64;
+    let mut records = 0u64;
+    let mut spent = Duration::ZERO;
+    let mut worst = Duration::ZERO;
+    if !plain {
+        print!("{}", tui::Dashboard::enter());
+    }
+
+    sim.run(
+        Pacing { wait, overrun: Overrun::Dilate, ticks: None },
+        |report, sim| {
+            inbound.settle(sim, &sink, ClientLimits::default());
+
+            ticks += 1;
+            served += report.stats.viewers;
+            records += report.stats.records;
+            spent += report.took;
+            worst = worst.max(report.took);
+
+            if reported.elapsed() >= Duration::from_secs(1) {
+                let mean_ms = spent.as_secs_f64() * 1_000.0 / ticks.max(1) as f64;
+                let viewers = served / ticks.max(1) as u64;
                 if plain {
-                    println!("herd-sim: {:?} attached from {}", edge.id(), edge.peer());
-                }
-                let failure = inbound.serve(&edge).err();
-                if plain {
-                    if let Some(e) = failure {
-                        println!("herd-sim: {:?} failed: {e}", edge.id());
-                    }
+                    // Dropped counts payloads the handoff declined to queue
+                    // because the I/O thread had not drained the slot. A rising
+                    // count means the delivery side is behind, not the tick.
                     println!(
-                        "herd-sim: {:?} detached, giving up {} entities",
-                        edge.id(),
-                        edge.entity_count()
+                        "herd-sim: {ticks} ticks | {} edges | {} entities | \
+                         {} slots | {viewers} viewers/tick | {records} records | \
+                         mean {mean_ms:.2} ms worst {:.2} ms | \
+                         delivered {} dropped {} | undeliverable {} refused {}",
+                        edges.len(),
+                        sim.entity_count(),
+                        slots.load(Ordering::Relaxed),
+                        worst.as_secs_f64() * 1_000.0,
+                        sim.sink().delivered(),
+                        sim.sink().dropped(),
+                        sink.undeliverable(),
+                        inbound.refused(),
                     );
+                } else {
+                    let frame = tui::Frame {
+                        region,
+                        addr: url.clone(),
+                        tick_hz: cfg.tick_hz(),
+                        wait: wait_name,
+                        uptime: started.elapsed(),
+                        entities: sim.entity_count(),
+                        slots: slots.load(Ordering::Relaxed),
+                        viewers,
+                        records,
+                        mean_ms,
+                        worst_ms: worst.as_secs_f64() * 1_000.0,
+                        delivered: sim.sink().delivered(),
+                        dropped: sim.sink().dropped(),
+                        undeliverable: sink.undeliverable(),
+                        refused: inbound.refused(),
+                        edges: edges.view(),
+                    };
+                    let painted = dash.render(&frame);
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(painted.as_bytes());
+                    let _ = out.flush();
                 }
-            });
-            if let Err(e) = outcome {
-                eprintln!("herd-sim: accept loop stopped: {e}");
+                reported = Instant::now();
+                ticks = 0;
+                served = 0;
+                records = 0;
+                spent = Duration::ZERO;
+                worst = Duration::ZERO;
             }
-        });
-
-        // Tick loop. settle runs between ticks, which is the only place a viewer
-        // can be registered or dropped.
-        let mut reported = Instant::now();
-        let started = Instant::now();
-        let mut dash = tui::Dashboard::new(width);
-        let mut ticks = 0u32;
-        let mut served = 0u64;
-        let mut records = 0u64;
-        let mut spent = Duration::ZERO;
-        let mut worst = Duration::ZERO;
-        if !plain {
-            print!("{}", tui::Dashboard::enter());
-        }
-
-        sim.run(
-            Pacing { wait, overrun: Overrun::Dilate, ticks: None },
-            |report, sim| {
-                inbound.settle(sim, &sink, ClientLimits::default());
-
-                ticks += 1;
-                served += report.stats.viewers;
-                records += report.stats.records;
-                spent += report.took;
-                worst = worst.max(report.took);
-
-                if reported.elapsed() >= Duration::from_secs(1) {
-                    let mean_ms = spent.as_secs_f64() * 1_000.0 / ticks.max(1) as f64;
-                    let viewers = served / ticks.max(1) as u64;
-                    if plain {
-                        // Dropped counts payloads the handoff declined to queue
-                        // because the I/O thread had not drained the slot. A rising
-                        // count means the delivery side is behind, not the tick.
-                        println!(
-                            "herd-sim: {ticks} ticks | {} edges | {} entities | \
-                             {} slots | {viewers} viewers/tick | {records} records | \
-                             mean {mean_ms:.2} ms worst {:.2} ms | \
-                             delivered {} dropped {} | undeliverable {} refused {}",
-                            edges.len(),
-                            sim.entity_count(),
-                            slots.load(Ordering::Relaxed),
-                            worst.as_secs_f64() * 1_000.0,
-                            sim.sink().delivered(),
-                            sim.sink().dropped(),
-                            sink.undeliverable(),
-                            inbound.refused(),
-                        );
-                    } else {
-                        let frame = tui::Frame {
-                            region,
-                            addr: server.local_addr().to_string(),
-                            tick_hz: cfg.tick_hz(),
-                            wait: wait_name,
-                            uptime: started.elapsed(),
-                            entities: sim.entity_count(),
-                            slots: slots.load(Ordering::Relaxed),
-                            viewers,
-                            records,
-                            mean_ms,
-                            worst_ms: worst.as_secs_f64() * 1_000.0,
-                            delivered: sim.sink().delivered(),
-                            dropped: sim.sink().dropped(),
-                            undeliverable: sink.undeliverable(),
-                            refused: inbound.refused(),
-                            edges: edges.view(),
-                        };
-                        let painted = dash.render(&frame);
-                        let mut out = std::io::stdout().lock();
-                        let _ = out.write_all(painted.as_bytes());
-                        let _ = out.flush();
-                    }
-                    reported = Instant::now();
-                    ticks = 0;
-                    served = 0;
-                    records = 0;
-                    spent = Duration::ZERO;
-                    worst = Duration::ZERO;
-                }
-                Flow::Continue
-            },
-        );
-    });
+            Flow::Continue
+        },
+    );
 }

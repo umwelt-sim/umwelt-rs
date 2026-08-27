@@ -37,15 +37,17 @@ use std::cmp::Ordering as Ordering2;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use tokio::runtime::Handle;
+
 use crate::entity::EntityId;
 use crate::net::error::NetError;
-use crate::net::region::edges::{Edge, EdgeId, EdgeStats, Edges};
+use crate::net::region::edges::{EdgeId, EdgeStats, Edges};
 use crate::net::region::protocol::{
-    DespawnEntities, EntitiesSpawned, EntityKind, KIND_DESPAWN_ENTITIES, KIND_ENTITIES_SPAWNED,
-    KIND_MOVE_ENTITIES, KIND_POSITION_UPDATES, KIND_QUIT, KIND_SPAWN_ENTITIES,
-    MAX_SPAWN_PER_MESSAGE, MoveEntities, SpawnEntities,
+    RegionId,
+    DespawnEntities, EntitiesSpawned, EntityKind, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE,
+    KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MAX_SPAWN_PER_MESSAGE, MoveEntities, SpawnEntities,
 };
-use crate::net::region::wire::read_frame;
+use crate::net::region::subjects;
 use crate::pos::Pos3;
 use crate::sim::{ClientLimits, Game, PayloadSink, Step, ViewerId, WorldSimulation};
 
@@ -129,41 +131,51 @@ impl Inbound {
         self.refused.load(Ordering::Relaxed)
     }
 
-    /// Reads from one edge until it closes, queueing what it sends.
+    /// The edges relaying for this region.
+    #[inline]
+    pub fn edges(&self) -> &Arc<Edges> {
+        &self.edges
+    }
+
+    /// Queues one command that arrived from `edge`.
     ///
-    /// Blocks, so this is what [`RegionServer::run`](crate::net::RegionServer::run)
-    /// hands each edge's thread. Nothing here touches the simulation: a command
-    /// is queued and applied on the next tick.
-    pub fn serve(&self, edge: &Edge) -> Result<(), NetError> {
-        let id = edge.id();
-        let stats = self.edges.stats(id);
-        let mut sock = edge.stream();
-        let mut body = Vec::new();
-        loop {
-            let kind = match read_frame(&mut sock, &mut body) {
-                Ok(kind) => kind,
-                Err(NetError::Closed) => return Ok(()),
-                Err(e) => return Err(e),
-            };
-            let command = match kind {
-                KIND_SPAWN_ENTITIES => {
-                    Command::Spawn { edge: id, spawns: SpawnEntities::decode(&body)?.spawns }
+    /// Called from the NATS reader, which is not the tick thread, so nothing
+    /// here touches the simulation. A command is queued and applied on the next
+    /// tick. A message that does not decode is counted and dropped: there is no
+    /// connection to tear down, and one bad message says nothing about the next.
+    pub fn accept(&self, edge: EdgeId, message: &[u8]) {
+        let Some((&kind, body)) = message.split_first() else {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let decoded = match kind {
+            KIND_SPAWN_ENTITIES => {
+                SpawnEntities::decode(body).map(|m| Command::Spawn { edge, spawns: m.spawns })
+            }
+            KIND_MOVE_ENTITIES => {
+                MoveEntities::decode(body).map(|m| Command::Move { edge, moves: m.moves })
+            }
+            KIND_DESPAWN_ENTITIES => {
+                DespawnEntities::decode(body).map(|m| Command::Despawn { edge, ids: m.ids })
+            }
+            // Says only that the edge is still there, which admitting it
+            // already recorded.
+            KIND_KEEPALIVE => return,
+            _ => Err(NetError::Unexpected { expected: "a command", got: kind }),
+        };
+        match decoded {
+            Ok(command) => {
+                self.queue.lock().expect("not poisoned").push(command);
+                self.received.fetch_add(1, Ordering::Relaxed);
+                if let Some(stats) = self.edges.stats(edge) {
+                    stats.messages.fetch_add(1, Ordering::Relaxed);
                 }
-                KIND_MOVE_ENTITIES => {
-                    Command::Move { edge: id, moves: MoveEntities::decode(&body)?.moves }
+            }
+            Err(_) => {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                if let Some(stats) = self.edges.stats(edge) {
+                    stats.refused.fetch_add(1, Ordering::Relaxed);
                 }
-                KIND_DESPAWN_ENTITIES => {
-                    Command::Despawn { edge: id, ids: DespawnEntities::decode(&body)?.ids }
-                }
-                KIND_QUIT => return Ok(()),
-                other => {
-                    return Err(NetError::Unexpected { expected: "a session message", got: other });
-                }
-            };
-            self.queue.lock().expect("not poisoned").push(command);
-            self.received.fetch_add(1, Ordering::Relaxed);
-            if let Some(stats) = &stats {
-                stats.messages.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -329,7 +341,7 @@ impl Inbound {
             for chunk in list.chunks(MAX_SPAWN_PER_MESSAGE) {
                 EntitiesSpawned { entities: chunk.to_vec() }.encode(&mut body);
                 // An edge that went away mid-tick is already being torn down.
-                if self.edges.send(edge, KIND_ENTITIES_SPAWNED, &body).is_ok() {
+                if sink.reply(edge, &body).is_ok() {
                     out.replies += 1;
                 }
             }
@@ -377,38 +389,59 @@ fn refuse(out: &mut Applied, stats: &Option<Arc<EdgeStats>>) {
     }
 }
 
-/// Sends each viewer's payload to the edge that manages its avatar.
+/// Publishes each viewer's payload to the edge that manages its avatar.
 ///
 /// Cheap to clone: one lives in the [`WorldSimulation`] and one stays with the
 /// tick loop, which is what binds a viewer when it registers.
 ///
-/// **Wrap this in [`Handoff`](crate::Handoff).** `send` writes to a socket, and
-/// [`PayloadSink`] is called from inside the tick, so an edge that stops reading
-/// would otherwise stall the region. `Handoff` turns the tick's side of it into
-/// a memory copy and drops rather than queues, which is right for state nobody
-/// wants stale.
-#[derive(Clone, Debug)]
+/// **Wrap this in [`Handoff`](crate::Handoff).** `send` publishes, and
+/// [`PayloadSink`] is called from inside the tick. `Handoff` turns the tick's
+/// side of it into a memory copy and drops rather than queues, which is right
+/// for state nobody wants stale.
+#[derive(Clone)]
 pub struct EdgeSink {
     shared: Arc<SinkShared>,
 }
 
-#[derive(Debug)]
 struct SinkShared {
+    region: RegionId,
+    client: async_nats::Client,
+    runtime: Handle,
     edges: Arc<Edges>,
-    /// Viewer index to avatar entity raw. The routing question is asked about
-    /// an entity, and a payload arrives named by its viewer.
+    /// Viewer index to avatar entity raw. A payload arrives named by its
+    /// viewer, and the routing question is asked about an entity.
     avatars: RwLock<Vec<AtomicU32>>,
+    /// One subject per edge, rebuilt when the set changes. Formatting a subject
+    /// per payload would allocate half a million times a second; taking the
+    /// set's lock instead would serialize on it.
+    subjects: RwLock<Cached>,
     sent: AtomicU64,
     undeliverable: AtomicU64,
     failed: AtomicU64,
 }
 
+#[derive(Default)]
+struct Cached {
+    generation: u64,
+    payload: Vec<Option<async_nats::Subject>>,
+    reply: Vec<Option<async_nats::Subject>>,
+}
+
 impl EdgeSink {
-    pub fn new(edges: Arc<Edges>) -> EdgeSink {
+    pub fn new(
+        region: RegionId,
+        client: async_nats::Client,
+        runtime: Handle,
+        edges: Arc<Edges>,
+    ) -> EdgeSink {
         EdgeSink {
             shared: Arc::new(SinkShared {
+                region,
+                client,
+                runtime,
                 edges,
                 avatars: RwLock::new(Vec::new()),
+                subjects: RwLock::new(Cached { generation: u64::MAX, ..Cached::default() }),
                 sent: AtomicU64::new(0),
                 undeliverable: AtomicU64::new(0),
                 failed: AtomicU64::new(0),
@@ -416,7 +449,7 @@ impl EdgeSink {
         }
     }
 
-    /// Records which entity a viewer watches, so its payloads can be routed.
+    /// Records which entity a viewer watches, so its payloads can be addressed.
     pub fn bind(&self, viewer: ViewerId, avatar: EntityId) {
         let mut avatars = self.shared.avatars.write().expect("not poisoned");
         if avatars.len() <= viewer.index() {
@@ -425,7 +458,7 @@ impl EdgeSink {
         avatars[viewer.index()].store(avatar.raw(), Ordering::Relaxed);
     }
 
-    /// Forgets a viewer, so a recycled id cannot route to the previous avatar.
+    /// Forgets a viewer, so a recycled id cannot address the previous avatar.
     pub fn unbind(&self, viewer: ViewerId) {
         let avatars = self.shared.avatars.read().expect("not poisoned");
         if let Some(slot) = avatars.get(viewer.index()) {
@@ -433,20 +466,28 @@ impl EdgeSink {
         }
     }
 
-    /// Payloads written to an edge.
+    /// Payloads published.
     pub fn sent(&self) -> u64 {
         self.shared.sent.load(Ordering::Relaxed)
     }
 
     /// Payloads for a viewer with no avatar bound, or an avatar no edge
-    /// manages. A viewer whose edge detached mid-tick lands here.
+    /// manages. A viewer whose edge went away mid-tick lands here.
     pub fn undeliverable(&self) -> u64 {
         self.shared.undeliverable.load(Ordering::Relaxed)
     }
 
-    /// Payloads whose write to the edge failed.
+    /// Payloads whose publish failed.
     pub fn failed(&self) -> u64 {
         self.shared.failed.load(Ordering::Relaxed)
+    }
+
+    /// Answers one edge's command, on its reply subject.
+    pub(crate) fn reply(&self, edge: EdgeId, body: &[u8]) -> Result<(), NetError> {
+        let Some(subject) = self.subject(edge, false) else { return Err(NetError::BadSubject) };
+        let bytes = bytes::Bytes::copy_from_slice(body);
+        self.shared.runtime.block_on(self.shared.client.publish(subject, bytes))?;
+        Ok(())
     }
 
     fn avatar_of(&self, viewer: ViewerId) -> Option<EntityId> {
@@ -455,6 +496,44 @@ impl EdgeSink {
             Some(raw) if raw != NO_AVATAR => Some(EntityId::from_raw(raw)),
             _ => None,
         }
+    }
+
+    /// One edge's subject, rebuilding the table if the set has changed since it
+    /// was built.
+    fn subject(&self, edge: EdgeId, payload: bool) -> Option<async_nats::Subject> {
+        let generation = self.shared.edges.generation();
+        {
+            let cached = self.shared.subjects.read().expect("not poisoned");
+            if cached.generation == generation {
+                let table = if payload { &cached.payload } else { &cached.reply };
+                return table.get(edge.index()).cloned().flatten();
+            }
+        }
+        let mut cached = self.shared.subjects.write().expect("not poisoned");
+        cached.payload.clear();
+        cached.reply.clear();
+        for view in self.shared.edges.view() {
+            let at = view.id.index();
+            if cached.payload.len() <= at {
+                cached.payload.resize(at + 1, None);
+                cached.reply.resize(at + 1, None);
+            }
+            cached.payload[at] =
+                Some(subjects::payload(self.shared.region, &view.name).into());
+            cached.reply[at] = Some(subjects::reply(self.shared.region, &view.name).into());
+        }
+        cached.generation = generation;
+        let table = if payload { &cached.payload } else { &cached.reply };
+        table.get(edge.index()).cloned().flatten()
+    }
+}
+
+impl core::fmt::Debug for EdgeSink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EdgeSink")
+            .field("region", &self.shared.region)
+            .field("sent", &self.sent())
+            .finish_non_exhaustive()
     }
 }
 
@@ -468,109 +547,41 @@ impl PayloadSink for EdgeSink {
             self.shared.undeliverable.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        // Written straight into the edge's buffer: no payload-sized copy, and
-        // no syscall until `flush`. Both mattered; see §The smoke test.
-        let named = viewer.raw().to_le_bytes();
-        match self.shared.edges.send_parts(edge, KIND_POSITION_UPDATES, &[&named, payload]) {
+        let Some(subject) = self.subject(edge, true) else {
+            self.shared.undeliverable.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let mut body = Vec::with_capacity(4 + payload.len());
+        body.extend_from_slice(&viewer.raw().to_le_bytes());
+        body.extend_from_slice(payload);
+        let published = self
+            .shared
+            .runtime
+            .block_on(self.shared.client.publish(subject, body.into()));
+        match published {
             Ok(()) => self.shared.sent.fetch_add(1, Ordering::Relaxed),
             Err(_) => self.shared.failed.fetch_add(1, Ordering::Relaxed),
         };
     }
 
-    /// Pushes the batch to the edges. One syscall per edge with work waiting,
-    /// rather than one per payload.
+    /// Pushes the batch to the broker. The NATS client buffers, so this is
+    /// where the write happens rather than once per payload.
     fn flush(&self) {
-        self.shared.edges.flush();
+        let _ = self.shared.runtime.block_on(self.shared.client.flush());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::region::protocol::RegionId;
-    use crate::net::region::server::RegionServer;
-    use crate::net::region::{AllowAll, RegionClient};
-    use crate::{Fixed, WorldConfig};
+    use crate::Fixed;
 
     fn ent(n: u32) -> EntityId {
         EntityId::from_raw(n)
     }
 
-    /// A region server with one edge attached, and the client end of it.
-    fn attached() -> (RegionServer, Edge, RegionClient) {
-        let server = RegionServer::bind(
-            "127.0.0.1:0",
-            RegionId::from_raw(1),
-            WorldConfig::default(),
-            Arc::new(AllowAll),
-        )
-        .expect("binds");
-        let addr = server.local_addr();
-        let (edge, client) = std::thread::scope(|scope| {
-            let taking = scope.spawn(|| server.accept().expect("attaches"));
-            let client = RegionClient::connect(addr, b"").expect("handshake completes");
-            (taking.join().expect("thread"), client)
-        });
-        (server, edge, client)
-    }
-
-    #[test]
-    fn a_payload_routes_to_the_edge_managing_its_avatar() {
-        let (server, edge, _client) = attached();
-        let sink = EdgeSink::new(Arc::clone(server.edges()));
-
-        edge.claim(ent(10)).expect("unclaimed");
-        sink.bind(ViewerId::from_raw(0), ent(10));
-
-        sink.send(ViewerId::from_raw(0), b"a payload");
-        assert_eq!(sink.sent(), 1);
-        assert_eq!(sink.undeliverable(), 0);
-    }
-
-    #[test]
-    fn a_payload_for_an_unbound_viewer_goes_nowhere() {
-        let (server, _edge, _client) = attached();
-        let sink = EdgeSink::new(Arc::clone(server.edges()));
-        sink.send(ViewerId::from_raw(3), b"a payload");
-        assert_eq!(sink.sent(), 0);
-        assert_eq!(sink.undeliverable(), 1);
-    }
-
-    #[test]
-    fn a_payload_whose_avatar_no_edge_manages_goes_nowhere() {
-        let (server, _edge, _client) = attached();
-        let sink = EdgeSink::new(Arc::clone(server.edges()));
-        // Bound, but never claimed by any edge.
-        sink.bind(ViewerId::from_raw(0), ent(10));
-        sink.send(ViewerId::from_raw(0), b"a payload");
-        assert_eq!(sink.undeliverable(), 1);
-    }
-
-    #[test]
-    fn unbinding_stops_a_recycled_viewer_routing_to_the_old_avatar() {
-        let (server, edge, _client) = attached();
-        let sink = EdgeSink::new(Arc::clone(server.edges()));
-        edge.claim(ent(10)).expect("unclaimed");
-
-        sink.bind(ViewerId::from_raw(0), ent(10));
-        sink.unbind(ViewerId::from_raw(0));
-        sink.send(ViewerId::from_raw(0), b"a payload");
-
-        assert_eq!(sink.sent(), 0);
-        assert_eq!(sink.undeliverable(), 1, "a dropped viewer routes nowhere");
-    }
-
-    #[test]
-    fn a_detached_edge_takes_its_routes_with_it() {
-        let (server, edge, _client) = attached();
-        let sink = EdgeSink::new(Arc::clone(server.edges()));
-        edge.claim(ent(10)).expect("unclaimed");
-        sink.bind(ViewerId::from_raw(0), ent(10));
-
-        drop(edge);
-        sink.send(ViewerId::from_raw(0), b"a payload");
-        assert_eq!(sink.undeliverable(), 1);
-    }
+    // Routing and publishing need a broker, so they are covered in
+    // tests/region_edge.rs. What is left here runs without one.
 
     #[test]
     fn the_watcher_map_is_the_direction_the_simulation_lacks() {
@@ -589,10 +600,45 @@ mod tests {
         // What apply writes into the arrays has to be what the edge sent, or a
         // stationary entity would drift a little every tick.
         let sent = Pos3::new(Fixed::from_millis(7, 500), Fixed::ZERO, Fixed::from_raw(1));
-        let m = MoveEntities { moves: vec![(ent(1), sent)] };
         let mut body = Vec::new();
-        m.encode(&mut body);
-        let back = MoveEntities::decode(&body).expect("well formed");
+        MoveEntities { moves: vec![(ent(1), sent)] }.encode(&mut body);
+        let back = MoveEntities::decode(&body[1..]).expect("well formed");
         assert_eq!(back.moves[0].1, sent);
+    }
+
+    #[test]
+    fn a_command_that_does_not_decode_is_counted_and_dropped() {
+        let edges = Arc::new(Edges::new());
+        let edge = edges.admit(&crate::net::EdgeName::new("alpha").expect("valid"));
+        let inbound = Inbound::new(Arc::clone(&edges));
+
+        inbound.accept(edge, &[]);
+        inbound.accept(edge, &[200, 1, 2, 3]);
+        inbound.accept(edge, &[KIND_MOVE_ENTITIES, 0xFF]);
+        assert_eq!(inbound.refused(), 3);
+        assert_eq!(inbound.received(), 0, "nothing was queued");
+    }
+
+    #[test]
+    fn a_keepalive_says_nothing_but_is_not_a_fault() {
+        let edges = Arc::new(Edges::new());
+        let edge = edges.admit(&crate::net::EdgeName::new("alpha").expect("valid"));
+        let inbound = Inbound::new(Arc::clone(&edges));
+        inbound.accept(edge, &[KIND_KEEPALIVE]);
+        assert_eq!(inbound.refused(), 0);
+        assert_eq!(inbound.received(), 0);
+    }
+
+    #[test]
+    fn a_well_formed_command_is_queued() {
+        let edges = Arc::new(Edges::new());
+        let edge = edges.admit(&crate::net::EdgeName::new("alpha").expect("valid"));
+        let inbound = Inbound::new(Arc::clone(&edges));
+
+        let mut body = Vec::new();
+        MoveEntities { moves: vec![(ent(1), Pos3::from_meters(1, 2, 3))] }.encode(&mut body);
+        inbound.accept(edge, &body);
+        assert_eq!(inbound.received(), 1);
+        assert_eq!(inbound.refused(), 0);
     }
 }

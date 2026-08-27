@@ -11,11 +11,9 @@ use std::str::FromStr;
 
 use umwelt::WorldConfig;
 
-pub const DEFAULT_ADDR: &str = "127.0.0.1:7777";
-
-/// Both ends default to this so a smoke test is one command each. A deployment
-/// passes `--secret`, and §The region link says what a bearer secret is worth.
-pub const DEFAULT_SECRET: &str = "herd-smoke-test-key";
+/// Both ends reach each other through NATS rather than through each other, so
+/// this is the only address either needs. See `docs/adr/0001`.
+pub const DEFAULT_NATS: &str = "nats://127.0.0.1:4222";
 
 /// `--name value`, anywhere in the arguments.
 pub fn arg(name: &str) -> Option<String> {

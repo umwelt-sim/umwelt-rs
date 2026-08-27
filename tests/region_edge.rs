@@ -1,32 +1,42 @@
-//! Several edges attach to a region, populate it, move their entities, and are
-//! sent the movement back.
+//! Several edges populate a region, move their entities, and are sent the
+//! movement back.
 //!
-//! The automated half of the smoke test. `examples/herd-sim.rs` and
-//! `examples/herd-edge.rs` are the same shape at crowd volumes, driven by hand.
+//! **Requires a running `nats-server`.** ADR 0001 chose that over a transport
+//! seam: an in-memory transport built only for tests would be a second
+//! implementation of the thing under test. Point `NATS_URL` elsewhere if the
+//! broker is not on the default port.
 //!
-//! What it establishes end to end: an edge asks for entities and is told the
-//! ids the region allocated, the region applies the positions the edge sends,
-//! and the payload that comes back carries those positions. The last step is
-//! the one that could not be checked before the link existed.
+//! What it establishes: an edge asks for entities and is told the ids the
+//! region allocated, the region applies the positions the edge sends, and the
+//! payload that comes back carries those positions.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use umwelt::net::{
-    EdgeSink, EntityKind, Incoming, Inbound, RegionClient, RegionId, RegionServer, SharedSecret,
+    EdgeName, EdgeSink, EntityKind, Incoming, Inbound, RegionId, RegionLink, RegionServer,
 };
-use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, Wait};
+use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, ViewerId, Wait};
 use umwelt::{EntityId, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
 
-const KEY: &[u8] = b"a secret both ends hold";
 const EDGES: usize = 3;
 /// Entities with a game client behind them. Each gets a viewer.
 const OBSERVERS: usize = 24;
 /// Entities with nothing behind them: replicated to whoever can see them, and
-/// sent nothing themselves. No viewer, and none of the per-viewer pipeline.
+/// sent nothing themselves.
 const UNATTENDED: usize = 8;
 const PER_EDGE: usize = OBSERVERS + UNATTENDED;
+
+fn url() -> String {
+    std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into())
+}
+
+/// Distinct per run, so a shared broker does not carry one run's subjects into
+/// another's.
+fn region_id() -> RegionId {
+    RegionId::from_raw(1_000_000 + std::process::id() % 1000)
+}
 
 /// The region's game: everything it does is what the edges asked for.
 struct Applier {
@@ -72,19 +82,13 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
 #[test]
 fn edges_populate_a_region_and_are_sent_the_movement_back() {
     let cfg = config();
-    let server = RegionServer::bind(
-        "127.0.0.1:0",
-        RegionId::from_raw(7),
-        cfg,
-        Arc::new(SharedSecret::new(KEY)),
-    )
-    .expect("binds a loopback port");
-    let addr = server.local_addr();
-    let stop_server = server.shutdown_handle();
-
-    let edges = Arc::clone(server.edges());
+    let region = region_id();
+    let edges = Arc::new(umwelt::net::Edges::new());
     let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
-    let sink = EdgeSink::new(Arc::clone(&edges));
+
+    let server = RegionServer::connect(&url(), region, cfg, Arc::clone(&inbound))
+        .expect("a nats-server must be running; see the module doc");
+    let sink = EdgeSink::new(region, server.client().clone(), server.runtime(), Arc::clone(&edges));
 
     let mut sim = WorldSimulation::new(cfg, Applier { inbound: Arc::clone(&inbound) })
         .with_sink(Handoff::new(sink.clone()));
@@ -95,18 +99,6 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
     let confirmed = AtomicU64::new(0);
 
     std::thread::scope(|scope| {
-        // The region's accept loop. Each attached edge gets a thread that only
-        // queues what it reads.
-        scope.spawn(|| {
-            server
-                .run(|edge| {
-                    let _ = inbound.serve(&edge);
-                })
-                .expect("the accept loop runs until it is stopped")
-        });
-
-        // The region's tick loop. settle runs between ticks, which is where a
-        // viewer can be registered.
         let sink_for_loop = sink.clone();
         let inbound_for_loop = Arc::clone(&inbound);
         let stop_for_loop = &stop;
@@ -124,37 +116,34 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
             )
         });
 
-        // The edges.
         for e in 0..EDGES {
             let confirmed = &confirmed;
             let stop = &stop;
             scope.spawn(move || {
-                let client =
-                    RegionClient::connect(addr, KEY).expect("handshake completes");
-                assert_eq!(client.region(), RegionId::from_raw(7));
-                let codec = RecordCodec::new(client.config());
+                let name = EdgeName::new(format!("test-{}-{e}", std::process::id()))
+                    .expect("valid name");
+                let link = RegionLink::connect(&url(), name).expect("connects to nats");
+                let offer = link.info(region).expect("the region answers");
+                assert_eq!(offer.region, region);
+                let codec = RecordCodec::new(&offer.config);
 
                 let mut asked: Vec<(Pos3, EntityKind)> =
                     (0..OBSERVERS).map(|n| (home(e, n), EntityKind::Observer)).collect();
                 asked.extend(
-                    (0..UNATTENDED)
-                        .map(|n| (home(e, OBSERVERS + n), EntityKind::Unattended)),
+                    (0..UNATTENDED).map(|n| (home(e, OBSERVERS + n), EntityKind::Unattended)),
                 );
-                client.spawn(&asked).expect("asks for its crowd");
+                link.spawn(region, &asked).expect("asks for its crowd");
 
                 // The region allocates the ids; the edge finds out here.
-                let mut all: Vec<(EntityId, Option<umwelt::sim::ViewerId>)> = Vec::new();
-                let mut body = Vec::new();
+                let mut all: Vec<(EntityId, Option<ViewerId>)> = Vec::new();
                 while all.len() < PER_EDGE {
-                    match client.receive(&mut body).expect("the region answers") {
-                        Incoming::Spawned(reply) => all.extend(reply.entities),
-                        Incoming::Updates(_) => {}
+                    match link.receive().expect("the region answers") {
+                        Incoming::Spawned { entities, .. } => all.extend(entities),
+                        Incoming::Updates { .. } => {}
                     }
                 }
                 assert_eq!(all.len(), PER_EDGE, "every entity asked for came back");
 
-                // The kinds came back the way they went out: the observers were
-                // given viewers and the unattended entities were not.
                 let watched = all.iter().filter(|(_, v)| v.is_some()).count();
                 assert_eq!(watched, OBSERVERS, "only observers get a viewer");
                 assert!(
@@ -162,19 +151,16 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                     "an unattended entity must not cost a viewer"
                 );
 
-                // Every id is distinct, across every edge as well as within one.
                 let mut sorted: Vec<u32> = all.iter().map(|(id, _)| id.raw()).collect();
                 sorted.sort_unstable();
                 sorted.dedup();
                 assert_eq!(sorted.len(), PER_EDGE, "the region handed out duplicate ids");
 
-                let mine: Vec<(EntityId, umwelt::sim::ViewerId)> =
+                let mine: Vec<(EntityId, ViewerId)> =
                     all.iter().filter_map(|(id, v)| v.map(|v| (*id, v))).collect();
-                // Everything this edge manages moves, watched or not.
                 let movable: Vec<EntityId> = all.iter().map(|(id, _)| *id).collect();
 
                 std::thread::scope(|inner| {
-                    // Send movement until the test is done.
                     inner.spawn(|| {
                         let mut at = 0i32;
                         while !stop.load(Ordering::Relaxed) {
@@ -184,33 +170,30 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                                 .enumerate()
                                 .map(|(n, id)| {
                                     let base = home(e, n);
-                                    (*id, Pos3::from_meters(
-                                        base.x.floor_meters() + at,
-                                        base.y.floor_meters(),
-                                        0,
-                                    ))
+                                    (
+                                        *id,
+                                        Pos3::from_meters(
+                                            base.x.floor_meters() + at,
+                                            base.y.floor_meters(),
+                                            0,
+                                        ),
+                                    )
                                 })
                                 .collect();
-                            if client.move_entities(&moves).is_err() {
+                            if link.move_entities(region, &moves).is_err() {
                                 return;
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         }
                     });
 
-                    // Receive the movement back.
-                    let mut body = Vec::new();
                     while !stop.load(Ordering::Relaxed) {
-                        let Ok(message) = client.receive(&mut body) else { return };
-                        let Incoming::Updates(update) = message else { continue };
-                        let Some(reader) = PacketReader::new(&codec, update.payload) else {
-                            continue;
-                        };
+                        let Some(message) = link.receive() else { return };
+                        let Incoming::Updates { viewer, payload, .. } = message else { continue };
+                        let Some(reader) = PacketReader::new(&codec, &payload) else { continue };
                         // A viewer always sees its own avatar: it is at distance
                         // zero from itself.
-                        let Some(&(avatar, _)) =
-                            mine.iter().find(|(_, v)| *v == update.viewer)
-                        else {
+                        let Some(&(avatar, _)) = mine.iter().find(|(_, v)| *v == viewer) else {
                             continue;
                         };
                         for (id, pos) in reader.updates() {
@@ -223,12 +206,10 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
             });
         }
 
-        // Every edge attached, every entity exists, and movement is coming back.
-        wait_until("every edge to attach", || edges.len() == EDGES);
+        wait_until("every edge to be heard from", || edges.len() == EDGES);
         wait_until("every entity to be claimed", || {
-            (0..EDGES as u32).all(|e| {
-                edges.entity_count(umwelt::net::EdgeId::from_raw(e)) == PER_EDGE
-            })
+            (0..EDGES as u32)
+                .all(|e| edges.entity_count(umwelt::net::EdgeId::from_raw(e)) == PER_EDGE)
         });
         wait_until("movement to make the round trip", || {
             confirmed.load(Ordering::Relaxed) >= 100
@@ -237,9 +218,8 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
         assert_eq!(edges.len(), EDGES);
         assert_eq!(inbound.refused(), 0, "nothing an edge sent was declined");
         assert!(sink.sent() > 0, "payloads reached the edges");
-        assert_eq!(sink.failed(), 0, "no write to an edge failed");
+        assert_eq!(sink.failed(), 0, "no publish failed");
 
         stop.store(true, Ordering::Relaxed);
-        stop_server.stop();
     });
 }

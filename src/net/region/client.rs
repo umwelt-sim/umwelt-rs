@@ -1,389 +1,272 @@
-//! One connection to a region.
+//! An edge's side of the link, over NATS.
 //!
-//! [`RegionClient`] is the near end of the link a [`RegionServer`](crate::net::RegionServer)
-//! answers. It connects, presents a credential, reads what the region says it
-//! is, and either takes the offer or leaves.
+//! [`RegionLink`] is one NATS connection and the edge's own name. Through it an
+//! edge talks to any number of regions, and reaching one it has never heard of
+//! costs nothing: its two subscriptions are wildcards taken at startup, so a
+//! payload from a region that did not exist then matches a subscription it
+//! already holds. See `docs/adr/0001`.
 //!
-//! A `RegionClient` is not an edge server. An edge server will take one of
-//! these and start its own socket server on the other side of itself, speaking
-//! the client-facing protocol to game clients. A `RegionClient` is one link to
-//! one region and knows nothing about game clients, fan-out, or relaying.
+//! A `RegionLink` is not an edge server. An edge server will hold one of these
+//! and run its own client-facing protocol on the other side of itself. This
+//! knows nothing about game clients, fan-out, or relaying.
 
-use std::io::{BufWriter, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::time::Duration;
+
+use futures::StreamExt;
+use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 use crate::config::WorldConfig;
 use crate::entity::EntityId;
 use crate::net::error::NetError;
+use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{
-    ClientIdentification, DespawnEntities, EntitiesSpawned, HANDSHAKE_TIMEOUT, KIND_ACCEPTED,
-    KIND_CLIENT_IDENTIFICATION, KIND_DESPAWN_ENTITIES, KIND_ENTITIES_SPAWNED, KIND_MOVE_ENTITIES,
-    KIND_POSITION_UPDATES, KIND_QUIT, KIND_REJECTION, KIND_SERVER_INFO, MAX_DESPAWN_PER_MESSAGE,
-    MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, PositionUpdates,
-    EntityKind, KIND_SPAWN_ENTITIES, RegionId, Rejection, ServerInfo, ServerVersion,
-    SpawnEntities,
+    DespawnEntities, EntitiesSpawned, EntityKind, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE,
+    MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, RegionId,
+    ServerInfo, ServerVersion, SpawnEntities,
 };
-use crate::net::region::wire::{read_frame, write_frame};
+use crate::net::region::subjects;
 use crate::pos::Pos3;
+use crate::sim::ViewerId;
 
-/// What a region says it is, before the client commits to it.
+/// How long an edge waits for a region to answer a request for its parameters.
+pub const INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a region says it is, checked before an edge uses it.
 ///
-/// The config here has already been rebuilt from the region's parameters and
-/// checked against its digest, so a client holding an `Offer` is holding a
-/// world it can decode packets against.
+/// The config here has been rebuilt from the region's parameters and checked
+/// against its digest, so an edge holding an `Offer` holds a world it can
+/// decode packets against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Offer {
+    pub region: RegionId,
     /// The crate version the region is running. Informational.
     pub server: ServerVersion,
-    pub region: RegionId,
     pub config: WorldConfig,
 }
 
-/// What a client does with an [`Offer`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Decision {
-    /// Take the session and stay connected.
-    #[default]
-    Accept,
-    /// Leave. The server is told, so it does not count a session it does not
-    /// have.
-    Quit,
-}
-
-/// A connected, handshaken link to one region.
-///
-/// Dropping it closes the connection.
-/// What the region sent, other than the handshake.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Incoming<'a> {
-    /// The entities a [`spawn`](RegionClient::spawn) asked for, and the viewer
-    /// watching each. The region allocated the ids.
-    Spawned(EntitiesSpawned),
+/// What a region sent this edge.
+#[derive(Clone, Debug)]
+pub enum Incoming {
+    /// The entities a spawn asked for, and the viewer watching each. The region
+    /// allocated the ids.
+    Spawned { region: RegionId, entities: Vec<(EntityId, Option<ViewerId>)> },
     /// One viewer's payload. Decode it with
     /// [`PacketReader`](crate::PacketReader).
-    Updates(PositionUpdates<'a>),
+    Updates { region: RegionId, viewer: ViewerId, payload: bytes::Bytes },
 }
 
-#[derive(Debug)]
-pub struct RegionClient {
-    stream: TcpStream,
-    /// The write half. Sending takes `&self` so a receive loop and a send loop
-    /// can hold the same client, and two frames must not interleave.
-    ///
-    /// Buffered, so a move batch split across frames by the frame cap costs one
-    /// syscall rather than one per frame.
-    writer: Mutex<BufWriter<TcpStream>>,
-    offer: Offer,
+/// One edge's connection to the region tier.
+pub struct RegionLink {
+    edge: EdgeName,
+    client: async_nats::Client,
+    runtime: Runtime,
+    /// Behind a lock so the link can be shared: one thread publishing while
+    /// another receives is the ordinary shape, and only one should receive.
+    inbox: Mutex<Receiver<Incoming>>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
-impl RegionClient {
-    /// Connects and takes whatever the region offers.
+impl RegionLink {
+    /// Connects to NATS and subscribes to everything addressed to this edge.
     ///
-    /// The common case: an edge is pointed at a region because it is meant to
-    /// relay for that region, so there is nothing to weigh up. Use
-    /// [`connect_with`](Self::connect_with) to inspect the offer first.
-    pub fn connect(
-        addr: impl ToSocketAddrs,
-        credential: &[u8],
-    ) -> Result<RegionClient, NetError> {
-        RegionClient::connect_with(addr, credential, |_| Decision::Accept)
+    /// Two subscriptions, both wildcards over the region: payloads and replies.
+    /// Neither is ever taken again, whatever regions the edge later deals with.
+    pub fn connect(url: &str, edge: EdgeName) -> Result<RegionLink, NetError> {
+        let runtime = Runtime::new()?;
+        let client = runtime.block_on(async_nats::connect(url))?;
+        let (send, inbox) = channel();
+
+        let mut tasks = Vec::new();
+        tasks.push(runtime.block_on(Self::read_payloads(&client, &edge, send.clone()))?);
+        tasks.push(runtime.block_on(Self::read_replies(&client, &edge, send))?);
+
+        Ok(RegionLink { edge, client, runtime, inbox: Mutex::new(inbox), tasks })
     }
 
-    /// Connects, then hands the region's offer to `decide`.
+    #[inline]
+    pub fn name(&self) -> &EdgeName {
+        &self.edge
+    }
+
+    /// Asks a region what world it runs, and checks the answer.
     ///
-    /// Returns [`NetError::Declined`] if `decide` quits, which is not a failure
-    /// of the link: a connect that quits simply has no client to give back.
-    ///
-    /// A region that refuses the credential returns
-    /// [`NetError::Rejected`], and `decide` is never called, since there is
-    /// nothing to decide about.
-    pub fn connect_with(
-        addr: impl ToSocketAddrs,
-        credential: &[u8],
-        decide: impl FnOnce(&Offer) -> Decision,
-    ) -> Result<RegionClient, NetError> {
-        let mut sock = TcpStream::connect(addr)?;
-        sock.set_nodelay(true)?;
-        // A region that accepts the connection and then goes quiet must not
-        // hold this thread indefinitely.
-        sock.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        sock.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-
-        let mut body = Vec::new();
-        ClientIdentification { protocol: PROTOCOL_VERSION, credential: credential.to_vec() }
-            .encode(&mut body);
-        write_frame(&mut sock, KIND_CLIENT_IDENTIFICATION, &body)?;
-
-        let kind = read_frame(&mut sock, &mut body)?;
-        let info = match kind {
-            KIND_SERVER_INFO => ServerInfo::decode(&body)?,
-            KIND_REJECTION => return Err(NetError::Rejected(Rejection::decode(&body)?.code)),
-            other => {
-                return Err(NetError::Unexpected {
-                    expected: "server info or rejection",
-                    got: other,
-                });
-            }
+    /// Rebuilding the config is also the check that this end decodes the
+    /// region's packets the way the region encodes them.
+    pub fn info(&self, region: RegionId) -> Result<Offer, NetError> {
+        let answer = self.runtime.block_on(async {
+            tokio::time::timeout(
+                INFO_TIMEOUT,
+                self.client.request(subjects::info(region), Vec::new().into()),
+            )
+            .await
+        });
+        let message = match answer {
+            Ok(Ok(message)) => message,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(NetError::Malformed("server info: no answer")),
         };
-
-        // Rebuilding the config is also the check that this end decodes the
-        // region's packets the way the region encodes them.
-        let offer = Offer {
-            server: info.server,
-            region: info.region,
-            config: info.params.to_config()?,
-        };
-
-        match decide(&offer) {
-            Decision::Accept => write_frame(&mut sock, KIND_ACCEPTED, &[])?,
-            Decision::Quit => {
-                // Best effort: the server drops the connection either way, and
-                // telling it saves it a timeout.
-                let _ = write_frame(&mut sock, KIND_QUIT, &[]);
-                return Err(NetError::Declined);
-            }
+        let info = ServerInfo::decode(&message.payload)?;
+        if info.protocol != PROTOCOL_VERSION {
+            return Err(NetError::ProtocolMismatch {
+                ours: PROTOCOL_VERSION,
+                theirs: info.protocol,
+            });
         }
-
-        // A session sits idle between packets, so the handshake's deadline
-        // would close a healthy connection.
-        sock.set_read_timeout(None)?;
-        sock.set_write_timeout(None)?;
-
-        let writer = Mutex::new(BufWriter::new(sock.try_clone()?));
-        Ok(RegionClient { stream: sock, writer, offer })
+        Ok(Offer { region: info.region, server: info.server, config: info.params.to_config()? })
     }
 
-    #[inline]
-    pub fn offer(&self) -> &Offer {
-        &self.offer
-    }
+    // -- commands ---------------------------------------------------------
 
-    #[inline]
-    pub fn region(&self) -> RegionId {
-        self.offer.region
-    }
-
-    #[inline]
-    pub fn server_version(&self) -> ServerVersion {
-        self.offer.server
-    }
-
-    /// The world this region runs, rebuilt from what it advertised.
-    #[inline]
-    pub fn config(&self) -> &WorldConfig {
-        &self.offer.config
-    }
-
-    #[inline]
-    pub fn stream(&self) -> &TcpStream {
-        &self.stream
-    }
-
-    // -- the session ------------------------------------------------------
-
-    /// Asks the region to create entities and record this edge as managing
-    /// them.
+    /// Asks a region to create entities and record this edge as managing them.
     ///
     /// Each carries an [`EntityKind`], because whether a viewer is registered
     /// for it is the difference between an entity that costs 12 bytes of
     /// snapshot and one that costs the whole per-viewer pipeline every tick.
-    ///
-    /// The region allocates the ids and answers with [`Incoming::Spawned`];
-    /// nothing is returned here, because the reply arrives on the same stream
-    /// as everything else. Sends as many messages as the frame cap needs.
-    pub fn spawn(&self, spawns: &[(Pos3, EntityKind)]) -> Result<(), NetError> {
-        self.send_all(
-            KIND_SPAWN_ENTITIES,
-            spawns.chunks(MAX_SPAWN_PER_MESSAGE).map(|chunk| {
-                let mut body = Vec::new();
-                SpawnEntities { spawns: chunk.to_vec() }.encode(&mut body);
-                body
-            }),
-        )
+    pub fn spawn(
+        &self,
+        region: RegionId,
+        spawns: &[(Pos3, EntityKind)],
+    ) -> Result<(), NetError> {
+        self.send_all(region, spawns.chunks(MAX_SPAWN_PER_MESSAGE).map(|chunk| {
+            let mut body = Vec::new();
+            SpawnEntities { spawns: chunk.to_vec() }.encode(&mut body);
+            body
+        }))
     }
 
     /// [`spawn`](Self::spawn) where every entity has a client behind it.
-    pub fn spawn_observers(&self, positions: &[Pos3]) -> Result<(), NetError> {
-        self.spawn(&SpawnEntities::observers(positions).spawns)
+    pub fn spawn_observers(
+        &self,
+        region: RegionId,
+        positions: &[Pos3],
+    ) -> Result<(), NetError> {
+        self.spawn(region, &SpawnEntities::observers(positions).spawns)
     }
 
     /// Sends new absolute positions for entities this edge manages.
-    ///
-    /// The region declines any naming an entity it does not have this edge down
-    /// as managing, so a stale id costs a refusal rather than moving somebody
-    /// else's entity.
-    pub fn move_entities(&self, moves: &[(EntityId, Pos3)]) -> Result<(), NetError> {
-        self.send_all(
-            KIND_MOVE_ENTITIES,
-            moves.chunks(MAX_MOVES_PER_MESSAGE).map(|chunk| {
-                let mut body = Vec::new();
-                MoveEntities { moves: chunk.to_vec() }.encode(&mut body);
-                body
-            }),
-        )
+    pub fn move_entities(
+        &self,
+        region: RegionId,
+        moves: &[(EntityId, Pos3)],
+    ) -> Result<(), NetError> {
+        self.send_all(region, moves.chunks(MAX_MOVES_PER_MESSAGE).map(|chunk| {
+            let mut body = Vec::new();
+            MoveEntities { moves: chunk.to_vec() }.encode(&mut body);
+            body
+        }))
     }
 
     /// Gives entities back, because the game clients behind them have gone.
-    ///
-    /// The region despawns them and drops the viewers watching them. An edge
-    /// that disconnects gives up everything it holds without sending this.
-    pub fn despawn(&self, ids: &[EntityId]) -> Result<(), NetError> {
-        self.send_all(
-            KIND_DESPAWN_ENTITIES,
-            ids.chunks(MAX_DESPAWN_PER_MESSAGE).map(|chunk| {
-                let mut body = Vec::new();
-                DespawnEntities { ids: chunk.to_vec() }.encode(&mut body);
-                body
-            }),
-        )
+    pub fn despawn(&self, region: RegionId, ids: &[EntityId]) -> Result<(), NetError> {
+        self.send_all(region, ids.chunks(MAX_DESPAWN_PER_MESSAGE).map(|chunk| {
+            let mut body = Vec::new();
+            DespawnEntities { ids: chunk.to_vec() }.encode(&mut body);
+            body
+        }))
     }
 
-    /// Reads one message from the region, blocking until it arrives.
+    /// Says nothing except that this edge is still here.
     ///
-    /// `body` is reused across calls, so a receive loop holding one buffer does
-    /// not allocate per message. The result borrows it.
+    /// A region drops an edge silent past
+    /// [`EDGE_TIMEOUT`](crate::net::EDGE_TIMEOUT) and despawns what it managed.
+    /// An edge sending moves every tick never needs this; an idle one does.
+    pub fn keepalive(&self, region: RegionId) -> Result<(), NetError> {
+        self.send_all(region, std::iter::once(vec![KIND_KEEPALIVE]))
+    }
+
+    // -- what comes back --------------------------------------------------
+
+    /// Takes the next message, waiting for one.
     ///
-    /// One caller at a time: two threads reading one link would each get part of
-    /// the other's frame.
-    pub fn receive<'a>(&self, body: &'a mut Vec<u8>) -> Result<Incoming<'a>, NetError> {
-        let mut sock = &self.stream;
-        let kind = read_frame(&mut sock, body)?;
-        match kind {
-            KIND_ENTITIES_SPAWNED => Ok(Incoming::Spawned(EntitiesSpawned::decode(body)?)),
-            KIND_POSITION_UPDATES => Ok(Incoming::Updates(PositionUpdates::decode(body)?)),
-            other => Err(NetError::Unexpected { expected: "a session message", got: other }),
+    /// `None` once the link is closed.
+    pub fn receive(&self) -> Option<Incoming> {
+        self.inbox.lock().expect("not poisoned").recv().ok()
+    }
+
+    /// Takes the next message if one is already here.
+    pub fn try_receive(&self) -> Option<Incoming> {
+        match self.inbox.lock().expect("not poisoned").try_recv() {
+            Ok(message) => Some(message),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
     }
 
-    /// Writes every chunk of one logical message, then pushes once.
-    fn send_all(&self, kind: u8, bodies: impl Iterator<Item = Vec<u8>>) -> Result<(), NetError> {
-        let mut sock = self.writer.lock().expect("not poisoned");
-        for body in bodies {
-            write_frame(&mut *sock, kind, &body)?;
-        }
-        sock.flush()?;
-        Ok(())
+    fn send_all(
+        &self,
+        region: RegionId,
+        bodies: impl Iterator<Item = Vec<u8>>,
+    ) -> Result<(), NetError> {
+        let subject: async_nats::Subject = subjects::command(region, &self.edge).into();
+        self.runtime.block_on(async {
+            for body in bodies {
+                self.client.publish(subject.clone(), body.into()).await?;
+            }
+            // One flush for the whole message, however many the cap split it
+            // into.
+            self.client.flush().await?;
+            Ok(())
+        })
+    }
+
+    async fn read_payloads(
+        client: &async_nats::Client,
+        edge: &EdgeName,
+        out: Sender<Incoming>,
+    ) -> Result<JoinHandle<()>, NetError> {
+        let mut payloads = client.subscribe(subjects::to_edge(edge, "payload")).await?;
+        Ok(tokio::spawn(async move {
+            while let Some(message) = payloads.next().await {
+                let Ok(region) = subjects::origin(&message.subject) else { continue };
+                if message.payload.len() < 4 {
+                    continue;
+                }
+                let viewer = ViewerId::from_raw(u32::from_le_bytes([
+                    message.payload[0],
+                    message.payload[1],
+                    message.payload[2],
+                    message.payload[3],
+                ]));
+                let payload = message.payload.slice(4..);
+                if out.send(Incoming::Updates { region, viewer, payload }).is_err() {
+                    return;
+                }
+            }
+        }))
+    }
+
+    async fn read_replies(
+        client: &async_nats::Client,
+        edge: &EdgeName,
+        out: Sender<Incoming>,
+    ) -> Result<JoinHandle<()>, NetError> {
+        let mut replies = client.subscribe(subjects::to_edge(edge, "reply")).await?;
+        Ok(tokio::spawn(async move {
+            while let Some(message) = replies.next().await {
+                let Ok(region) = subjects::origin(&message.subject) else { continue };
+                let Some((_kind, body)) = message.payload.split_first() else { continue };
+                let Ok(spawned) = EntitiesSpawned::decode(body) else { continue };
+                let entities = spawned.entities;
+                if out.send(Incoming::Spawned { region, entities }).is_err() {
+                    return;
+                }
+            }
+        }))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::net::error::RejectCode;
-    use crate::net::region::auth::AllowAll;
-    use crate::net::region::protocol::{ProtocolVersion, WorldParams};
-    use crate::net::region::server::RegionServer;
-    use std::sync::Arc;
-
-    fn server() -> RegionServer {
-        RegionServer::bind(
-            "127.0.0.1:0",
-            RegionId::from_raw(3),
-            WorldConfig::default(),
-            Arc::new(AllowAll),
-        )
-        .expect("binds a loopback port")
+impl Drop for RegionLink {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
     }
+}
 
-    #[test]
-    fn a_client_reads_the_offer_before_deciding() {
-        let s = server();
-        let addr = s.local_addr();
-        std::thread::scope(|scope| {
-            scope.spawn(|| s.accept());
-            let mut seen = None;
-            let client = RegionClient::connect_with(addr, b"", |offer| {
-                seen = Some(*offer);
-                Decision::Accept
-            })
-            .expect("handshake completes");
-
-            let seen = seen.expect("decide was called");
-            assert_eq!(seen.region, RegionId::from_raw(3));
-            assert_eq!(seen.config, WorldConfig::default());
-            assert_eq!(client.offer(), &seen);
-        });
-    }
-
-    #[test]
-    fn connecting_to_nothing_is_an_io_error() {
-        // Port zero never listens.
-        let e = RegionClient::connect("127.0.0.1:0", b"").expect_err("nothing is listening");
-        assert!(matches!(e, NetError::Io(_)));
-    }
-
-    #[test]
-    fn a_client_refuses_a_region_whose_config_does_not_rebuild() {
-        // Stands in for a region running a build whose wire layout has moved.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let addr = listener.local_addr().expect("bound");
-
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                let (mut sock, _) = listener.accept().expect("accepts");
-                let mut body = Vec::new();
-                read_frame(&mut sock, &mut body).expect("reads the hello");
-
-                let mut params = WorldParams::from_config(&WorldConfig::default());
-                params.protocol_hash ^= 0xFF;
-                ServerInfo { server: ServerVersion::CURRENT, region: RegionId::from_raw(1), params }
-                    .encode(&mut body);
-                write_frame(&mut sock, KIND_SERVER_INFO, &body).expect("writes the info");
-            });
-
-            let e = RegionClient::connect(addr, b"").expect_err("must not accept the offer");
-            assert!(matches!(e, NetError::ConfigMismatch { .. }), "got {e:?}");
-        });
-    }
-
-    #[test]
-    fn a_client_reports_the_reason_it_was_refused() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let addr = listener.local_addr().expect("bound");
-
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                let (mut sock, _) = listener.accept().expect("accepts");
-                let mut body = Vec::new();
-                read_frame(&mut sock, &mut body).expect("reads the hello");
-                Rejection { code: RejectCode::ProtocolMismatch }.encode(&mut body);
-                write_frame(&mut sock, KIND_REJECTION, &body).expect("writes the rejection");
-            });
-
-            let e = RegionClient::connect(addr, b"").expect_err("must be refused");
-            assert!(matches!(e, NetError::Rejected(RejectCode::ProtocolMismatch)), "got {e:?}");
-        });
-    }
-
-    #[test]
-    fn a_client_speaking_the_wrong_protocol_version_is_refused() {
-        let s = server();
-        let addr = s.local_addr();
-        std::thread::scope(|scope| {
-            let accepted = scope.spawn(|| s.accept());
-
-            // Hand-rolled, since RegionClient always sends the current version.
-            let mut sock = TcpStream::connect(addr).expect("connects");
-            let mut body = Vec::new();
-            ClientIdentification {
-                protocol: ProtocolVersion::from_raw(PROTOCOL_VERSION.raw() + 1),
-                credential: Vec::new(),
-            }
-            .encode(&mut body);
-            write_frame(&mut sock, KIND_CLIENT_IDENTIFICATION, &body).expect("writes");
-
-            let kind = read_frame(&mut sock, &mut body).expect("reads the answer");
-            assert_eq!(kind, KIND_REJECTION);
-            assert_eq!(
-                Rejection::decode(&body).expect("well formed").code,
-                RejectCode::ProtocolMismatch
-            );
-
-            assert!(matches!(
-                accepted.join().expect("thread"),
-                Err(NetError::ProtocolMismatch { .. })
-            ));
-        });
+impl core::fmt::Debug for RegionLink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RegionLink").field("edge", &self.edge).finish_non_exhaustive()
     }
 }

@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EntityKind, Incoming, RegionClient};
+use umwelt::net::{EdgeName, EntityKind, Incoming, RegionId, RegionLink};
 use umwelt::sim::ViewerId;
 use umwelt::{EntityId, Fixed, PacketReader, Pos3, RecordCodec};
 
@@ -34,8 +34,15 @@ const WALK_M_PER_SEC: i32 = 2;
 const RANGE_M: i32 = 32;
 
 fn main() {
-    let addr: String = herd::arg_or("addr", herd::DEFAULT_ADDR.to_string());
-    let secret: String = herd::arg_or("secret", herd::DEFAULT_SECRET.to_string());
+    let url: String = herd::arg_or("nats", herd::DEFAULT_NATS.to_string());
+    let region = RegionId::from_raw(herd::arg_or("region", 7u32));
+    // Distinct per process, so several edges against one region do not collide
+    // on a subject.
+    let name = EdgeName::new(herd::arg_or("name", format!("herd-{}", std::process::id())))
+        .unwrap_or_else(|e| {
+            eprintln!("--name: {e}");
+            std::process::exit(2);
+        });
     // Entities with a game client behind them. Each costs a viewer.
     let observers: usize = herd::arg_or("observers", 2048usize);
     // Entities with nothing behind them: replicated to whoever can see them,
@@ -45,18 +52,21 @@ fn main() {
     // clients disconnecting and connecting.
     let churn: usize = herd::arg_or("churn", 0usize);
 
-    let client = RegionClient::connect(addr.as_str(), secret.as_bytes()).unwrap_or_else(|e| {
-        eprintln!("connect {addr}: {e}");
+    let link = RegionLink::connect(&url, name.clone()).unwrap_or_else(|e| {
+        eprintln!("nats {url}: {e}");
+        std::process::exit(1);
+    });
+    let offer = link.info(region).unwrap_or_else(|e| {
+        eprintln!("asking {region} what it runs: {e}");
         std::process::exit(1);
     });
 
-    let cfg = *client.config();
+    let cfg = offer.config;
     let codec = RecordCodec::new(&cfg);
     let hz = cfg.tick_hz();
     println!(
-        "herd-edge: attached to {} running umwelt {} at {hz} Hz",
-        client.region(),
-        client.server_version(),
+        "herd-edge: {name} talking to {} running umwelt {} at {hz} Hz",
+        offer.region, offer.server,
     );
 
     // A column of its own, so several edges do not stack on one spot. The
@@ -67,7 +77,7 @@ fn main() {
     let mut asked: Vec<(Pos3, EntityKind)> =
         (0..observers).map(|n| (home(n), EntityKind::Observer)).collect();
     asked.extend((0..unattended).map(|n| (home(observers + n), EntityKind::Unattended)));
-    client.spawn(&asked).expect("asks for its population");
+    link.spawn(region, &asked).expect("asks for its population");
     println!(
         "herd-edge: asked for {observers} observers and {unattended} unattended \
          in lane x={lane}"
@@ -84,27 +94,22 @@ fn main() {
         // Receive: replication coming down, and the ids for anything spawned.
         scope.spawn(|| {
             let mut roster: Vec<(EntityId, ViewerId)> = Vec::new();
-            let mut body = Vec::new();
             while !stop.load(Ordering::Relaxed) {
-                match client.receive(&mut body) {
-                    Ok(Incoming::Spawned(reply)) => {
+                let Some(message) = link.receive() else { return };
+                match message {
+                    Incoming::Spawned { entities, .. } => {
                         // Only observers have a viewer, and only viewers are
                         // named by a payload coming down.
-                        roster.extend(reply.observers());
-                        arrivals
-                            .lock()
-                            .expect("not poisoned")
-                            .extend(reply.entities.iter().copied());
+                        roster.extend(entities.iter().filter_map(|(id, v)| v.map(|v| (*id, v))));
+                        arrivals.lock().expect("not poisoned").extend(entities);
                     }
-                    Ok(Incoming::Updates(update)) => {
+                    Incoming::Updates { viewer, payload, .. } => {
                         updates.fetch_add(1, Ordering::Relaxed);
-                        let Some(reader) = PacketReader::new(&codec, update.payload) else {
+                        let Some(reader) = PacketReader::new(&codec, &payload) else {
                             continue;
                         };
-                        let avatar = roster
-                            .iter()
-                            .find(|(_, v)| *v == update.viewer)
-                            .map(|(id, _)| *id);
+                        let avatar =
+                            roster.iter().find(|(_, v)| *v == viewer).map(|(id, _)| *id);
                         let mut n = 0u64;
                         for (id, _) in reader.updates() {
                             n += 1;
@@ -113,12 +118,6 @@ fn main() {
                             }
                         }
                         records.fetch_add(n, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        if !stop.load(Ordering::Relaxed) {
-                            eprintln!("herd-edge: link closed: {e}");
-                        }
-                        return;
                     }
                 }
             }
@@ -156,7 +155,7 @@ fn main() {
             let moves: Vec<(EntityId, Pos3)> =
                 held.iter().map(|(id, pos, _, _)| (*id, *pos)).collect();
             if !moves.is_empty() {
-                if client.move_entities(&moves).is_err() {
+                if link.move_entities(region, &moves).is_err() {
                     break;
                 }
                 sent += moves.len() as u64;
@@ -175,7 +174,7 @@ fn main() {
                     let leaving_at = &watched[watched.len() - churn..];
                     let leaving: Vec<EntityId> =
                         leaving_at.iter().map(|&at| held[at].0).collect();
-                    if client.despawn(&leaving).is_err() {
+                    if link.despawn(region, &leaving).is_err() {
                         break;
                     }
                     for &at in leaving_at.iter().rev() {
@@ -187,7 +186,7 @@ fn main() {
                     let coming: Vec<Pos3> =
                         (0..churn).map(|k| home(next_home + k)).collect();
                     next_home += churn;
-                    if client.spawn_observers(&coming).is_err() {
+                    if link.spawn_observers(region, &coming).is_err() {
                         break;
                     }
                 }

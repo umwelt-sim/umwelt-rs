@@ -1,36 +1,26 @@
-//! The region-to-edge protocol.
+//! The region-to-edge protocol, over NATS.
 //!
-//! One region simulation, and the edges relaying for it. Few peers, mutually
-//! trusted, deployed together, over a reliable ordered stream.
-//!
-//! Nothing here is shared with the client-facing protocol, which is not built.
-//! See [`net`](crate::net) for why that separation is deliberate rather than
-//! incidental.
+//! One region simulation, and the edges relaying for it. See `docs/adr/0001`
+//! for why this is NATS rather than a connection this crate implements.
 //!
 //! - [`protocol`] is the messages and the versions.
-//! - [`wire`] is how a message becomes bytes on this link, and is specific to
-//!   it: a length-prefixed stream is the wrong shape for the client-facing
-//!   datagrams.
-//! - [`auth`] is who is allowed to open a link.
-//! - [`edges`] is the set of edges one region has attached.
+//! - [`subjects`] is which subject carries what, and how to read one back.
+//! - [`edges`] is the set of edges one region has heard from.
+//! - [`session`] is what a running region and its edges say to each other.
 
-pub mod auth;
 mod client;
 pub mod edges;
 pub mod protocol;
 mod server;
 pub mod session;
-mod wire;
+pub mod subjects;
 
-pub use auth::{AllowAll, Authorizer, Denied, MAX_CREDENTIAL_BYTES, SharedSecret};
-pub use client::{Decision, Incoming, Offer, RegionClient};
-pub use edges::{ClaimError, Edge, EdgeId, EdgeView, Edges};
+pub use client::{INFO_TIMEOUT, Incoming, Offer, RegionLink};
+pub use edges::{ClaimError, EdgeId, EdgeName, EdgeView, Edges};
 pub use protocol::{
-    ClientIdentification, DespawnEntities, EntitiesSpawned, EntityKind, HANDSHAKE_TIMEOUT,
-    MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities,
-    PROTOCOL_VERSION, PositionUpdates, ProtocolVersion, RegionId, Rejection, ServerInfo,
-    ServerVersion, SpawnEntities, WorldParams,
+    DespawnEntities, EntitiesSpawned, EntityKind, MAX_DESPAWN_PER_MESSAGE, MAX_MESSAGE_BYTES,
+    MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION,
+    ProtocolVersion, RegionId, ServerInfo, ServerVersion, SpawnEntities, WorldParams,
 };
-pub use server::{RegionServer, Shutdown};
+pub use server::{EDGE_TIMEOUT, RegionServer};
 pub use session::{Applied, EdgeSink, Inbound, Settled};
-pub use wire::MAX_FRAME_BYTES;

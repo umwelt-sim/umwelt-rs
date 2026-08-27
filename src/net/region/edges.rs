@@ -1,46 +1,72 @@
-//! The edges connected to one region, and the entities each one manages.
-//!
-//! [`Edges`] is the set. [`Edge`] is one connected edge: holding one keeps it
-//! attached, and dropping it closes the link, frees the id, and releases every
-//! entity it managed.
+//! The edges relaying for one region, and the entities each one manages.
 //!
 //! An edge claims the entities whose game clients it holds the connections for.
 //! [`Edges::edge_for`] answers which edge manages a given entity, which is what
-//! a [`PayloadSink`](crate::PayloadSink) needs in order to send a viewer's
-//! payload to the right place. It is called once per served viewer per tick, so
-//! it takes a read lock and no more; claiming and releasing take the write lock
-//! and happen when a game client arrives or leaves.
+//! a [`PayloadSink`](crate::PayloadSink) needs in order to address a payload. It
+//! is called once per served viewer per tick, so it takes a read lock and no
+//! more; claiming and releasing take the write lock and happen when a game
+//! client arrives or leaves.
 //!
-//! [`EdgeId`] is dense and reusable. A recycled id names a different connection
-//! carrying nothing over from the last one.
+//! Edges arrive by name rather than by connection. Under NATS there is nothing
+//! to accept, so an edge becomes known the first time it sends a command, and
+//! stops being known when it has been silent long enough. See
+//! `docs/adr/0001`.
 
 use core::fmt;
-use std::io::{self, BufWriter, Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::entity::EntityId;
 use crate::net::error::NetError;
-use crate::net::region::wire::write_frame_parts;
 
 /// No edge manages this entity. Edge ids are dense from zero, so the top of
 /// the range is unreachable.
 const UNOWNED: u32 = u32::MAX;
 
-/// Bytes held per edge before a write reaches the socket.
+/// What an edge calls itself, and the token that names it in a subject.
 ///
-/// A payload is at most a packet, so this holds a couple of hundred of them.
-/// Writing every payload straight to the socket cost three syscalls each and
-/// held delivery to about 170,000 payloads a second; buffering trades two
-/// megabytes across eight edges for one syscall a batch.
-const OUTBOUND_BYTES: usize = 256 * 1024;
+/// Chosen by the edge and stable across restarts of any region, unlike
+/// [`EdgeId`], which is one region's dense internal index.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EdgeName(String);
 
-/// One connected edge's identity within one region server.
-///
-/// Dense and reusable. Not a network address, and not stable across
-/// reconnection: an edge that drops and comes back is a new `EdgeId`.
+impl EdgeName {
+    /// # Errors
+    ///
+    /// If the name is empty, longer than 64 bytes, or holds a character that
+    /// would change how a subject parses. Subjects are dot-separated and NATS
+    /// reads `*` and `>` as wildcards, so a name carrying one of those could
+    /// address subjects belonging to another edge.
+    pub fn new(name: impl Into<String>) -> Result<EdgeName, NetError> {
+        let name = name.into();
+        if name.is_empty() || name.len() > 64 {
+            return Err(NetError::BadEdgeName("length must be 1 to 64 bytes"));
+        }
+        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err(NetError::BadEdgeName("only letters, digits, dash and underscore"));
+        }
+        Ok(EdgeName(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EdgeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for EdgeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One edge's index within one region. Dense and reusable.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct EdgeId(u32);
@@ -72,14 +98,10 @@ impl fmt::Debug for EdgeId {
 /// Why an entity could not be claimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimError {
-    /// Another edge already manages this entity.
-    ///
-    /// Two edges managing one avatar would mean two clients being sent the same
-    /// viewer's packets, so this is a bug to surface rather than a race to
-    /// resolve by taking the last writer.
+    /// Another edge already manages this entity. Two edges managing one avatar
+    /// would send one viewer's packets to two clients.
     AlreadyClaimed { entity: EntityId, by: EdgeId },
-    /// That edge is not attached. A stale [`EdgeId`] naming a slot that has
-    /// since been freed or reused reaches this.
+    /// That edge is not attached.
     NoSuchEdge(EdgeId),
 }
 
@@ -96,68 +118,44 @@ impl fmt::Display for ClaimError {
 
 impl std::error::Error for ClaimError {}
 
-/// Running totals for one attached edge.
-///
-/// Cumulative since the edge attached, so a caller wanting rates takes
-/// differences between samples. An operator watching a region needs to know
-/// which edge is carrying what, not only the region's total.
+/// Running totals for one attached edge, cumulative since it was admitted.
 #[derive(Debug, Default)]
 pub(crate) struct EdgeStats {
-    /// Frames written to this edge, payloads and replies together.
-    pub(crate) frames: AtomicU64,
-    /// Bytes of frame body written, excluding the five-byte frame header.
-    pub(crate) bytes: AtomicU64,
-    /// Frames read from this edge.
     pub(crate) messages: AtomicU64,
-    /// Entities this edge manages that have a viewer watching them.
+    pub(crate) payloads: AtomicU64,
+    pub(crate) bytes: AtomicU64,
     pub(crate) observers: AtomicUsize,
-    /// Commands from this edge the region declined.
     pub(crate) refused: AtomicU64,
 }
 
 /// One edge's state, sampled together under a single lock.
-///
-/// Reading each field through its own accessor would take the lock once per
-/// field and could show a mixture of two moments.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EdgeView {
     pub id: EdgeId,
-    pub peer: SocketAddr,
+    pub name: EdgeName,
     /// How long this edge has been attached.
     pub uptime: Duration,
+    /// Since its last command. An edge silent past the region's expiry is
+    /// dropped.
+    pub silent: Duration,
     pub entities: usize,
     pub observers: usize,
-    pub frames: u64,
+    pub payloads: u64,
     pub bytes: u64,
     pub messages: u64,
     pub refused: u64,
 }
 
-/// One edge's buffered write half, shared by whatever needs to write to it.
-type Outbound = Arc<Mutex<BufWriter<TcpStream>>>;
-
-/// What one attached edge is, from the region's side.
 #[derive(Debug)]
 struct EdgeRecord {
-    peer: SocketAddr,
-    /// When this edge completed its handshake.
+    name: EdgeName,
     since: Instant,
-    /// Entities whose clients this edge holds the connections for.
+    heard: Instant,
     entities: Vec<EntityId>,
     stats: Arc<EdgeStats>,
-    /// The write half, so a reply or a payload can reach this edge from a
-    /// thread that does not own the [`Edge`]. One lock per edge, since two
-    /// writers interleaving would splice one frame into another.
-    ///
-    /// Buffered: the bulk path writes many payloads and pays its syscalls when
-    /// something flushes, rather than one per payload.
-    writer: Outbound,
 }
 
-/// The edges relaying for one region, and what each of them manages.
-///
-/// Shared between the accept loop, the thread holding each edge, and anything
-/// asking who is attached, so every method takes `&self`.
+/// The edges relaying for one region.
 #[derive(Debug, Default)]
 pub struct Edges {
     /// Indexed by [`EdgeId`]. `None` is a free slot awaiting reuse.
@@ -165,19 +163,15 @@ pub struct Edges {
     /// Indexed by entity slot, holding an edge id raw or [`UNOWNED`]. Separate
     /// from `slots` so a routing lookup never waits on a claim.
     owners: RwLock<Vec<u32>>,
-    /// Entities orphaned by an edge detaching, waiting for the tick loop to
+    /// Entities orphaned by an edge going away, waiting for the tick loop to
     /// despawn them and drop their viewers.
-    ///
-    /// Detaching happens on the edge's own thread, and despawning needs a
-    /// [`Step`](crate::sim::Step) that only exists inside a tick, so the two
-    /// cannot be the same moment.
     detached: Mutex<Vec<EntityId>>,
     live: AtomicUsize,
     accepted: AtomicU64,
-    /// Set when a frame is queued, cleared by a flush. `Handoff` calls
-    /// [`flush`](Self::flush) about a thousand times a second and most of those
-    /// have nothing waiting, so this keeps them from taking the set's lock.
-    buffered: AtomicBool,
+    /// Bumped whenever the set changes. A sink caches one subject per edge and
+    /// rebuilds when this moves, rather than taking the set's lock for every
+    /// payload it addresses.
+    generation: AtomicU64,
 }
 
 impl Edges {
@@ -186,6 +180,13 @@ impl Edges {
     }
 
     // -- the set ----------------------------------------------------------
+
+    /// Changes to the set, counted. A caller holding anything derived from
+    /// membership rebuilds when this moves.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
 
     /// Edges attached right now.
     #[inline]
@@ -198,30 +199,81 @@ impl Edges {
         self.len() == 0
     }
 
-    /// Edges admitted since this region server was bound, including those that
-    /// have since gone.
+    /// Edges admitted since this region started, including those since gone.
     #[inline]
     pub fn accepted(&self) -> u64 {
         self.accepted.load(Ordering::Relaxed)
     }
 
-    /// Where one edge is connected from, or `None` if that id is not currently
-    /// in use.
-    pub fn peer(&self, id: EdgeId) -> Option<SocketAddr> {
-        let slots = self.slots.lock().expect("not poisoned");
-        slots.get(id.index()).and_then(|held| held.as_ref()).map(|rec| rec.peer)
+    /// The id this region uses for an edge, admitting it if it is new.
+    ///
+    /// Called when a command arrives, which is the only way a region learns an
+    /// edge exists.
+    pub fn admit(&self, name: &EdgeName) -> EdgeId {
+        let mut slots = self.slots.lock().expect("not poisoned");
+        if let Some(at) = slots.iter().position(|h| h.as_ref().is_some_and(|r| &r.name == name)) {
+            let rec = slots[at].as_mut().expect("just matched");
+            rec.heard = Instant::now();
+            return EdgeId::from_raw(at as u32);
+        }
+        let at = match slots.iter().position(|held| held.is_none()) {
+            Some(free) => free,
+            None => {
+                slots.push(None);
+                slots.len() - 1
+            }
+        };
+        let now = Instant::now();
+        slots[at] = Some(EdgeRecord {
+            name: name.clone(),
+            since: now,
+            heard: now,
+            entities: Vec::new(),
+            stats: Arc::new(EdgeStats::default()),
+        });
+        self.live.fetch_add(1, Ordering::Relaxed);
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Release);
+        EdgeId::from_raw(at as u32)
     }
 
-    /// One edge's counters, shared so a caller can hold them across ticks.
+    /// Drops every edge silent for longer than `after`, orphaning what it
+    /// managed.
+    ///
+    /// A closed socket used to say an edge had gone. Nothing says so now, so
+    /// silence does. An edge holding entities sends a keepalive when it has
+    /// nothing else to say, and one under load sends moves every tick.
+    ///
+    /// Returns how many were dropped.
+    pub fn expire(&self, after: Duration) -> usize {
+        let stale: Vec<EdgeId> = {
+            let slots = self.slots.lock().expect("not poisoned");
+            slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, held)| {
+                    let rec = held.as_ref()?;
+                    (rec.heard.elapsed() > after).then(|| EdgeId::from_raw(i as u32))
+                })
+                .collect()
+        };
+        for id in &stale {
+            self.detach(*id);
+        }
+        stale.len()
+    }
+
+    pub fn name(&self, id: EdgeId) -> Option<EdgeName> {
+        let slots = self.slots.lock().expect("not poisoned");
+        slots.get(id.index()).and_then(|h| h.as_ref()).map(|r| r.name.clone())
+    }
+
     pub(crate) fn stats(&self, edge: EdgeId) -> Option<Arc<EdgeStats>> {
         let slots = self.slots.lock().expect("not poisoned");
-        slots.get(edge.index()).and_then(|held| held.as_ref()).map(|r| Arc::clone(&r.stats))
+        slots.get(edge.index()).and_then(|h| h.as_ref()).map(|r| Arc::clone(&r.stats))
     }
 
     /// Every attached edge with its counters, sampled at one moment.
-    ///
-    /// Allocates and takes the lock, so this is a reporting path rather than
-    /// something to call per tick.
     pub fn view(&self) -> Vec<EdgeView> {
         let slots = self.slots.lock().expect("not poisoned");
         slots
@@ -231,11 +283,12 @@ impl Edges {
                 let rec = held.as_ref()?;
                 Some(EdgeView {
                     id: EdgeId::from_raw(i as u32),
-                    peer: rec.peer,
+                    name: rec.name.clone(),
                     uptime: rec.since.elapsed(),
+                    silent: rec.heard.elapsed(),
                     entities: rec.entities.len(),
                     observers: rec.stats.observers.load(Ordering::Relaxed),
-                    frames: rec.stats.frames.load(Ordering::Relaxed),
+                    payloads: rec.stats.payloads.load(Ordering::Relaxed),
                     bytes: rec.stats.bytes.load(Ordering::Relaxed),
                     messages: rec.stats.messages.load(Ordering::Relaxed),
                     refused: rec.stats.refused.load(Ordering::Relaxed),
@@ -246,10 +299,8 @@ impl Edges {
 
     // -- who manages what -------------------------------------------------
 
-    /// Records that `edge` manages `entity`.
-    ///
-    /// Claiming an entity the same edge already manages is accepted and changes
-    /// nothing, so a caller resending a claim does not have to check first.
+    /// Records that `edge` manages `entity`. Repeating a claim the same edge
+    /// already holds changes nothing.
     pub fn claim(&self, edge: EdgeId, entity: EntityId) -> Result<(), ClaimError> {
         let mut slots = self.slots.lock().expect("not poisoned");
         let rec = slots
@@ -273,10 +324,8 @@ impl Edges {
         Ok(())
     }
 
-    /// Gives up an entity, whichever edge held it.
-    ///
-    /// Returns the edge that had it, or `None` if nobody did. Called when a
-    /// game client disconnects, or when the entity despawns.
+    /// Gives up an entity, whichever edge held it. Returns the edge that had
+    /// it, or `None` if nobody did.
     pub fn release(&self, entity: EntityId) -> Option<EdgeId> {
         let mut slots = self.slots.lock().expect("not poisoned");
         let mut owners = self.owners.write().expect("not poisoned");
@@ -292,10 +341,9 @@ impl Edges {
         Some(edge)
     }
 
-    /// Which edge manages this entity, if any.
-    ///
-    /// A payload built for a viewer goes to the edge holding that viewer's
-    /// client connection, and this is that lookup. Takes a read lock only.
+    /// Which edge manages this entity, if any. A payload built for a viewer is
+    /// addressed to the edge holding that viewer's client connection, and this
+    /// is that lookup. Takes a read lock only.
     #[inline]
     pub fn edge_for(&self, entity: EntityId) -> Option<EdgeId> {
         let owners = self.owners.read().expect("not poisoned");
@@ -303,132 +351,19 @@ impl Edges {
         (held_by != UNOWNED).then(|| EdgeId::from_raw(held_by))
     }
 
-    /// How many entities one edge manages, without building the list.
+    /// How many entities one edge manages.
     pub fn entity_count(&self, edge: EdgeId) -> usize {
         let slots = self.slots.lock().expect("not poisoned");
-        slots
-            .get(edge.index())
-            .and_then(|held| held.as_ref())
-            .map(|rec| rec.entities.len())
-            .unwrap_or(0)
+        slots.get(edge.index()).and_then(|h| h.as_ref()).map(|r| r.entities.len()).unwrap_or(0)
     }
 
-    // -- attachment -------------------------------------------------------
-
-    /// [`register`](Self::register) with a throwaway writer, for tests that
-    /// only exercise the set and its ownership rules.
-    #[cfg(test)]
-    fn register_for_test(&self, peer: SocketAddr) -> EdgeId {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let sock = TcpStream::connect(listener.local_addr().expect("bound")).expect("connects");
-        self.register(peer, Arc::new(Mutex::new(BufWriter::new(sock))))
-    }
-
-    /// Sends one frame to an attached edge and pushes it out.
-    ///
-    /// The control path: replies an edge is waiting on, which are few and want
-    /// no latency. Returns [`NetError::Closed`] if that id names nobody.
-    pub(crate) fn send(&self, edge: EdgeId, kind: u8, body: &[u8]) -> Result<(), NetError> {
-        self.send_parts(edge, kind, &[body])?;
-        let (writer, _) = self.writer_for(edge)?;
-        writer.lock().expect("not poisoned").flush()?;
-        Ok(())
-    }
-
-    /// Queues one frame from several pieces, without pushing it out.
-    ///
-    /// The bulk path. Nothing reaches the socket until [`flush`](Self::flush),
-    /// which is what turns a syscall per payload into a syscall per batch.
-    pub(crate) fn send_parts(
-        &self,
-        edge: EdgeId,
-        kind: u8,
-        parts: &[&[u8]],
-    ) -> Result<(), NetError> {
-        let (writer, stats) = self.writer_for(edge)?;
-        let mut sock = writer.lock().expect("not poisoned");
-        write_frame_parts(&mut *sock, kind, parts)?;
-        self.buffered.store(true, Ordering::Release);
-        stats.frames.fetch_add(1, Ordering::Relaxed);
-        stats.bytes.fetch_add(parts.iter().map(|p| p.len() as u64).sum::<u64>(), Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Pushes every edge's queued frames to its socket.
-    ///
-    /// Returns how many edges had anything waiting. Called at the end of a
-    /// batch: [`Handoff`](crate::Handoff) does it once per drain pass.
-    pub fn flush(&self) -> usize {
-        if !self.buffered.swap(false, Ordering::Acquire) {
-            return 0;
-        }
-        let writers: Vec<Outbound> = {
-            let slots = self.slots.lock().expect("not poisoned");
-            slots.iter().filter_map(|held| held.as_ref()).map(|r| Arc::clone(&r.writer)).collect()
-        };
-        // The set's lock is released before the writes, so a slow edge cannot
-        // block a claim or another edge's flush.
-        let mut pushed = 0;
-        for writer in writers {
-            let mut sock = writer.lock().expect("not poisoned");
-            if sock.buffer().is_empty() {
-                continue;
-            }
-            // A failed flush is a gone edge, which detaching will report.
-            if sock.flush().is_ok() {
-                pushed += 1;
-            }
-        }
-        pushed
-    }
-
-    fn writer_for(&self, edge: EdgeId) -> Result<(Outbound, Arc<EdgeStats>), NetError> {
-        let slots = self.slots.lock().expect("not poisoned");
-        slots
-            .get(edge.index())
-            .and_then(|held| held.as_ref())
-            .map(|rec| (Arc::clone(&rec.writer), Arc::clone(&rec.stats)))
-            .ok_or(NetError::Closed)
-    }
-
-    /// Takes the lowest free id, so the set stays dense.
-    fn register(&self, peer: SocketAddr, writer: Outbound) -> EdgeId {
-        let mut slots = self.slots.lock().expect("not poisoned");
-        let at = match slots.iter().position(|held| held.is_none()) {
-            Some(free) => free,
-            None => {
-                slots.push(None);
-                slots.len() - 1
-            }
-        };
-        slots[at] = Some(EdgeRecord {
-            peer,
-            since: Instant::now(),
-            entities: Vec::new(),
-            stats: Arc::new(EdgeStats::default()),
-            writer,
-        });
-        self.live.fetch_add(1, Ordering::Relaxed);
-        self.accepted.fetch_add(1, Ordering::Relaxed);
-        EdgeId::from_raw(at as u32)
-    }
-
-    /// Entities orphaned by a detaching edge, taken once.
-    ///
-    /// The tick loop drains this and despawns them: an entity whose edge has
-    /// gone has no client behind it, and leaving it alive would have the region
-    /// replicating for nobody.
+    /// Entities orphaned by an edge going away, taken once. The tick loop
+    /// despawns them: an entity whose edge has gone has no client behind it.
     pub fn take_detached(&self) -> Vec<EntityId> {
         std::mem::take(&mut *self.detached.lock().expect("not poisoned"))
     }
 
-    /// Detaches an edge and releases everything it managed.
-    ///
-    /// The entities stop being routable immediately, which is the truth: there
-    /// is no longer a connection to send their clients anything over. They are
-    /// also recorded in [`take_detached`](Self::take_detached), since a region
-    /// that kept simulating them would be replicating for nobody.
-    fn deregister(&self, id: EdgeId) {
+    fn detach(&self, id: EdgeId) {
         let mut slots = self.slots.lock().expect("not poisoned");
         let Some(Some(rec)) = slots.get_mut(id.index()).map(|held| held.take()) else {
             return;
@@ -448,98 +383,7 @@ impl Edges {
             self.detached.lock().expect("not poisoned").extend_from_slice(&rec.entities);
         }
         self.live.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Admits a connected peer to the set.
-    ///
-    /// Called by [`RegionServer`](crate::net::RegionServer) once a handshake
-    /// has completed, which is the only point an edge exists.
-    pub(crate) fn admit(
-        self: &Arc<Edges>,
-        stream: TcpStream,
-        peer: SocketAddr,
-    ) -> Result<Edge, NetError> {
-        let writer =
-            Arc::new(Mutex::new(BufWriter::with_capacity(OUTBOUND_BYTES, stream.try_clone()?)));
-        let id = self.register(peer, writer);
-        Ok(Edge { id, peer, stream, edges: Arc::clone(self) })
-    }
-}
-
-/// One attached edge, past the handshake.
-///
-/// Holding one keeps the edge attached and counted in [`Edges::len`]. Dropping
-/// it closes the link, frees the id, and releases every entity it managed.
-///
-/// There is nothing to carry yet. The state payloads
-/// [`PacketWriter`](crate::PacketWriter) assembles do not travel this link, and
-/// the sink that would route them here is not built.
-#[derive(Debug)]
-pub struct Edge {
-    id: EdgeId,
-    peer: SocketAddr,
-    stream: TcpStream,
-    edges: Arc<Edges>,
-}
-
-impl Edge {
-    #[inline]
-    pub fn id(&self) -> EdgeId {
-        self.id
-    }
-
-    #[inline]
-    pub fn peer(&self) -> SocketAddr {
-        self.peer
-    }
-
-    #[inline]
-    pub fn stream(&self) -> &TcpStream {
-        &self.stream
-    }
-
-    /// The set this edge belongs to.
-    #[inline]
-    pub fn edges(&self) -> &Arc<Edges> {
-        &self.edges
-    }
-
-    /// Takes over an entity, meaning this edge holds its client's connection.
-    pub fn claim(&self, entity: EntityId) -> Result<(), ClaimError> {
-        self.edges.claim(self.id, entity)
-    }
-
-    /// Gives up an entity. Returns whether this edge was the one holding it.
-    pub fn release(&self, entity: EntityId) -> bool {
-        self.edges.release(entity) == Some(self.id)
-    }
-
-    /// How many entities this edge manages.
-    pub fn entity_count(&self) -> usize {
-        self.edges.entity_count(self.id)
-    }
-
-    /// Holds the link open until the edge closes it.
-    ///
-    /// Reads and discards, since nothing speaks on this link yet. This is what
-    /// an edge does in the meantime, and it is the placeholder the payload path
-    /// replaces.
-    pub fn wait_for_close(&mut self) -> Result<(), NetError> {
-        let mut scratch = [0u8; 256];
-        loop {
-            match self.stream.read(&mut scratch) {
-                Ok(0) => return Ok(()),
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(NetError::Io(e)),
-            }
-        }
-    }
-}
-
-impl Drop for Edge {
-    fn drop(&mut self) {
-        self.edges.deregister(self.id);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -547,12 +391,25 @@ impl Drop for Edge {
 mod tests {
     use super::*;
 
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
-    }
-
     fn ent(n: u32) -> EntityId {
         EntityId::from_raw(n)
+    }
+
+    fn name(s: &str) -> EdgeName {
+        EdgeName::new(s).expect("valid")
+    }
+
+    #[test]
+    fn an_edge_name_refuses_what_would_break_a_subject() {
+        assert!(EdgeName::new("edge-1").is_ok());
+        assert!(EdgeName::new("edge_1").is_ok());
+        // A dot would split into another subject token, and the wildcards would
+        // reach subjects belonging to other edges.
+        assert!(EdgeName::new("edge.1").is_err());
+        assert!(EdgeName::new("*").is_err());
+        assert!(EdgeName::new(">").is_err());
+        assert!(EdgeName::new("").is_err());
+        assert!(EdgeName::new("x".repeat(65)).is_err());
     }
 
     #[test]
@@ -569,82 +426,66 @@ mod tests {
         assert!(edges.is_empty());
         assert_eq!(edges.accepted(), 0);
         assert!(edges.view().is_empty());
-        assert_eq!(edges.peer(EdgeId::from_raw(0)), None);
         assert_eq!(edges.edge_for(ent(0)), None);
     }
 
     #[test]
-    fn ids_are_handed_out_densely() {
+    fn an_edge_is_admitted_once_however_often_it_speaks() {
         let edges = Edges::new();
-        for n in 0..4u32 {
-            assert_eq!(edges.register_for_test(addr(9000 + n as u16)), EdgeId::from_raw(n));
-        }
-        assert_eq!(edges.len(), 4);
-        assert_eq!(edges.accepted(), 4);
-    }
+        let a = edges.admit(&name("alpha"));
+        assert_eq!(edges.admit(&name("alpha")), a, "the same name is the same edge");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges.accepted(), 1);
 
-    #[test]
-    fn a_freed_id_is_reused() {
-        let edges = Edges::new();
-        for n in 0..3u16 {
-            edges.register_for_test(addr(9000 + n));
-        }
-        edges.deregister(EdgeId::from_raw(1));
+        let b = edges.admit(&name("beta"));
+        assert_ne!(a, b);
         assert_eq!(edges.len(), 2);
-        assert_eq!(
-            edges.register_for_test(addr(9999)),
-            EdgeId::from_raw(1),
-            "the lowest free slot is taken first"
-        );
-        assert_eq!(edges.accepted(), 4, "reuse is still an admission");
     }
 
     #[test]
-    fn deregistering_twice_counts_once() {
+    fn silence_past_the_expiry_drops_an_edge() {
         let edges = Edges::new();
-        let id = edges.register_for_test(addr(9000));
-        edges.deregister(id);
-        edges.deregister(id);
-        assert_eq!(edges.len(), 0, "the count must not go negative");
-    }
-
-    #[test]
-    fn the_set_reports_who_is_attached() {
-        let edges = Edges::new();
-        edges.register_for_test(addr(9000));
-        let second = edges.register_for_test(addr(9001));
-        edges.register_for_test(addr(9002));
-        edges.deregister(second);
-
-        assert_eq!(edges.peer(EdgeId::from_raw(0)), Some(addr(9000)));
-        assert_eq!(edges.peer(second), None, "a freed id names nobody");
-
-        let attached = edges.view();
-        assert_eq!(attached.len(), 2);
-        assert_eq!((attached[0].id, attached[0].peer), (EdgeId::from_raw(0), addr(9000)));
-        assert_eq!((attached[1].id, attached[1].peer), (EdgeId::from_raw(2), addr(9002)));
-    }
-
-    #[test]
-    fn an_edge_manages_the_entities_it_claims() {
-        let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        let b = edges.register_for_test(addr(9001));
-
+        let a = edges.admit(&name("alpha"));
         edges.claim(a, ent(10)).expect("unclaimed");
-        edges.claim(a, ent(11)).expect("unclaimed");
-        edges.claim(b, ent(20)).expect("unclaimed");
 
-        assert_eq!(edges.entity_count(a), 2);
-        assert_eq!(edges.entity_count(b), 1);
+        assert_eq!(edges.expire(Duration::from_secs(60)), 0, "not silent long enough");
+        assert_eq!(edges.len(), 1);
+
+        assert_eq!(edges.expire(Duration::ZERO), 1);
+        assert!(edges.is_empty());
+        assert_eq!(edges.edge_for(ent(10)), None, "its entities stop routing");
+        assert_eq!(edges.take_detached(), vec![ent(10)], "and go to the tick loop");
+    }
+
+    #[test]
+    fn speaking_again_resets_the_silence() {
+        let edges = Edges::new();
+        let a = edges.admit(&name("alpha"));
+        std::thread::sleep(Duration::from_millis(20));
+        edges.admit(&name("alpha")); // a command arriving
+        assert_eq!(edges.expire(Duration::from_millis(15)), 0);
+        assert_eq!(edges.len(), 1);
+        let _ = a;
+    }
+
+    #[test]
+    fn a_freed_id_is_reused_and_inherits_nothing() {
+        let edges = Edges::new();
+        let a = edges.admit(&name("alpha"));
+        edges.claim(a, ent(10)).expect("unclaimed");
+        edges.expire(Duration::ZERO);
+
+        let reused = edges.admit(&name("gamma"));
+        assert_eq!(reused, a, "the same slot came back");
+        assert_eq!(edges.entity_count(reused), 0, "with none of the old claims");
+        assert_eq!(edges.edge_for(ent(10)), None);
     }
 
     #[test]
     fn routing_finds_the_edge_that_manages_an_entity() {
-        // The lookup a sink makes for every payload it is handed.
         let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        let b = edges.register_for_test(addr(9001));
+        let a = edges.admit(&name("alpha"));
+        let b = edges.admit(&name("beta"));
         edges.claim(a, ent(10)).expect("unclaimed");
         edges.claim(b, ent(20)).expect("unclaimed");
 
@@ -656,8 +497,8 @@ mod tests {
     #[test]
     fn two_edges_cannot_manage_one_entity() {
         let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        let b = edges.register_for_test(addr(9001));
+        let a = edges.admit(&name("alpha"));
+        let b = edges.admit(&name("beta"));
         edges.claim(a, ent(10)).expect("unclaimed");
 
         assert_eq!(
@@ -671,7 +512,7 @@ mod tests {
     #[test]
     fn reclaiming_an_entity_this_edge_already_has_changes_nothing() {
         let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
+        let a = edges.admit(&name("alpha"));
         edges.claim(a, ent(10)).expect("unclaimed");
         edges.claim(a, ent(10)).expect("the same edge may repeat itself");
         assert_eq!(edges.entity_count(a), 1, "and it is not counted twice");
@@ -680,8 +521,8 @@ mod tests {
     #[test]
     fn claiming_through_a_stale_edge_id_is_refused() {
         let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        edges.deregister(a);
+        let a = edges.admit(&name("alpha"));
+        edges.expire(Duration::ZERO);
         assert_eq!(edges.claim(a, ent(10)), Err(ClaimError::NoSuchEdge(a)));
         assert_eq!(edges.edge_for(ent(10)), None);
     }
@@ -689,24 +530,22 @@ mod tests {
     #[test]
     fn releasing_an_entity_stops_it_routing() {
         let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
+        let a = edges.admit(&name("alpha"));
         edges.claim(a, ent(10)).expect("unclaimed");
         edges.claim(a, ent(11)).expect("unclaimed");
 
         assert_eq!(edges.release(ent(10)), Some(a));
         assert_eq!(edges.edge_for(ent(10)), None);
         assert_eq!(edges.entity_count(a), 1, "the rest are untouched");
-
         assert_eq!(edges.release(ent(10)), None, "releasing twice reports nobody");
         assert_eq!(edges.release(ent(99)), None, "so does releasing what nobody held");
     }
 
     #[test]
     fn a_released_entity_can_move_to_another_edge() {
-        // A game client reconnecting through a different edge.
         let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        let b = edges.register_for_test(addr(9001));
+        let a = edges.admit(&name("alpha"));
+        let b = edges.admit(&name("beta"));
         edges.claim(a, ent(10)).expect("unclaimed");
         edges.release(ent(10));
         edges.claim(b, ent(10)).expect("free again");
@@ -715,66 +554,10 @@ mod tests {
     }
 
     #[test]
-    fn detaching_an_edge_releases_everything_it_managed() {
+    fn the_set_takes_traffic_from_several_threads() {
         let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        let b = edges.register_for_test(addr(9001));
-        edges.claim(a, ent(10)).expect("unclaimed");
-        edges.claim(a, ent(11)).expect("unclaimed");
-        edges.claim(b, ent(20)).expect("unclaimed");
-
-        edges.deregister(a);
-        assert_eq!(edges.edge_for(ent(10)), None);
-        assert_eq!(edges.edge_for(ent(11)), None);
-        assert_eq!(edges.edge_for(ent(20)), Some(b), "another edge is unaffected");
-        assert_eq!(edges.entity_count(a), 0);
-    }
-
-    #[test]
-    fn a_detaching_edge_leaves_its_entities_for_the_tick_loop() {
-        let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        let b = edges.register_for_test(addr(9001));
-        edges.claim(a, ent(10)).expect("unclaimed");
-        edges.claim(a, ent(11)).expect("unclaimed");
-        edges.claim(b, ent(20)).expect("unclaimed");
-
-        assert!(edges.take_detached().is_empty(), "nothing has detached yet");
-        edges.deregister(a);
-
-        let mut orphaned = edges.take_detached();
-        orphaned.sort();
-        assert_eq!(orphaned, vec![ent(10), ent(11)]);
-        assert!(edges.take_detached().is_empty(), "taken once, not repeatedly");
-        assert_eq!(edges.edge_for(ent(20)), Some(b), "another edge keeps its own");
-    }
-
-    #[test]
-    fn an_edge_that_managed_nothing_orphans_nothing() {
-        let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        edges.deregister(a);
-        assert!(edges.take_detached().is_empty());
-    }
-
-    #[test]
-    fn a_reused_id_does_not_inherit_the_previous_edges_entities() {
-        let edges = Edges::new();
-        let a = edges.register_for_test(addr(9000));
-        edges.claim(a, ent(10)).expect("unclaimed");
-        edges.deregister(a);
-
-        let reused = edges.register_for_test(addr(9001));
-        assert_eq!(reused, a, "the same slot came back");
-        assert_eq!(edges.entity_count(reused), 0, "with none of the old claims");
-        assert_eq!(edges.edge_for(ent(10)), None);
-    }
-
-    #[test]
-    fn routing_survives_claims_from_several_threads() {
-        let edges = Edges::new();
-        let ids: Vec<EdgeId> = (0..8).map(|n| edges.register_for_test(addr(9000 + n))).collect();
-
+        let ids: Vec<EdgeId> =
+            (0..8).map(|n| edges.admit(&name(&format!("edge{n}")))).collect();
         std::thread::scope(|scope| {
             for (t, id) in ids.iter().enumerate() {
                 let edges = &edges;
@@ -787,29 +570,9 @@ mod tests {
                 });
             }
         });
-
-        for (t, id) in ids.iter().enumerate() {
+        for id in &ids {
             assert_eq!(edges.entity_count(*id), 100);
-            assert_eq!(edges.edge_for(ent(t as u32 * 100)), Some(*id));
         }
-    }
-
-    #[test]
-    fn the_set_takes_registrations_from_several_threads() {
-        let edges = Edges::new();
-        std::thread::scope(|scope| {
-            for t in 0..8u16 {
-                let edges = &edges;
-                scope.spawn(move || {
-                    for n in 0..50u16 {
-                        let id = edges.register_for_test(addr(9000 + t * 50 + n));
-                        edges.deregister(id);
-                    }
-                });
-            }
-        });
-        assert_eq!(edges.len(), 0);
-        assert_eq!(edges.accepted(), 400);
-        assert!(edges.view().is_empty());
+        assert_eq!(edges.len(), 8);
     }
 }

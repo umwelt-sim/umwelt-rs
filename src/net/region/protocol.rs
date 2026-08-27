@@ -1,36 +1,18 @@
 //! The messages on the region-to-edge link.
 //!
 //! A message belongs to the protocol, not to whichever end happens to send it.
-//! Each is named for what it carries: [`ClientIdentification`] identifies the
-//! connecting client, [`ServerInfo`] describes the server, [`Rejection`] says
-//! the connection will not be taken.
+//! Each is named for what it carries.
 //!
-//! The exchange, and why it is in this order:
-//!
-//! 1. The client sends [`ClientIdentification`]: the protocol version it
-//!    speaks, and its credential.
-//! 2. The server authorizes it. A peer that fails gets a bare [`Rejection`] and
-//!    the connection closes.
-//! 3. The server sends [`ServerInfo`]: its version, its region id, and the
-//!    world parameters.
-//! 4. The client accepts, or quits. Both are empty frames.
-//!
-//! The identification comes first and the server info second, so a peer that
-//! cannot authorize never learns the region's size, its tick rate, or its id.
-//!
-//! The client accepts or quits rather than the server assuming it will stay. A
-//! client that reads the parameters and finds a world it cannot render, or a
-//! region it did not mean to reach, quits, so the server does not count an edge
-//! that is about to leave.
+//! NATS delivers whole messages, so there is no framing here: a message is a
+//! one-byte kind followed by its body. Which subject it arrived on says which
+//! direction it travelled and, for a command, which edge sent it. See
+//! `docs/adr/0001`.
 
 use core::fmt;
-use std::time::Duration;
 
 use crate::config::WorldConfig;
 use crate::entity::EntityId;
-use crate::net::error::{NetError, RejectCode};
-use crate::net::region::auth::MAX_CREDENTIAL_BYTES;
-use crate::net::region::wire::{Cursor, MAX_FRAME_BYTES};
+use crate::net::error::NetError;
 use crate::pos::Pos3;
 use crate::sim::ViewerId;
 
@@ -38,41 +20,23 @@ use crate::sim::ViewerId;
 // Frame kinds
 // ---------------------------------------------------------------------------
 
-pub(crate) const KIND_CLIENT_IDENTIFICATION: u8 = 1;
-pub(crate) const KIND_SERVER_INFO: u8 = 2;
-pub(crate) const KIND_REJECTION: u8 = 3;
-pub(crate) const KIND_ACCEPTED: u8 = 4;
-pub(crate) const KIND_QUIT: u8 = 5;
-pub(crate) const KIND_SPAWN_ENTITIES: u8 = 6;
-pub(crate) const KIND_ENTITIES_SPAWNED: u8 = 7;
-pub(crate) const KIND_MOVE_ENTITIES: u8 = 8;
-pub(crate) const KIND_POSITION_UPDATES: u8 = 9;
-pub(crate) const KIND_DESPAWN_ENTITIES: u8 = 10;
+pub(crate) const KIND_SPAWN_ENTITIES: u8 = 1;
+pub(crate) const KIND_ENTITIES_SPAWNED: u8 = 2;
+pub(crate) const KIND_MOVE_ENTITIES: u8 = 3;
+pub(crate) const KIND_DESPAWN_ENTITIES: u8 = 5;
+pub(crate) const KIND_KEEPALIVE: u8 = 6;
 
 /// Names a frame kind for an error message, without echoing the peer's bytes.
 pub(crate) fn kind_name(kind: u8) -> &'static str {
     match kind {
-        KIND_CLIENT_IDENTIFICATION => "client identification",
-        KIND_SERVER_INFO => "server info",
-        KIND_REJECTION => "rejection",
-        KIND_ACCEPTED => "accepted",
-        KIND_QUIT => "quit",
         KIND_SPAWN_ENTITIES => "spawn entities",
         KIND_ENTITIES_SPAWNED => "entities spawned",
         KIND_MOVE_ENTITIES => "move entities",
-        KIND_POSITION_UPDATES => "position updates",
         KIND_DESPAWN_ENTITIES => "despawn entities",
+        KIND_KEEPALIVE => "keepalive",
         _ => "unknown",
     }
 }
-
-/// How long either end waits on the other during the handshake.
-///
-/// A peer that connects and then says nothing would otherwise hold a thread
-/// for as long as it liked, which is a way in that does not need a credential.
-/// The deadline is lifted once the link is up, since a link is expected to sit
-/// idle between packets.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Identity and versions
@@ -288,51 +252,24 @@ impl WorldParams {
 // Messages
 // ---------------------------------------------------------------------------
 
-/// Identifies the connecting client. The first message on the link.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClientIdentification {
-    pub protocol: ProtocolVersion,
-    /// Opaque bytes for the region's
-    /// [`Authorizer`](crate::net::Authorizer). This crate never interprets
-    /// them.
-    pub credential: Vec<u8>,
-}
-
-impl ClientIdentification {
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        out.clear();
-        out.extend_from_slice(&self.protocol.raw().to_le_bytes());
-        out.extend_from_slice(&(self.credential.len() as u16).to_le_bytes());
-        out.extend_from_slice(&self.credential);
-    }
-
-    pub(crate) fn decode(body: &[u8]) -> Result<ClientIdentification, NetError> {
-        let mut c = Cursor::new(body, "client identification");
-        let protocol = ProtocolVersion::from_raw(c.u16()?);
-        let len = c.u16()? as usize;
-        if len > MAX_CREDENTIAL_BYTES {
-            return Err(NetError::Malformed("client identification credential"));
-        }
-        let credential = c.bytes(len)?.to_vec();
-        c.finish()?;
-        Ok(ClientIdentification { protocol, credential })
-    }
-}
-
 /// Describes the server and the region it owns. Sent once an identification
 /// has authorized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerInfo {
+    /// What this region speaks. There is no handshake to check it in, so it
+    /// travels here and the edge refuses a region it cannot talk to.
+    pub protocol: ProtocolVersion,
     pub server: ServerVersion,
     pub region: RegionId,
     pub params: WorldParams,
 }
 
 impl ServerInfo {
-    pub const BYTES: usize = 6 + 4 + WorldParams::BYTES;
+    pub const BYTES: usize = 2 + 6 + 4 + WorldParams::BYTES;
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
+        out.extend_from_slice(&self.protocol.raw().to_le_bytes());
         out.extend_from_slice(&self.server.major.to_le_bytes());
         out.extend_from_slice(&self.server.minor.to_le_bytes());
         out.extend_from_slice(&self.server.patch.to_le_bytes());
@@ -342,42 +279,25 @@ impl ServerInfo {
 
     pub(crate) fn decode(body: &[u8]) -> Result<ServerInfo, NetError> {
         let mut c = Cursor::new(body, "server info");
+        let protocol = ProtocolVersion::from_raw(c.u16()?);
         let server = ServerVersion { major: c.u16()?, minor: c.u16()?, patch: c.u16()? };
         let region = RegionId::from_raw(c.u32()?);
         let params = WorldParams::decode(&mut c)?;
         c.finish()?;
-        Ok(ServerInfo { server, region, params })
-    }
-}
-
-/// Says the connection will not be taken, and nothing else.
-///
-/// One byte. Everything the server knows about why stays on the server.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rejection {
-    pub code: RejectCode,
-}
-
-impl Rejection {
-    pub const BYTES: usize = 1;
-
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        out.clear();
-        out.push(self.code.as_u8());
-    }
-
-    pub(crate) fn decode(body: &[u8]) -> Result<Rejection, NetError> {
-        let mut c = Cursor::new(body, "rejection");
-        let raw = c.u8()?;
-        c.finish()?;
-        let code = RejectCode::from_u8(raw).ok_or(NetError::Malformed("rejection code"))?;
-        Ok(Rejection { code })
+        Ok(ServerInfo { protocol, server, region, params })
     }
 }
 
 // ---------------------------------------------------------------------------
 // Session messages
 // ---------------------------------------------------------------------------
+
+/// Most bytes one message body may carry.
+///
+/// NATS enforces its own maximum payload, well above this. Keeping messages
+/// small bounds the buffer a decoder allocates for a claimed count, and makes a
+/// large spawn or move batch arrive as several messages rather than one.
+pub const MAX_MESSAGE_BYTES: usize = 4096;
 
 /// Bytes one spawn request takes: three raw [`Fixed`](crate::Fixed) axes, and
 /// what kind of thing is being spawned.
@@ -396,24 +316,25 @@ const SPAWNED_BYTES: usize = 8;
 /// error on every round trip through the region.
 const MOVE_BYTES: usize = 16;
 
-/// Most entities one [`SpawnEntities`] may ask for, so its reply fits a frame.
+/// Most entities one [`SpawnEntities`] may ask for, so its reply fits one
+/// message. The five bytes are the kind and the count.
 ///
 /// An edge wanting more sends more messages. The frame cap is what bounds an
 /// unauthorized peer's allocation, so it does not move to suit a caller.
-pub const MAX_SPAWN_PER_MESSAGE: usize = (MAX_FRAME_BYTES - 4) / SPAWN_BYTES;
+pub const MAX_SPAWN_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / SPAWN_BYTES;
 
 /// Most moves one [`MoveEntities`] may carry. Same bargain.
-pub const MAX_MOVES_PER_MESSAGE: usize = (MAX_FRAME_BYTES - 4) / MOVE_BYTES;
+pub const MAX_MOVES_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / MOVE_BYTES;
 
 /// A full spawn request's reply has to fit a frame too, or the region could
 /// accept a request it cannot answer.
 const _: () = assert!(
-    4 + MAX_SPAWN_PER_MESSAGE * SPAWNED_BYTES <= MAX_FRAME_BYTES,
+    5 + MAX_SPAWN_PER_MESSAGE * SPAWNED_BYTES <= MAX_MESSAGE_BYTES,
     "a reply to a full spawn request does not fit a frame"
 );
 
 /// Most entities one [`DespawnEntities`] may give up. Same bargain.
-pub const MAX_DESPAWN_PER_MESSAGE: usize = (MAX_FRAME_BYTES - 4) / 4;
+pub const MAX_DESPAWN_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / 4;
 
 /// What is behind an entity, which decides whether it observes.
 ///
@@ -505,6 +426,7 @@ impl SpawnEntities {
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
+        out.push(KIND_SPAWN_ENTITIES);
         out.extend_from_slice(&(self.spawns.len() as u32).to_le_bytes());
         for (pos, kind) in &self.spawns {
             out.extend_from_slice(&pos.x.raw().to_le_bytes());
@@ -560,6 +482,7 @@ impl EntitiesSpawned {
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
+        out.push(KIND_ENTITIES_SPAWNED);
         out.extend_from_slice(&(self.entities.len() as u32).to_le_bytes());
         for (entity, viewer) in &self.entities {
             out.extend_from_slice(&entity.raw().to_le_bytes());
@@ -597,6 +520,7 @@ pub struct MoveEntities {
 impl MoveEntities {
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
+        out.push(KIND_MOVE_ENTITIES);
         out.extend_from_slice(&(self.moves.len() as u32).to_le_bytes());
         for (id, pos) in &self.moves {
             out.extend_from_slice(&id.raw().to_le_bytes());
@@ -644,6 +568,7 @@ pub struct DespawnEntities {
 impl DespawnEntities {
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
+        out.push(KIND_DESPAWN_ENTITIES);
         out.extend_from_slice(&(self.ids.len() as u32).to_le_bytes());
         for id in &self.ids {
             out.extend_from_slice(&id.raw().to_le_bytes());
@@ -665,42 +590,6 @@ impl DespawnEntities {
     }
 }
 
-/// One viewer's assembled payload, relayed to the edge that manages it.
-///
-/// The payload is exactly what [`PacketWriter`](crate::PacketWriter) built, so
-/// an edge decodes it with [`PacketReader`](crate::PacketReader) and this
-/// protocol does not need to know what is inside.
-///
-/// **A known deviation.** State is latest-only, lossy and unordered by design,
-/// and this link is reliable and ordered. Carrying payloads here is what lets
-/// the smoke test run end to end before the datagram path exists; it is not
-/// what the architecture says should happen in the end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PositionUpdates<'a> {
-    pub viewer: ViewerId,
-    pub payload: &'a [u8],
-}
-
-impl PositionUpdates<'_> {
-    /// Only the round-trip test builds one of these. The live path writes the
-    /// viewer and the payload straight into the edge's buffer rather than
-    /// joining them into a body first, which is a copy per payload it does not
-    /// need to pay.
-    #[cfg(test)]
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        out.clear();
-        out.extend_from_slice(&self.viewer.raw().to_le_bytes());
-        out.extend_from_slice(self.payload);
-    }
-
-    pub(crate) fn decode(body: &[u8]) -> Result<PositionUpdates<'_>, NetError> {
-        let mut c = Cursor::new(body, "position updates");
-        let viewer = ViewerId::from_raw(c.u32()?);
-        let payload = c.rest();
-        Ok(PositionUpdates { viewer, payload })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,53 +608,10 @@ mod tests {
     }
 
     #[test]
-    fn an_identification_round_trips() {
-        let m = ClientIdentification {
-            protocol: PROTOCOL_VERSION,
-            credential: b"region-7-edge-key".to_vec(),
-        };
-        let mut buf = Vec::new();
-        m.encode(&mut buf);
-        assert_eq!(ClientIdentification::decode(&buf).expect("well formed"), m);
-    }
-
-    #[test]
-    fn an_identification_with_no_credential_round_trips() {
-        // Well formed, and the authorizer is what refuses it.
-        let m = ClientIdentification { protocol: PROTOCOL_VERSION, credential: Vec::new() };
-        let mut buf = Vec::new();
-        m.encode(&mut buf);
-        assert_eq!(ClientIdentification::decode(&buf).expect("well formed"), m);
-    }
-
-    #[test]
-    fn an_identification_claiming_a_credential_past_the_cap_is_refused() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&PROTOCOL_VERSION.raw().to_le_bytes());
-        buf.extend_from_slice(&((MAX_CREDENTIAL_BYTES + 1) as u16).to_le_bytes());
-        buf.resize(buf.len() + MAX_CREDENTIAL_BYTES + 1, 0);
-        assert!(matches!(
-            ClientIdentification::decode(&buf),
-            Err(NetError::Malformed("client identification credential"))
-        ));
-    }
-
-    #[test]
-    fn an_identification_shorter_than_it_claims_is_refused() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&PROTOCOL_VERSION.raw().to_le_bytes());
-        buf.extend_from_slice(&64u16.to_le_bytes());
-        buf.extend_from_slice(b"only eight");
-        assert!(matches!(
-            ClientIdentification::decode(&buf),
-            Err(NetError::Malformed("client identification"))
-        ));
-    }
-
-    #[test]
     fn server_info_round_trips() {
         let cfg = WorldConfig::default();
         let m = ServerInfo {
+            protocol: PROTOCOL_VERSION,
             server: ServerVersion::CURRENT,
             region: RegionId::from_raw(42),
             params: WorldParams::from_config(&cfg),
@@ -779,6 +625,7 @@ mod tests {
     #[test]
     fn truncated_server_info_is_refused() {
         let m = ServerInfo {
+            protocol: PROTOCOL_VERSION,
             server: ServerVersion::CURRENT,
             region: RegionId::from_raw(1),
             params: WorldParams::from_config(&WorldConfig::default()),
@@ -849,23 +696,6 @@ mod tests {
         assert!(matches!(p.to_config(), Err(NetError::ConfigMismatch { .. })));
     }
 
-    #[test]
-    fn a_rejection_round_trips() {
-        for code in [RejectCode::Unauthorized, RejectCode::ProtocolMismatch, RejectCode::Malformed]
-        {
-            let mut buf = Vec::new();
-            Rejection { code }.encode(&mut buf);
-            assert_eq!(buf.len(), Rejection::BYTES);
-            assert_eq!(Rejection::decode(&buf).expect("well formed"), Rejection { code });
-        }
-    }
-
-    #[test]
-    fn an_unknown_rejection_code_is_refused() {
-        assert!(matches!(Rejection::decode(&[99]), Err(NetError::Malformed("rejection code"))));
-        assert!(matches!(Rejection::decode(&[]), Err(NetError::Malformed("rejection"))));
-    }
-
     fn ent(n: u32) -> EntityId {
         EntityId::from_raw(n)
     }
@@ -880,7 +710,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        assert_eq!(SpawnEntities::decode(&buf).expect("well formed"), m);
+        assert_eq!(SpawnEntities::decode(&buf[1..]).expect("well formed"), m);
     }
 
     #[test]
@@ -921,13 +751,13 @@ mod tests {
     }
 
     #[test]
-    fn a_full_spawn_request_fits_a_frame() {
+    fn a_full_spawn_request_fits_one_message() {
         let m = SpawnEntities {
             spawns: vec![(Pos3::ZERO, EntityKind::Observer); MAX_SPAWN_PER_MESSAGE],
         };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        assert!(buf.len() <= MAX_FRAME_BYTES, "{} bytes does not fit a frame", buf.len());
+        assert!(buf.len() <= MAX_MESSAGE_BYTES, "{} bytes is past the cap", buf.len());
     }
 
     #[test]
@@ -941,7 +771,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        assert_eq!(EntitiesSpawned::decode(&buf).expect("well formed"), m);
+        assert_eq!(EntitiesSpawned::decode(&buf[1..]).expect("well formed"), m);
     }
 
     #[test]
@@ -972,15 +802,15 @@ mod tests {
         };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        assert_eq!(MoveEntities::decode(&buf).expect("well formed"), m);
+        assert_eq!(MoveEntities::decode(&buf[1..]).expect("well formed"), m);
     }
 
     #[test]
-    fn a_full_move_message_fits_a_frame() {
+    fn a_full_move_message_fits_one_message() {
         let m = MoveEntities { moves: vec![(ent(0), Pos3::ZERO); MAX_MOVES_PER_MESSAGE] };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        assert!(buf.len() <= MAX_FRAME_BYTES, "{} bytes does not fit a frame", buf.len());
+        assert!(buf.len() <= MAX_MESSAGE_BYTES, "{} bytes is past the cap", buf.len());
     }
 
     #[test]
@@ -998,8 +828,8 @@ mod tests {
         let m = MoveEntities { moves: vec![(ent(1), Pos3::from_meters(1, 2, 3))] };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        for cut in 0..buf.len() {
-            assert!(MoveEntities::decode(&buf[..cut]).is_err(), "{cut} bytes must not parse");
+        for cut in 1..buf.len() {
+            assert!(MoveEntities::decode(&buf[1..cut]).is_err(), "{cut} bytes must not parse");
         }
     }
 
@@ -1008,15 +838,15 @@ mod tests {
         let m = DespawnEntities { ids: vec![ent(3), ent(9), ent(1000)] };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        assert_eq!(DespawnEntities::decode(&buf).expect("well formed"), m);
+        assert_eq!(DespawnEntities::decode(&buf[1..]).expect("well formed"), m);
     }
 
     #[test]
-    fn a_full_despawn_message_fits_a_frame() {
+    fn a_full_despawn_message_fits_one_message() {
         let m = DespawnEntities { ids: vec![ent(0); MAX_DESPAWN_PER_MESSAGE] };
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        assert!(buf.len() <= MAX_FRAME_BYTES, "{} bytes does not fit a frame", buf.len());
+        assert!(buf.len() <= MAX_MESSAGE_BYTES, "{} bytes is past the cap", buf.len());
     }
 
     #[test]
@@ -1030,40 +860,105 @@ mod tests {
     }
 
     #[test]
-    fn position_updates_carry_the_payload_untouched() {
-        let payload = b"a payload PacketWriter built";
-        let m = PositionUpdates { viewer: ViewerId::from_raw(9), payload };
-        let mut buf = Vec::new();
-        m.encode(&mut buf);
-        let back = PositionUpdates::decode(&buf).expect("well formed");
-        assert_eq!(back.viewer, ViewerId::from_raw(9));
-        assert_eq!(back.payload, payload);
-    }
-
-    #[test]
-    fn position_updates_carry_an_empty_payload() {
-        let m = PositionUpdates { viewer: ViewerId::from_raw(0), payload: &[] };
-        let mut buf = Vec::new();
-        m.encode(&mut buf);
-        assert_eq!(PositionUpdates::decode(&buf).expect("well formed").payload, b"");
-    }
-
-    #[test]
     fn every_kind_has_a_name() {
         for kind in [
-            KIND_CLIENT_IDENTIFICATION,
-            KIND_SERVER_INFO,
-            KIND_REJECTION,
-            KIND_ACCEPTED,
-            KIND_QUIT,
             KIND_SPAWN_ENTITIES,
             KIND_ENTITIES_SPAWNED,
             KIND_MOVE_ENTITIES,
-            KIND_POSITION_UPDATES,
             KIND_DESPAWN_ENTITIES,
+            KIND_KEEPALIVE,
         ] {
             assert_ne!(kind_name(kind), "unknown", "kind {kind} needs a name");
         }
         assert_eq!(kind_name(200), "unknown");
+    }
+}
+
+/// Reads scalars out of a message body, refusing to run off the end.
+pub(crate) struct Cursor<'a> {
+    buf: &'a [u8],
+    at: usize,
+    what: &'static str,
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn new(buf: &'a [u8], what: &'static str) -> Cursor<'a> {
+        Cursor { buf, at: 0, what }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], NetError> {
+        let end = self.at.checked_add(n).ok_or(NetError::Malformed(self.what))?;
+        if end > self.buf.len() {
+            return Err(NetError::Malformed(self.what));
+        }
+        let got = &self.buf[self.at..end];
+        self.at = end;
+        Ok(got)
+    }
+
+    pub(crate) fn u8(&mut self) -> Result<u8, NetError> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub(crate) fn u16(&mut self) -> Result<u16, NetError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    pub(crate) fn u32(&mut self) -> Result<u32, NetError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub(crate) fn i32(&mut self) -> Result<i32, NetError> {
+        Ok(self.u32()? as i32)
+    }
+
+    pub(crate) fn u64(&mut self) -> Result<u64, NetError> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+
+    /// Trailing bytes mean the two ends disagree about the format, so this is a
+    /// decode failure rather than something to ignore.
+    pub(crate) fn finish(self) -> Result<(), NetError> {
+        if self.at == self.buf.len() { Ok(()) } else { Err(NetError::Malformed(self.what)) }
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn a_cursor_refuses_to_run_off_the_end() {
+        let mut c = Cursor::new(&[1, 2, 3], "test");
+        assert_eq!(c.u16().expect("two bytes are there"), 0x0201);
+        assert!(matches!(c.u32(), Err(NetError::Malformed("test"))));
+    }
+
+    #[test]
+    fn a_cursor_refuses_trailing_bytes() {
+        let mut c = Cursor::new(&[1, 2, 3, 4], "test");
+        c.u16().expect("two bytes are there");
+        assert!(matches!(c.finish(), Err(NetError::Malformed("test"))));
+    }
+
+    #[test]
+    fn a_cursor_reads_every_width() {
+        let mut buf = vec![0xABu8];
+        buf.extend_from_slice(&0x1234u16.to_le_bytes());
+        buf.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        buf.extend_from_slice(&(-7i32).to_le_bytes());
+        buf.extend_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+        buf.extend_from_slice(b"tail");
+
+        let mut c = Cursor::new(&buf, "test");
+        assert_eq!(c.u8().unwrap(), 0xAB);
+        assert_eq!(c.u16().unwrap(), 0x1234);
+        assert_eq!(c.u32().unwrap(), 0xDEAD_BEEF);
+        assert_eq!(c.i32().unwrap(), -7);
+        assert_eq!(c.u64().unwrap(), 0x0123_4567_89AB_CDEF);
+        assert!(matches!(c.finish(), Err(NetError::Malformed("test"))), "tail is left over");
     }
 }

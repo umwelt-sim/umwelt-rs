@@ -93,7 +93,7 @@ impl Dashboard {
         let live: Vec<u32> = f.edges.iter().map(|e| e.id.raw()).collect();
         self.previous.retain(|id, _| live.contains(id));
         for edge in &f.edges {
-            self.previous.insert(edge.id.raw(), (now, *edge));
+            self.previous.insert(edge.id.raw(), (now, edge.clone()));
         }
 
         // Clear anything the previous frame left below this one.
@@ -160,25 +160,25 @@ impl Dashboard {
             }
             current.saturating_sub(before) as f64 / secs
         };
-        let (msg_s, frame_s, byte_s) = match self.previous.get(&edge.id.raw()) {
+        let (msg_s, payload_s, byte_s) = match self.previous.get(&edge.id.raw()) {
             Some((then, was)) => {
                 let secs = now.duration_since(*then).as_secs_f64();
                 (
                     rate(edge.messages, was.messages, secs),
-                    rate(edge.frames, was.frames, secs),
+                    rate(edge.payloads, was.payloads, secs),
                     rate(edge.bytes, was.bytes, secs),
                 )
             }
             None => (0.0, 0.0, 0.0),
         };
 
-        let title = format!("{:?} {}", edge.id, edge.peer);
+        let title = format!("{:?} {}", edge.id, edge.name);
         let mut card = vec![top(&title)];
         card.push(field("up", &span(edge.uptime)));
         card.push(field("entities", &thousands(edge.entities as u64)));
         card.push(field("observers", &thousands(edge.observers as u64)));
         card.push(field("in", &format!("{}/s", thousands(msg_s as u64))));
-        card.push(field("out", &format!("{}/s", thousands(frame_s as u64))));
+        card.push(field("out", &format!("{}/s", thousands(payload_s as u64))));
         card.push(field("", &format!("{}/s", bytes(byte_s))));
         let refused = if edge.refused == 0 {
             thousands(0)

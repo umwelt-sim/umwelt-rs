@@ -18,6 +18,13 @@ opt-level = 1
 opt-level = 3
 
 [dependencies]
+# ADR 0001: the region-to-edge transport is NATS. These are the crate's first
+# dependencies, and tokio arrives through async-nats rather than by choice.
+async-nats = "0.50"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# Named so a payload can reach an edge without a copy; async-nats already uses it.
+bytes = "1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 criterion = "0.8.2"

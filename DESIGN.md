@@ -12,6 +12,13 @@ mechanism that is not in the paper. All three are corrected here.
 
 ---
 
+## Architecture decision records
+
+Decisions that would otherwise be re-argued live in `docs/adr/`, one file each.
+This document holds the design and its measurements; those hold the decisions
+and what they cost. `docs/adr/0001` moves the region-to-edge transport to NATS
+and supersedes the TCP transport described under §The region link.
+
 ## Working agreements
 
 Rules for anyone, human or model, writing code or prose for this project.
@@ -990,111 +997,66 @@ they do.
 
 ### The region link
 
-`net` holds two protocols, and keeping them apart is what the module is for
-rather than an afterthought.
+**Superseded in part by `docs/adr/0001`.** The link was a TCP connection this
+crate implemented: its own framing, its own handshake, and a bearer secret. It
+is NATS now, and that record holds the measurements and the reasoning. What
+follows is what survived the change.
 
-**Region to edge**, `net::region`, is built. One region simulation and the small
-number of edges relaying for it: few peers, mutually trusted, deployed together,
-over a reliable ordered stream.
+`net` holds two protocols, and keeping them apart is what the module is for.
+
+**Region to edge**, `net::region`, is built. One region simulation and the
+edges relaying for it: few peers, mutually trusted, deployed together.
 
 **Edge to game client** is not built and will be its own module. Many peers,
 none of them trusted, deployed on someone else's machine and updated on their
-schedule. The payloads §Payload assembly produces belong to that link, and they
-are latest-only, lossy, unordered and MTU-sized, so nothing about the framing
-below suits them.
+schedule. Game clients do not speak NATS, so that link is unaffected by the
+transport change.
 
-The two differ in peer count, in reliability, in ordering, in who is trusted and
-in what may be disclosed, which is every property that shapes a protocol. So they
-get their own message types, their own framing and their own version, and a
-change to one must not be able to break the other.
-
-**Two ends, and deliberately not one type.** `RegionServer` is a region's
-listening socket. `RegionClient` is one link to a region. An edge server will
-take a `RegionClient` and start its own socket server on the other side of
-itself, speaking the client-facing protocol; it is not built and it is not
-`RegionClient`. Collapsing the two would put per-client work back on the edge
+**Two ends, and deliberately not one type.** `RegionServer` is a region's side.
+`RegionLink` is an edge's: one NATS connection through which it talks to any
+number of regions. An edge server will hold a `RegionLink` and run its own
+client-facing protocol on the other side of itself; it is not built and it is
+not `RegionLink`. Collapsing the two would put per-client work back on the edge
 tier, which is what §Why per-client work stays in the simulation is about.
 
 **Messages are named for what they carry, not for who sends them.** A message
-belongs to the protocol, not to whichever end happens to speak it.
-`ClientIdentification` identifies the connecting client, `ServerInfo` describes
-the server and the region it owns, `Rejection` says the link will not be taken.
-
-**Framing.** A one-byte kind, a `u32` length, then the body, little-endian to
-match §Payload assembly. The length is bounded at 4,096 bytes before anything is
-allocated, which matters more than it looks: it is read from a peer that has not
-authorized yet, because the credential is inside the frame being sized.
-
-**The handshake, in this order.**
-
-1. Client sends `ClientIdentification`: the protocol version it speaks, and its
-   credential.
-2. Server authorizes. A peer that fails gets a bare `Rejection` and nothing else.
-3. Server sends `ServerInfo`: its crate version, its region id, world parameters.
-4. Client accepts, or quits. Both are empty frames.
-
-**The identification goes first and the server info second**, so a peer that
-cannot authorize learns neither the region id nor the shape of the world. The
-reverse order would have been easier to write and would hand both to anyone able
-to open a socket. A test asserts the refusal a client sees carries neither.
-
-The client accepts or quits rather than the server assuming, so a client that
-reads the parameters and finds a world it cannot render, or a region it did not
-mean to reach, leaves instead of becoming an edge the region counts.
+belongs to the protocol, not to whichever end speaks it. `ServerInfo` describes
+a region, `SpawnEntities` asks for entities, `MoveEntities` carries positions.
 
 **The config crosses as the five authored values, not the struct.** A
 `WorldConfig` is mostly derived, so `WorldParams` carries region size, vertical
 extent, view radius and max speed in whole meters, plus tick rate and
-`protocol_hash`. The client rebuilds through the builder and rejects on a digest
-mismatch. That is one derivation rather than two, and it makes the digest do real
-work rather than decorate the frame: a config that did not come through the
-builder is caught instead of approximated. A server using `with_cell_size_m`
-fails it, and a test pins that.
+`protocol_hash`. The edge rebuilds through the builder and rejects on a digest
+mismatch. That is one derivation rather than two, and it makes the digest do
+real work: a config that did not come through the builder is caught instead of
+approximated. A region using `with_cell_size_m` fails it, and a test pins that.
 
 Three versions are checked and all three move independently. `PROTOCOL_VERSION`
-is the shape of these messages and must match exactly, since region and edge
+is the shape of the messages and must match exactly, since region and edge
 deploy together and a skew is a deployment mistake rather than a condition to
-tolerate. It versions this protocol only; the client-facing one will carry its
-own. `ServerVersion` is the crate build, reported so an operator can see what a
-region is running without asking it, and nothing rejects on it. `protocol_hash`
-is the world's wire layout.
+tolerate. `ServerVersion` is the crate build, reported so an operator can see
+what a region is running. `protocol_hash` is the world's wire layout.
 
-**Authorization is a bearer secret, checked once.** `Authorizer` is the seam and
-`SharedSecret` is the shipped implementation, comparing without short-circuiting
-on the first differing byte. It is consulted exactly once per link, during the
-handshake, and never again: after that the established TCP connection is the only
-thing standing in for identity. There is no per-message authentication and no
-per-message integrity check.
-
-What that is worth, stated plainly. The secret crosses the wire on every connect,
-so whoever can read the link has it, and whoever can inject on an established
-connection is not stopped by anything here. It is the second lock rather than the
-first: it stops a misconfigured edge, a stale binary from a previous deployment,
-and a process configured against the wrong port. Raising the bar means
-challenge-response over a MAC, so the secret itself never travels, which needs a
-vetted crypto implementation rather than a hand-rolled one. That is a dependency
-this crate does not have and a decision nobody has made.
-
-**A handshake has a five second deadline, lifted once the link is up.** A peer
-that connects and then says nothing would otherwise hold a server thread without
-ever presenting a credential, which is a way in that needs no credential. A link
-sits idle between packets, so the same deadline cannot apply to it.
-
-**Threading.** One thread per attached edge, spawned into a `std::thread::scope`
-by `RegionServer::run`, and no dependency. A region takes links from a small
-number of edges rather than from thousands of game clients, so a blocking accept
-loop is sized for the job. The note in §Rust implementation notes that Tokio
-belongs in the edge server is about the client-facing side, which this is not.
+**Authorization is the broker's.** NATS accounts, JWT and `.creds` files
+replaced the bearer secret this crate used to check, whose own documentation
+called it a second lock rather than a first.
 
 ### Edges, and what each one manages
 
-A region does not think about sockets one at a time. `Edges` is the set of edges
-relaying for it: dense reusable ids, where each is connected from, and the
-entities each one manages. `Edge` is one attached edge, and holding one is what
-keeps it attached — dropping it closes the link, frees the id, and releases every
-entity it held. Ids are reusable on the same terms as `ViewerId`: a recycled
-`EdgeId` names a different connection carrying nothing over, so there is nothing
-for a stale reference to alias.
+`Edges` is the set of edges relaying for one region: dense reusable ids, the
+name each edge calls itself, and the entities each one manages. An edge becomes
+known the first time it sends a command. Ids are reusable on the same terms as
+`ViewerId`: a recycled `EdgeId` names a different edge carrying nothing over, so
+there is nothing for a stale reference to alias.
+
+**An edge's death stopped being observable when the socket went.** A closed
+connection used to say an edge had gone, which is what triggered despawning the
+entities it managed. Publish and subscribe carries no such signal, so silence
+does: an edge is dropped after `EDGE_TIMEOUT` without a word. An edge under load
+sends moves every tick and an idle one sends a keepalive, so the timeout only
+decides how long a quiet edge survives. Measured end to end: an edge killed with
+no warning is dropped about five seconds later, and its 640 entities despawn
+with it while the slots they occupied stay allocated.
 
 **Why an edge owns entities.** A game client connects to an edge, and that edge
 registers a viewer with the region for the client's avatar. The region then
@@ -1139,8 +1101,8 @@ Past the handshake, an edge asks for entities, moves them, gives them back, and
 is sent each of its viewers' payloads. `net::region::session` is both halves.
 
 **Inbound work happens in three places, because what it needs is available at
-three different moments.** `Inbound::serve` runs on the edge's own thread and
-only queues, since the simulation is mid-tick as often as not. `Inbound::apply`
+three different moments.** `Inbound::accept` runs on the NATS reader and only
+queues, since the simulation is mid-tick as often as not. `Inbound::apply`
 runs inside `Game::step`, the only place a `Step` exists and therefore the only
 place an entity can be spawned, despawned or moved. `Inbound::settle` runs
 between ticks, the only place `&mut WorldSimulation` exists and therefore the
@@ -1189,19 +1151,19 @@ boundary here, not the id scheme.
 
 **An edge's population is not fixed.** Game clients connect and disconnect, so
 `DespawnEntities` gives entities back: the region despawns them, drops the
-viewer watching each, and frees the ownership record. An edge that detaches
-entirely gives up everything it held without sending anything, because a region
-that kept simulating entities with no connection behind them would be
-replicating for nobody. Detaching happens on the edge's thread and despawning
-needs a `Step`, so the orphans are recorded and the next tick clears them.
+viewer watching each, and frees the ownership record. An edge that goes away
+gives up everything it held without sending anything, because a region that kept
+simulating entities with nobody behind them would be replicating for nobody.
+Expiry runs on its own timer and despawning needs a `Step`, so the orphans are
+recorded and the next tick clears them.
 
 **Tearing a viewer down requires entity to viewer, which the simulation does not
 hold.** `Inbound` keeps that map itself. §Open items records the same gap.
 
 **Payloads route by ownership.** `EdgeSink` holds viewer to avatar, filled when
 a viewer registers, and asks `Edges::edge_for` which edge manages that avatar.
-It is wrapped in `Handoff`, so the tick's side of a send is a memory copy and an
-edge that stops reading cannot stall the region.
+It is wrapped in `Handoff`, so the tick's side of a send is a memory copy and a
+broker that stops accepting cannot stall the region.
 
 **A known deviation.** State is latest-only, lossy and unordered, and this link
 is reliable and ordered. Carrying payloads here is what lets the thing run end

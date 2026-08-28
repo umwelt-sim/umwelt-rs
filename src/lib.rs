@@ -33,6 +33,7 @@ pub mod budget;
 pub mod codec;
 pub mod packet;
 mod subscription;
+pub mod game;
 pub mod sim;
 pub mod net;
 
@@ -48,8 +49,9 @@ pub use select::{Policy, Ranked, Selection, Weights, select};
 pub use codec::RecordCodec;
 pub use packet::{PacketHeader, PacketReader, PacketWriter};
 pub use budget::PacketBudget;
+pub use game::Game;
 pub use sim::{
-    ClientLimits, Flow, Game, Handoff, NullSink, Overrun, Pacing, PayloadSink, RecordingSink,
+    ClientLimits, Flow, Handoff, NullSink, Overrun, Pacing, PayloadSink, RecordingSink,
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
 pub use subscription::{CellList, Subscription};

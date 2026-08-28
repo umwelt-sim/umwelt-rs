@@ -18,8 +18,8 @@ use umwelt::net::{
     EdgeName, EdgeSink, EntityKind, Incoming, Inbound, Presence, RegionClient, RegionId,
     RegionServer, Spawn,
 };
-use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{EntityId, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
+use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
+use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
 
 const EDGES: usize = 3;
 /// Entities with a game client behind them. Each gets a viewer.

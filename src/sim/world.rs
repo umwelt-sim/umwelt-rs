@@ -21,6 +21,7 @@ use crate::codec::RecordCodec;
 use crate::config::WorldConfig;
 use crate::entity::{EntityId, LiveSet};
 use crate::fixed::Fixed;
+use crate::game::Game;
 use crate::gather::DiscoveredEntities;
 use crate::ghost::GhostTable;
 use crate::odometer::Odometer;
@@ -60,13 +61,6 @@ pub const DEFAULT_WALK_CAP: usize = DEFAULT_GHOST_CAP;
 /// A ghost is only aged when its viewer is served, so a grace below a client's
 /// [`send_period`](ClientLimits::send_period) behaves as zero.
 pub const DEFAULT_GRACE: u32 = 1;
-
-/// The consumer's game, called once per tick.
-pub trait Game {
-    /// Moves entities, spawns and despawns. Everything that is not position is
-    /// the consumer's own storage, keyed by [`EntityId`].
-    fn step(&mut self, world: &mut Step<'_>);
-}
 
 /// What a [`Game`] may do during one tick.
 pub struct Step<'a> {

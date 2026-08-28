@@ -26,8 +26,8 @@ use umwelt::net::{
     EdgeId, EdgeName, EdgeSink, Edges, EntityKind, Incoming, Inbound, Presence, RegionClient,
     RegionId, RegionServer, Spawn,
 };
-use umwelt::sim::{ClientLimits, Flow, Game, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{EntityId, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
+use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
+use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
 
 /// Unattended entities the origin holds and the destination does not, so the
 /// ids the two regions hand out cannot coincide. The traveler's origin id ends

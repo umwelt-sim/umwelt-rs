@@ -14,7 +14,8 @@
 use std::time::{Duration, Instant};
 
 use crate::sim::sink::PayloadSink;
-use crate::sim::world::{Game, Outbound, TickStats, WorldSimulation};
+use crate::game::Game;
+use crate::sim::world::{Outbound, TickStats, WorldSimulation};
 
 /// How long [`Wait::Sleep`] holds the core before a deadline.
 ///

@@ -34,9 +34,9 @@ use std::sync::Mutex;
 
 use umwelt::select::{NEAR_BAND, Policy, Weights};
 use umwelt::sim::{
-    ClientLimits, DEFAULT_GHOST_CAP, DEFAULT_GRACE, Game, Outbound, Step, WorldSimulation,
+    ClientLimits, DEFAULT_GHOST_CAP, DEFAULT_GRACE, Outbound, Step, WorldSimulation,
 };
-use umwelt::{EntityId, Fixed, Pos3, WorldConfig};
+use umwelt::{EntityId, Fixed, Game, Pos3, WorldConfig};
 
 /// Dense enough that a viewer's candidate set exceeds a packet, or there is no
 /// selection pressure and every curve behaves identically.

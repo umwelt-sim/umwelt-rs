@@ -47,7 +47,8 @@ use crate::net::region::protocol::{
 };
 use crate::net::region::subjects;
 use crate::pos::Pos3;
-use crate::sim::{ClientLimits, Game, PayloadSink, Step, ViewerId, WorldSimulation};
+use crate::game::Game;
+use crate::sim::{ClientLimits, PayloadSink, Step, ViewerId, WorldSimulation};
 
 /// No viewer watches this entity. Reserved in the entity-to-viewer map.
 const NO_WATCHER: u32 = u32::MAX;

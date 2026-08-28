@@ -285,7 +285,7 @@ impl Shared {
     ///
     /// An entity the region has not answered for yet is simply forgotten. Its
     /// arrival then carries a token this edge no longer holds, and the path
-    /// that already handles an unrecognised token gives it straight back.
+    /// that already handles an unrecognized token gives it straight back.
     pub(crate) fn release(&self, key: EntityKey) {
         let mut entities = self.entities();
         let Some(entity) = entities.by_key.get_mut(&key) else { return };

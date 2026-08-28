@@ -5,7 +5,7 @@
 //!
 //! NATS delivers whole messages, so there is no framing here: a message is a
 //! one-byte kind followed by its body. Which subject it arrived on says which
-//! direction it travelled and, for a command, which edge sent it. See
+//! direction it traveled and, for a command, which edge sent it. See
 //! `docs/adr/0001`.
 
 use core::fmt;

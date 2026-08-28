@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use umwelt::net::{
-    EdgeSink, EdgeServer, Edges, EntityKind, Framer, FromClient, Inbound, RegionId,
-    RegionServer, ToClient,
+    EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, FromEdge, Inbound, RegionId,
+    RegionServer,
 };
 use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
 use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
@@ -235,121 +235,75 @@ fn a_game_client_populates_a_region_through_an_edge() {
             })
         });
 
-        let client = game_endpoint(runtime.handle());
+        let endpoint = game_endpoint(runtime.handle());
         let conn = runtime
-            .block_on(async {
-                client.connect(at, "localhost").expect("configured").await
-            })
+            .block_on(async { endpoint.connect(at, "localhost").expect("configured").await })
             .expect("connects to the edge");
-        let (mut send, mut recv) =
-            runtime.block_on(conn.open_bi()).expect("opens its stream");
-
-        let mut body = Vec::new();
-        let mut framed = Vec::new();
-        let post = |message: &FromClient,
-                        send: &mut quinn::SendStream,
-                        body: &mut Vec<u8>,
-                        framed: &mut Vec<u8>| {
-            message.encode(body);
-            if message.is_latest_only() {
-                conn.send_datagram(body.clone().into()).expect("a datagram fits");
-            } else {
-                Framer::frame(body, framed);
-                runtime.block_on(send.write_all(framed)).expect("writes");
-            }
-        };
+        // Everything below goes through the library. A game developer never
+        // frames a message or picks a datagram: which of the four commands
+        // rides which is a property of the command.
+        let client = EdgeClient::new(conn, runtime.handle().clone()).expect("opens a stream");
 
         // Spawn before move: a handle this connection never spawned is refused,
         // and counted, rather than reaching a region.
         let before = edge.stats().refused;
-        post(
-            &FromClient::Move { handle: 9_999, position: home(0) },
-            &mut send,
-            &mut body,
-            &mut framed,
-        );
+        client.move_entity(9_999, home(0)).expect("publishes");
         wait_until("the edge to refuse a move for an unspawned handle", &stop, || {
             edge.stats().refused > before
         });
 
-        for n in 0..WANTED {
-            post(
-                &FromClient::Spawn {
-                    handle: n as u32,
-                    region,
-                    position: home(n),
-                    kind: EntityKind::Observer,
-                },
-                &mut send,
-                &mut body,
-                &mut framed,
-            );
-        }
+        // The client mints its own handles, spent once and never reused.
+        let handles: Vec<u32> = (0..WANTED)
+            .map(|n| {
+                client
+                    .spawn(region, home(n), EntityKind::Observer)
+                    .expect("asks for an entity")
+            })
+            .collect();
 
-        // Ids come back on the reliable stream; packets come down as datagrams.
+        // What the edge said. One receive loop, whichever transport carried it.
         let ids: Mutex<Vec<Option<EntityId>>> = Mutex::new(vec![None; WANTED]);
         let gone: Mutex<Vec<u32>> = Mutex::new(Vec::new());
         let confirmed = std::sync::atomic::AtomicU64::new(0);
         let codec = RecordCodec::new(&cfg);
 
-        let runtime = &runtime;
-        let conn = &conn;
+        let client = &client;
+        let handles = &handles;
         std::thread::scope(|inner| {
             let ids = &ids;
             let gone = &gone;
             let stop = &stop;
-            inner.spawn(move || {
-                let mut framer = Framer::new();
-                let mut buf = vec![0u8; 16 * 1024];
-                while !stop.load(Ordering::Relaxed) {
-                    // Built inside `block_on`: a timeout needs a runtime to
-                    // exist before it does.
-                    let read = match runtime.block_on(async {
-                        tokio::time::timeout(POLL, recv.read(&mut buf)).await
-                    }) {
-                        Ok(Ok(Some(read))) => read,
-                        // Nothing yet. Go round and look at `stop` again.
-                        Err(_) => continue,
-                        _ => return,
-                    };
-                    framer.push(&buf[..read]);
-                    while let Ok(Some(one)) = framer.take() {
-                        match ToClient::decode(&one) {
-                            Ok(ToClient::Spawned { handle, region: from, entity }) => {
-                                assert_eq!(from, region, "an id from a region nobody asked");
-                                ids.lock().expect("not poisoned")[handle as usize] =
-                                    Some(entity);
-                            }
-                            Ok(ToClient::Removed { handle }) => {
-                                gone.lock().expect("not poisoned").push(handle);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            });
-
             let confirmed = &confirmed;
             inner.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    let datagram = match runtime.block_on(async {
-                        tokio::time::timeout(POLL, conn.read_datagram()).await
-                    }) {
-                        Ok(Ok(datagram)) => datagram,
-                        Err(_) => continue,
-                        _ => return,
-                    };
-                    let Ok(ToClient::State { packet, .. }) = ToClient::decode(&datagram)
-                    else {
-                        continue;
-                    };
-                    let Some(reader) = PacketReader::new(&codec, packet) else { continue };
-                    // A packet reaching this client is one built for an avatar
-                    // it owns, and an avatar always sees itself.
-                    for (_, pos) in reader.updates() {
-                        if pos.x.floor_meters() > 200 {
-                            confirmed.fetch_add(1, Ordering::Relaxed);
+                    // A timeout rather than a blocking receive, so a failure
+                    // elsewhere reports itself instead of hanging the scope.
+                    let Some(message) = client.receive_timeout(POLL) else { continue };
+                    match message {
+                        FromEdge::Spawned { handle, region: from, entity } => {
+                            assert_eq!(from, region, "an id from a region nobody asked");
+                            let at = handles
+                                .iter()
+                                .position(|h| *h == handle)
+                                .expect("a handle this client never spent");
+                            ids.lock().expect("not poisoned")[at] = Some(entity);
                         }
+                        FromEdge::Removed { handle } => {
+                            gone.lock().expect("not poisoned").push(handle);
+                        }
+                        FromEdge::State { packet, .. } => {
+                            let Some(reader) = PacketReader::new(&codec, &packet) else {
+                                continue;
+                            };
+                            // A packet reaching this client is one built for an
+                            // avatar it owns, and an avatar always sees itself.
+                            for (_, pos) in reader.updates() {
+                                if pos.x.floor_meters() > 200 {
+                                    confirmed.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        FromEdge::Message(_) => {}
                     }
                 }
             });
@@ -365,23 +319,23 @@ fn a_game_client_populates_a_region_through_an_edge() {
 
             // Move them, and wait for the movement to come back.
             let mover = inner.spawn(move || {
-                let mut body = Vec::new();
-                let mut framed = Vec::new();
                 let mut at = 0i32;
                 while !stop.load(Ordering::Relaxed) {
                     at = (at + 1) % 64;
-                    for n in 0..WANTED {
-                        let base = home(n);
-                        let to = Pos3::from_meters(
-                            base.x.floor_meters() + at,
-                            base.y.floor_meters(),
-                            0,
-                        );
-                        let go = FromClient::Move { handle: n as u32, position: to };
-                        go.encode(&mut body);
-                        Framer::frame(&body, &mut framed);
-                        let _ = conn.send_datagram(body.clone().into());
-                    }
+                    let moves: Vec<(u32, Pos3)> = handles
+                        .iter()
+                        .enumerate()
+                        .map(|(n, handle)| {
+                            let base = home(n);
+                            let to = Pos3::from_meters(
+                                base.x.floor_meters() + at,
+                                base.y.floor_meters(),
+                                0,
+                            );
+                            (*handle, to)
+                        })
+                        .collect();
+                    let _ = client.move_entities(&moves);
                     std::thread::sleep(Duration::from_millis(10));
                 }
             });
@@ -396,10 +350,10 @@ fn a_game_client_populates_a_region_through_an_edge() {
                 let culled = *culled.lock().expect("not poisoned");
                 let Some(culled) = culled else { return false };
                 let held = ids.lock().expect("not poisoned");
-                let Some(handle) = held.iter().position(|id| *id == Some(culled)) else {
+                let Some(at) = held.iter().position(|id| *id == Some(culled)) else {
                     return false;
                 };
-                gone.lock().expect("not poisoned").contains(&(handle as u32))
+                gone.lock().expect("not poisoned").contains(&handles[at])
             });
 
             stop.store(true, Ordering::Relaxed);
@@ -408,8 +362,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
 
         // The client goes. Everything it held goes with it, without anything
         // asking for it.
-        conn.close(0u32.into(), b"done");
-        drop(client);
+        client.connection().close(0u32.into(), b"done");
         wait_until("the region to lose everything the client held", &stop, || {
             edges.entity_count(umwelt::net::EdgeId::from_raw(0)) == 0
         });

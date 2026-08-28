@@ -8,17 +8,24 @@
 //! - [`protocol`] is the messages and how they are framed.
 //! - [`ids`] is the two identities an edge mints.
 //!
+//! [`EdgeClient`] is a game client's side, and it is what a game developer
+//! holds: four commands, and what the edge says back. Which of them rides a
+//! datagram and which rides a stream is decided here rather than at the call
+//! site.
+//!
 //! An [`EdgeServer`] holds a [`RegionClient`](crate::net::RegionClient) on one
 //! side and a QUIC endpoint on the other, and relays. It connects to nothing
 //! and binds nothing: the caller supplies a connected `async_nats::Client` and
 //! a bound `quinn::Endpoint`, so credentials, certificates and the crypto
 //! provider stay with the deployment.
 
+mod client;
 mod handle;
 pub mod ids;
 pub mod protocol;
 mod server;
 
+pub use client::{EdgeClient, FromEdge};
 pub use handle::{EdgeHandle, EdgeStats};
 pub use server::{DEFAULT_HEARTBEAT, EdgeServer};
 pub use ids::{ClientId, EntityKey};

@@ -55,4 +55,4 @@ pub use sim::{
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
 pub use subscription::{CellList, Subscription};
-pub use net::{EdgeHandle, EdgeServer, RegionClient, RegionId, RegionServer};
+pub use net::{EdgeClient, EdgeHandle, EdgeServer, RegionClient, RegionId, RegionServer};

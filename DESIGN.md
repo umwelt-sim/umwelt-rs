@@ -1286,6 +1286,16 @@ inside `Game::step`; nothing an edge does is moment-scoped, and an edge that cou
 only speak from inside a callback would force a consumer to queue its own work
 until some unrelated event fired.
 
+**Both halves are built, and a game developer touches neither transport.**
+`EdgeServer` is the edge's side; `EdgeClient` is the game client's, and it is
+what a game developer holds. It offers four commands — spawn, move, despawn, and
+the game's own opaque bytes — and hands back what the edge said. Which of them
+rides a datagram and which rides a reliable stream is decided by the message
+rather than at the call site: a lost move is superseded within a tick and a lost
+spawn is not recoverable by anything, so that is a property of the command, not
+a choice to push onto a consumer. Nobody outside the library frames a message or
+picks a transport.
+
 **`EdgeGame` is five callbacks, all defaulted to nothing.** A game whose clients
 spawn, move and despawn implements none of them: the library runs that whole
 loop. `ClientId` and `EntityKey` surface only once the consumer originates

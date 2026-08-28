@@ -289,13 +289,23 @@ fn a_game_client_populates_a_region_through_an_edge() {
             .expect("opens a stream");
         let sending: ClientHandle = client.handle();
 
-        // Spawn before move: a handle this connection never spawned is refused,
-        // and counted, rather than reaching a region.
+        // A command this connection could not have meant is refused and
+        // counted. Giving back something never asked for is one: it cannot be
+        // a race, because a despawn travels on the ordered stream.
         let before = edge.stats().refused;
-        sending.move_entity(9_999, home(0)).expect("publishes");
-        wait_until("the edge to refuse a move for an unspawned handle", &stop, || {
+        sending.despawn(9_999).expect("publishes");
+        wait_until("the edge to refuse a despawn for a handle nobody spent", &stop, || {
             edge.stats().refused > before
         });
+
+        // A stray *move*, by contrast, is dropped and not counted: a region's
+        // game can despawn anything, so a client can be moving something it has
+        // not yet been told is gone. `refused` is for mistakes, and that is a
+        // race. It reaches no region either way.
+        let quiet = edge.stats().refused;
+        sending.move_entity(9_998, home(0)).expect("publishes");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(edge.stats().refused, quiet, "a stray move must not count as a mistake");
 
         // The client mints its own handles, spent once and never reused.
         let handles: Vec<u32> = (0..WANTED)

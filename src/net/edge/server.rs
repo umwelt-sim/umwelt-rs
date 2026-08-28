@@ -353,20 +353,16 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
             // that checked would have to hold every region's world.
             let _ = shared.ask(Some(client), Some(handle), region, position, kind);
         }
-        // A move rides a datagram and a spawn rides the stream, so a client's
-        // first move for a handle can arrive before the spawn that named it.
-        // Refused and counted, and superseded by the next move a tick later.
+        // A move for a handle this connection is not holding is dropped
+        // silently rather than counted. A region's game can despawn anything,
+        // so a client can still be moving something it has not yet been told is
+        // gone — a race, and `refused` is for mistakes. The one case here that
+        // was a mistake, a first move overtaking the spawn that named it, is
+        // gone: a client sends its first move for a handle on the ordered
+        // stream, where it cannot pass anything.
         FromClient::Move { handle, position } => {
-            let key = key_of(shared, client, handle);
-            match key {
-                // Spawn before move: a handle this connection never spawned is
-                // dropped and counted.
-                Some(key) => {
-                    if !shared.set_position(key, position) {
-                        shared.count_refused();
-                    }
-                }
-                None => shared.count_refused(),
+            if let Some(key) = key_of(shared, client, handle) {
+                shared.set_position(key, position);
             }
         }
         FromClient::Despawn { handle } => match key_of(shared, client, handle) {

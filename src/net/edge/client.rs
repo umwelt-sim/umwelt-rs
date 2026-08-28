@@ -45,10 +45,14 @@ struct Shared {
     /// neither: it is told which of its handles, and what that one can see.
     codecs: Mutex<HashMap<RegionId, RecordCodec>>,
     wheres: Mutex<HashMap<u32, RegionId>>,
-    /// Handles the edge has said are gone. A game learns the same thing, but
-    /// not before its next pass, and moves sent in between would be refused
-    /// there for naming something this end already knows is not there.
+    /// Handles the edge has said are gone, or that this end has given back. A
+    /// game learns the same thing, but not before its next pass, and moves sent
+    /// in between would be refused for naming something this end already knows
+    /// is not there.
     dead: Mutex<HashSet<u32>>,
+    /// Handles that have had at least one move sent. The first one goes on the
+    /// stream, behind the spawn that created it; the rest ride datagrams.
+    walked: Mutex<HashSet<u32>>,
 }
 
 impl Shared {
@@ -92,6 +96,7 @@ impl EdgeClient {
             codecs: Mutex::new(HashMap::new()),
             wheres: Mutex::new(HashMap::new()),
             dead: Mutex::new(HashSet::new()),
+            walked: Mutex::new(HashSet::new()),
         });
         let built = game(ClientHandle { shared: Arc::downgrade(&shared) });
         *shared.game.lock().expect("not poisoned") = Box::new(built);
@@ -177,23 +182,32 @@ impl ClientHandle {
     /// Latest-only, so it rides a datagram: a lost one is superseded by the
     /// next, and waiting for a retransmission of a position two ticks stale
     /// helps nobody.
+    ///
+    /// The *first* move for a handle is the exception. A spawn travels on the
+    /// ordered stream and a datagram can pass it, so a first move sent as a
+    /// datagram can reach the edge before the spawn that named the handle, and
+    /// be refused for naming nothing. Sent on the stream it cannot overtake
+    /// anything. One message per entity, once.
     pub fn move_entity(&self, handle: u32, to: Pos3) -> Result<(), NetError> {
         let shared = self.live()?;
         if shared.dead.lock().expect("not poisoned").contains(&handle) {
             return Ok(());
         }
-        datagram(&shared, &FromClient::Move { handle, position: to })
+        let first = shared.walked.lock().expect("not poisoned").insert(handle);
+        let go = FromClient::Move { handle, position: to };
+        if first { reliable(&shared, &go) } else { datagram(&shared, &go) }
     }
 
-    /// Several at once. Each is its own datagram, since each has to fit one.
+    /// Several at once.
     pub fn move_entities(&self, moves: &[(u32, Pos3)]) -> Result<(), NetError> {
         let shared = self.live()?;
-        let dead = shared.dead.lock().expect("not poisoned");
         for &(handle, to) in moves {
-            if dead.contains(&handle) {
+            if shared.dead.lock().expect("not poisoned").contains(&handle) {
                 continue;
             }
-            datagram(&shared, &FromClient::Move { handle, position: to })?;
+            let first = shared.walked.lock().expect("not poisoned").insert(handle);
+            let go = FromClient::Move { handle, position: to };
+            if first { reliable(&shared, &go)? } else { datagram(&shared, &go)? }
         }
         Ok(())
     }
@@ -204,7 +218,11 @@ impl ClientHandle {
         let shared = self.live()?;
         // Dead here rather than when the edge confirms it. A move for an entity
         // just given back is refused there, and there is no reason to send one.
-        shared.dead.lock().expect("not poisoned").insert(handle);
+        // Giving the same one back twice is likewise not worth a message: the
+        // edge would refuse the second, and refusing is meant to mean a mistake.
+        if !shared.dead.lock().expect("not poisoned").insert(handle) {
+            return Ok(());
+        }
         reliable(&shared, &FromClient::Despawn { handle })
     }
 
@@ -289,6 +307,7 @@ async fn read_datagrams(conn: quinn::Connection, shared: Arc<Shared>) {
 
 fn shared_forget(shared: &Shared, handle: u32) {
     shared.wheres.lock().expect("not poisoned").remove(&handle);
+    shared.walked.lock().expect("not poisoned").remove(&handle);
     shared.dead.lock().expect("not poisoned").insert(handle);
 }
 

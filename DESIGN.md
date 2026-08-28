@@ -1334,9 +1334,25 @@ held is despawned, `removed` fires per entity as the regions confirm, and
 `disconnected` fires last. A developer cleaning up out of habit finds
 `entities_of` empty and `despawn` a no-op.
 
-**A stale key is a race, not a mistake.** A removal arrives unprompted — a
-region's game can despawn anything — so acting on an entity that has just gone is
-dropped and counted rather than refused. The only `Err` is a transport failure.
+**A stale key is a race, not a mistake, and is not counted as one.** A removal
+arrives unprompted — a region's game can despawn anything — so acting on an
+entity that has just gone is dropped silently. `refused` counts commands a
+client could not have meant: a malformed message, a spawn reusing a handle it is
+already using, a despawn of something it never asked for. It is meant to be zero
+in correct operation, because a signal that is never zero is not a signal.
+
+**A client's first move for a handle goes on the reliable stream.** Every move
+after it rides a datagram, which is what latest-only wants. The first cannot,
+because a spawn travels on the ordered stream and a datagram can pass it: sent
+as a datagram, a first move can reach the edge before the spawn that named the
+handle and be dropped for naming nothing. One stream message per entity, once,
+and the race is gone by construction.
+
+**Measured**, 128 entities with 8 replaced a second, 20 seconds, about 48,000
+commands. Before: 127 refused with the region's own game killing entities, 51
+with all deaths switched off — so two thirds of them were not deaths at all, but
+first moves overtaking their spawns. After both changes: **zero in both, and
+zero again with two regions and 176 migrations.**
 
 **Two threads own the region side.** `RegionClient` receives and publishes by
 blocking on its runtime, and almost all of an edge runs *inside* that runtime, so

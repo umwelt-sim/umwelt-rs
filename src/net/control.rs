@@ -16,9 +16,10 @@
 use core::fmt;
 use std::time::Duration;
 
+use crate::id::RegionId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
-use crate::net::region::protocol::{ProtocolVersion, RegionId, ServerVersion};
+use crate::net::region::protocol::{ProtocolVersion, ServerVersion};
 use crate::net::wire::Cursor;
 
 /// One region's heartbeat subject.

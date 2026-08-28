@@ -19,13 +19,12 @@ use futures::StreamExt;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::id::RegionId;
 use crate::config::WorldConfig;
 use crate::net::control::{self, Heartbeat};
 use crate::net::error::NetError;
 use crate::net::region::edges::Edges;
-use crate::net::region::protocol::{
-    PROTOCOL_VERSION, RegionId, ServerInfo, ServerVersion, WorldParams,
-};
+use crate::net::region::protocol::{PROTOCOL_VERSION, ServerInfo, ServerVersion, WorldParams};
 use crate::net::region::session::Inbound;
 use crate::net::region::subjects;
 

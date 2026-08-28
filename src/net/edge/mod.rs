@@ -6,7 +6,10 @@
 //! which is why the two share no types. See `docs/adr/0006`.
 //!
 //! - [`protocol`] is the messages and how they are framed.
-//! - [`ids`] is the two identities an edge mints.
+//!
+//! The identities an edge mints — [`ClientId`](crate::ClientId) and
+//! [`EntityKey`](crate::EntityKey) — are in [`id`](crate::id), because nothing
+//! about them is networking.
 //!
 //! [`EdgeClient`] is a game client's side, and it is what a game developer
 //! holds: four commands on a [`ClientHandle`], and a
@@ -22,14 +25,12 @@
 
 mod client;
 mod handle;
-pub mod ids;
 pub mod protocol;
 mod server;
 
 pub use client::{ClientHandle, EdgeClient};
 pub use handle::{EdgeHandle, EdgeStats};
 pub use server::{DEFAULT_HEARTBEAT, EdgeServer};
-pub use ids::{ClientId, EntityKey};
 pub use protocol::{
     EdgeInfo, Framer, FromClient, MAX_MESSAGE_BYTES, MAX_MOVES_PER_DATAGRAM, ToClient,
 };

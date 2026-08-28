@@ -16,9 +16,9 @@
 //! listening, so presence reaches one edge rather than all of them. See
 //! `docs/adr/0001` and `docs/adr/0004`.
 
+use crate::id::RegionId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
-use crate::net::region::protocol::RegionId;
 
 pub fn info(region: RegionId) -> String {
     format!("umwelt.{}.info", region.raw())

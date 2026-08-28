@@ -22,15 +22,12 @@ use futures::StreamExt;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::id::RegionId;
 use crate::config::WorldConfig;
 use crate::entity::EntityId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
-use crate::net::region::protocol::{
-    DespawnEntities, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE,
-    MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, Presence, RegionId, ServerInfo,
-    ServerVersion, Spawn, SpawnEntities,
-};
+use crate::net::region::protocol::{DespawnEntities, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, Presence, ServerInfo, ServerVersion, Spawn, SpawnEntities};
 use crate::net::region::subjects;
 use crate::pos::Pos3;
 

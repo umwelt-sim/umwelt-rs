@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::id::RegionId;
 use crate::codec::RecordCodec;
 use crate::game::ClientGame;
 use crate::packet::PacketReader;
@@ -29,7 +30,7 @@ use crate::net::edge::protocol::{
     Framer, FromClient, MAX_MOVES_PER_DATAGRAM, MOVES_HEADER_BYTES, MOVE_BYTES, ToClient,
 };
 use crate::net::error::NetError;
-use crate::net::region::protocol::{EntityKind, RegionId};
+use crate::net::region::protocol::{EntityKind};
 use crate::pos::Pos3;
 
 /// What a client holds, shared with every handle to it.

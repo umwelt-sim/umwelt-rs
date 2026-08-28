@@ -4,11 +4,13 @@
 //! common. Sharing a *message* between them would be the easy mistake, so they
 //! are separate modules and neither reaches into the other's protocol.
 //!
-//! What they do share is the vocabulary underneath both — [`RegionId`],
-//! [`EntityId`](crate::EntityId), [`EntityKind`] — because those name things in
-//! the world rather than things on a wire, and duplicating them per link would
-//! mean converting between two spellings of the same id at every hop. They also
-//! share one decoder, `wire::Cursor`, which belongs to neither.
+//! What they do share is the vocabulary underneath both —
+//! [`RegionId`](crate::RegionId), [`EntityId`](crate::EntityId) and
+//! [`EntityKind`] — because those name things in the world rather than things
+//! on a wire. They live in [`id`](crate::id) and [`entity`](crate::entity),
+//! outside this module entirely, so that the traits a consumer implements can
+//! be written without reaching in here. The two links also share one decoder,
+//! `wire::Cursor`, which belongs to neither.
 //!
 //! **Region to edge** — [`region`], built, over NATS. A region simulation and
 //! the edges relaying for it: few peers, deployed together and updated
@@ -48,8 +50,8 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use std::time::Duration;
-//! use umwelt::WorldConfig;
-//! use umwelt::net::{EdgeName, Edges, Inbound, RegionClient, RegionId, RegionServer};
+//! use umwelt::{RegionId, WorldConfig};
+//! use umwelt::net::{EdgeName, Edges, Inbound, RegionClient, RegionServer};
 //!
 //! // The caller connects. Where the broker is, what credentials it wants and
 //! // whether it is a cluster are not the library's to decide.
@@ -84,14 +86,14 @@ pub(crate) mod wire;
 
 pub use control::{EdgeHeartbeat, EdgeLoad, Heartbeat, RegionLoad};
 pub use edge::{
-    ClientHandle, ClientId, EdgeClient, EdgeHandle, EdgeServer, EdgeStats, EntityKey,
-    Framer, FromClient, MAX_MOVES_PER_DATAGRAM, ToClient,
+    ClientHandle, EdgeClient, EdgeHandle, EdgeServer, EdgeStats, Framer, FromClient,
+    MAX_MOVES_PER_DATAGRAM, ToClient,
 };
 pub use error::NetError;
 pub use region::{
     Applied, ClaimError, DespawnEntities, EdgeId, EdgeName, EdgeSink, EdgeView,
     Edges, EntityKind, Incoming, Inbound, MAX_DESPAWN_PER_MESSAGE,
     MAX_MESSAGE_BYTES, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, Offer,
-    PROTOCOL_VERSION, Presence, ProtocolVersion, RegionClient, RegionId, RegionServer, Spawn,
+    PROTOCOL_VERSION, Presence, ProtocolVersion, RegionClient, RegionServer, Spawn,
     ServerInfo, ServerVersion, Settled, SpawnEntities, WorldParams, subjects,
 };

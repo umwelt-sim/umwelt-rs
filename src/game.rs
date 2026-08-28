@@ -16,8 +16,8 @@
 use std::net::SocketAddr;
 
 use crate::entity::EntityId;
-use crate::net::edge::{ClientId, EntityKey};
-use crate::net::region::protocol::RegionId;
+use crate::id::{ClientId, EntityKey, RegionId};
+
 use crate::packet::PacketReader;
 use crate::sim::Step;
 

@@ -14,12 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{
-    ClientHandle, EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, FromClient, Inbound,
-    RegionId, RegionServer,
-};
+use umwelt::net::{ClientHandle, EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, FromClient, Inbound, RegionServer};
 use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{ClientGame, EntityId, Game, PacketReader, Pos3, WorldConfig, WorldSimulation};
+use umwelt::{ClientGame, EntityId, Game, PacketReader, Pos3, RegionId, WorldConfig, WorldSimulation};
 
 /// Entities the client asks for. Small: this is a wiring test, not a load one.
 const WANTED: usize = 16;

@@ -13,6 +13,7 @@ use core::fmt;
 use crate::config::WorldConfig;
 use crate::entity::EntityId;
 use crate::net::error::NetError;
+use crate::id::RegionId;
 use crate::net::wire::Cursor;
 use crate::pos::Pos3;
 
@@ -39,39 +40,6 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
 // ---------------------------------------------------------------------------
 // Identity and versions
 // ---------------------------------------------------------------------------
-
-/// Which region a simulation owns.
-///
-/// Assigned by the control plane, which is not built. Until then a consumer
-/// picks one and passes it to
-/// [`RegionServer::new`](crate::net::RegionServer::new).
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct RegionId(u32);
-
-impl RegionId {
-    #[inline]
-    pub const fn from_raw(raw: u32) -> RegionId {
-        RegionId(raw)
-    }
-
-    #[inline]
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Debug for RegionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "R{}", self.0)
-    }
-}
-
-impl fmt::Display for RegionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "region {}", self.0)
-    }
-}
 
 /// The version of this protocol itself.
 ///

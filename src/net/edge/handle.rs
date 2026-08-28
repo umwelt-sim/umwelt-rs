@@ -12,14 +12,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use crate::id::{ClientId, EntityKey, RegionId};
 use crate::entity::EntityId;
 use crate::game::EdgeGame;
 use crate::net::control::EdgeLoad;
-use crate::net::edge::ids::{ClientId, EntityKey, Mint};
+use crate::id::Mint;
 use crate::net::edge::protocol::{EdgeInfo, ToClient};
 use crate::net::error::NetError;
 use crate::net::region::RegionClient;
-use crate::net::region::protocol::{EntityKind, Presence, RegionId, Spawn};
+use crate::net::region::protocol::{EntityKind, Presence, Spawn};
 use crate::pos::Pos3;
 
 /// What this edge has done since it started.

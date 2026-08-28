@@ -24,6 +24,7 @@ pub mod fixed;
 pub mod pos;
 pub mod config;
 pub mod entity;
+pub mod id;
 pub mod gather;
 pub mod snapshot;
 pub mod odometer;
@@ -41,6 +42,7 @@ pub use fixed::{Fixed, DistSq, FIXED_ONE, FIXED_SHIFT};
 pub use pos::{Pos3, Pos2, CellCoord, CellId};
 pub use config::{ConfigError, WorldConfig, WorldConfigBuilder};
 pub use entity::{EntityId, LiveSet};
+pub use id::{ClientId, EntityKey, RegionId};
 pub use gather::{DiscoveredEntities, DiscoveredEntity};
 pub use snapshot::{CellOccupants, CellSnapshot, SubCells};
 pub use odometer::Odometer;
@@ -55,4 +57,4 @@ pub use sim::{
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
 pub use subscription::{CellList, Subscription};
-pub use net::{EdgeClient, EdgeHandle, EdgeServer, RegionClient, RegionId, RegionServer};
+pub use net::{EdgeClient, EdgeHandle, EdgeServer, RegionClient, RegionServer};

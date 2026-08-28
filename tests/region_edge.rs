@@ -14,12 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{
-    EdgeName, EdgeSink, EntityKind, Incoming, Inbound, Presence, RegionClient, RegionId,
-    RegionServer, Spawn,
-};
+use umwelt::net::{EdgeName, EdgeSink, EntityKind, Incoming, Inbound, Presence, RegionClient, RegionServer, Spawn};
 use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
+use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, RegionId, WorldConfig, WorldSimulation};
 
 const EDGES: usize = 3;
 /// Entities with a game client behind them. Each gets a viewer.

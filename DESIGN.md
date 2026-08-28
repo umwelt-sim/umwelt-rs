@@ -1268,6 +1268,15 @@ out of band — see `docs/adr/0003` — and the game is what told that client wh
 it is. Nor does an edge check a position against the region's bounds: the region
 refuses one, and checking here would mean holding every region's world.
 
+**The identifiers live outside `net`.** `RegionId`, `ClientId` and `EntityKey`
+name a region, a connection and an entity an edge is holding; none of that is
+networking, and a program that never opened a socket would name the same things.
+They are in `id`, so the traits a consumer implements can be written without
+reaching into a networking module. `EntityId` stays with `LiveSet` in `entity`
+for the one reason the others do not share: it is also the index of a slot in
+the simulation's position arrays. Every one of them carries `from_raw` and `raw`
+and nothing else — the bytes are the protocol's business.
+
 **Three identifier spaces, and only one of them crosses a tier.** A client names
 entities by a `u32` handle it chose, so it can move one the instant it asks for
 it. The edge maps that to an `EntityKey`, which is never reused and doubles as

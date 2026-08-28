@@ -21,19 +21,20 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::id::{ClientId, EntityKey, RegionId};
 use crate::game::EdgeGame;
 use crate::net::control::{self, EdgeHeartbeat};
 use crate::net::edge::handle::{
     Client, Counters, EdgeHandle, EdgeStats, Entities, Outgoing, Shared, finish_leaving,
     on_presence, span,
 };
-use crate::net::edge::ids::{ClientId, EntityKey, Mint};
+use crate::id::Mint;
 use crate::net::edge::protocol::{EdgeInfo, Framer, FromClient, ToClient};
 use crate::net::error::NetError;
 use crate::pos::Pos3;
 use crate::net::region::{Incoming, RegionClient};
 use crate::net::region::edges::EdgeName;
-use crate::net::region::protocol::{PROTOCOL_VERSION, RegionId, ServerVersion, Spawn};
+use crate::net::region::protocol::{PROTOCOL_VERSION, ServerVersion, Spawn};
 
 /// How long a region is given to say what world it runs.
 ///

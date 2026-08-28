@@ -38,13 +38,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::runtime::Handle;
 
+use crate::id::RegionId;
 use crate::entity::EntityId;
 use crate::net::error::NetError;
 use crate::net::region::edges::{EdgeId, EdgeStats, Edges};
-use crate::net::region::protocol::{
-    DespawnEntities, EntityKind, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE, KIND_MOVE_ENTITIES,
-    KIND_SPAWN_ENTITIES, MoveEntities, Presence, RegionId, Spawn, SpawnEntities,
-};
+use crate::net::region::protocol::{DespawnEntities, EntityKind, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE, KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MoveEntities, Presence, Spawn, SpawnEntities};
 use crate::net::region::subjects;
 use crate::pos::Pos3;
 use crate::game::Game;

@@ -16,10 +16,11 @@
 //! as a `u32`. Both carry the same bodies, and the leading kind byte says which
 //! message it is either way.
 
+use crate::id::RegionId;
 use crate::entity::EntityId;
 use crate::fixed::Fixed;
 use crate::net::error::NetError;
-use crate::net::region::protocol::{EntityKind, RegionId};
+use crate::net::region::protocol::{EntityKind};
 use crate::net::wire::Cursor;
 use crate::pos::Pos3;
 

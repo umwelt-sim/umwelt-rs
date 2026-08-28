@@ -1,11 +1,49 @@
-//! The two identities an edge mints.
+//! Who and what, named.
 //!
-//! Both are never reused, and both are the edge's alone: a game client never
-//! sees either, and neither crosses to a region. See `docs/adr/0005` and
-//! `docs/adr/0006`.
+//! Nothing here is about networking. These name a region, a connection and an
+//! entity an edge is holding, and they would name the same things in a program
+//! that never opened a socket. They live outside `net` so that the traits a
+//! consumer implements can be written without reaching into it.
+//!
+//! [`EntityId`](crate::EntityId) is the exception that stays where it is: it is
+//! an identifier *and* the index of a slot in the simulation's position arrays,
+//! so it belongs beside the set that says which slots are live.
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Which region a simulation owns.
+///
+/// Assigned by the control plane, which is not built. Until then a consumer
+/// picks one and passes it to
+/// [`RegionServer::new`](crate::net::RegionServer::new).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RegionId(u32);
+
+impl RegionId {
+    #[inline]
+    pub const fn from_raw(raw: u32) -> RegionId {
+        RegionId(raw)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Debug for RegionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "R{}", self.0)
+    }
+}
+
+impl fmt::Display for RegionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "region {}", self.0)
+    }
+}
 
 /// One live game client connection.
 ///

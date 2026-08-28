@@ -1,16 +1,24 @@
-//! What can go wrong on the region-to-edge link.
+//! What can go wrong on either link.
 
 use core::fmt;
 
 use crate::config::ConfigError;
 use crate::net::region::protocol::{ProtocolVersion, kind_name};
 
-/// A failure on the region-to-edge link.
+/// A failure on either link.
 #[derive(Debug)]
 pub enum NetError {
     /// The NATS client failed: connecting, publishing, subscribing or a request
     /// that went unanswered.
     Nats(Box<dyn std::error::Error + Send + Sync>),
+    /// The client link failed: a connection lost, a stream that could not be
+    /// written, or a datagram the peer will not take.
+    Quic(Box<dyn std::error::Error + Send + Sync>),
+    /// Named a client or an entity this edge does not hold.
+    ///
+    /// A race rather than a mistake, in most cases: a removal can arrive
+    /// unprompted, so anything acting on a key may find it already gone.
+    Unknown(&'static str),
     /// A message arrived but did not decode. The string names what was being
     /// read rather than echoing any of the sender's bytes back.
     Malformed(&'static str),
@@ -39,6 +47,8 @@ impl fmt::Display for NetError {
         use NetError::*;
         match self {
             Nats(e) => write!(f, "nats: {e}"),
+            Quic(e) => write!(f, "quic: {e}"),
+            Unknown(what) => write!(f, "no such {what}"),
             Malformed(what) => write!(f, "malformed {what}"),
             Unexpected { expected, got } => {
                 write!(f, "expected {expected}, got {} (kind {got})", kind_name(*got))
@@ -63,7 +73,7 @@ impl fmt::Display for NetError {
 impl std::error::Error for NetError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            NetError::Nats(e) => Some(e.as_ref()),
+            NetError::Nats(e) | NetError::Quic(e) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -87,6 +97,26 @@ macro_rules! from_nats {
         })*
     };
 }
+
+/// Every `quinn` failure reaches here the same way, for the same reason.
+macro_rules! from_quic {
+    ($($t:ty),* $(,)?) => {
+        $(impl From<$t> for NetError {
+            fn from(e: $t) -> NetError {
+                NetError::Quic(Box::new(e))
+            }
+        })*
+    };
+}
+
+from_quic!(
+    quinn::ConnectionError,
+    quinn::WriteError,
+    quinn::ReadError,
+    quinn::ReadExactError,
+    quinn::SendDatagramError,
+    quinn::ClosedStream,
+);
 
 from_nats!(
     async_nats::client::FlushError,

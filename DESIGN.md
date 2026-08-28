@@ -621,10 +621,11 @@ authored. Everything else in this table derives from those five.
 ## What is built
 
 `fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
-`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`. 280
-library tests pass, and two integration tests run against a live broker: one
-drives a region and three edges end to end, the other moves an entity from one
-region into another.
+`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`, and
+both halves of `net`: the region link and the edge server. 302 library tests
+pass, and three integration tests run against a live broker: one drives a region
+and three edges end to end, one moves an entity from one region into another, and
+one takes a game client through an edge into a region and out again.
 
 A tick runs end to end: the game moves entities, the odometer observes how far
 they went, the snapshot is rebuilt in cell order, and every due viewer is
@@ -633,8 +634,7 @@ assembled from that selection and passed to its sink. Viewers are partitioned
 across worker threads.
 
 Not built: events, and anything a session carries. The clock is built; see
-§Pacing the loop. The region link is built and carries its handshake and nothing
-else; see §The region link.
+§Pacing the loop. Both links are built: §The region link and §The edge server.
 
 ### Subscription
 
@@ -1010,10 +1010,11 @@ survived.
 **Region to edge**, `net::region`, is built. One region simulation and the
 edges relaying for it: few peers, mutually trusted, deployed together.
 
-**Edge to game client** is not built and will be its own module. Many peers,
-none of them trusted, deployed on someone else's machine and updated on their
-schedule. Game clients do not speak NATS, so that link is unaffected by the
-transport change.
+**Edge to game client**, `net::edge`, is built, over QUIC. Many peers, none of
+them trusted, deployed on someone else's machine and updated on their schedule.
+Game clients do not speak NATS, so that link was unaffected by the transport
+change and is a separate protocol sharing no types with this one. See
+`docs/adr/0006` and §The edge server.
 
 **Neither end connects to anything.** Both take a connected
 `async_nats::Client` and a Tokio handle, so the broker address, credentials,
@@ -1191,10 +1192,11 @@ a viewer registers, and asks `Edges::edge_for` which edge manages that avatar.
 It is wrapped in `Handoff`, so the tick's side of a send is a memory copy and a
 broker that stops accepting cannot stall the region.
 
-**A known deviation.** State is latest-only, lossy and unordered, and this link
-is reliable and ordered. Carrying payloads here is what lets the thing run end
-to end before the datagram path exists. It is not what §Architecture says should
-happen, and the smoke test below shows why in numbers.
+**A known deviation, now half closed.** State is latest-only, lossy and
+unordered, and this link is reliable and ordered. It reaches the client on a
+datagram now — §The edge server — so what remains is one reliable hop in the
+middle, between peers in the same datacenter. What that costs has not been
+measured under loss, which is the only condition where it costs anything.
 
 ### Moving an entity between regions
 
@@ -1235,19 +1237,139 @@ reported.** A move already in flight for an entity just despawned is refused, an
 the round trip is a tick or more. Migrating 16 observers a second without this
 cost 16 refused moves a second, one per migration, which is how it was found.
 
+### The edge server
+
+`net::edge` is the other half, and it shares no types with `net::region`. One
+edge, and the game clients connected to it: many peers, none of them trusted,
+running on someone else's machine and updated on someone else's schedule. See
+`docs/adr/0006`.
+
+**QUIC, not TCP plus a second UDP socket.** A reliable ordered stream carries
+spawn, despawn and the consumer's own messages; datagrams carry the state stream
+down and moves up. Both of those are latest-only, so a lost one is superseded
+within a tick, and a lost spawn is not recoverable by anything. Two sockets would
+mean two handshakes, NAT traversal on the second, and two congestion controllers
+over one path.
+
+**The caller supplies a bound endpoint.** Same rule as the NATS client:
+certificates, the crypto provider and what the edge listens on are deployment
+decisions, and the library installs no process-global default.
+
+**The region ships final packets and the edge relays them without decoding.**
+The edge routes on the four-byte avatar in front of a packet and replaces those
+bytes with the region it came from. Authoritative state does not lose authority
+by passing through a relay, and where the edge has something of its own to say it
+has its own channel to say it on.
+
+**An edge has no home region.** It reaches every region through one wildcard
+subscription and has no way to know which regions exist, so a client's spawn
+names the region it is for. Which region a player belongs in is the game's, kept
+out of band — see `docs/adr/0003` — and the game is what told that client where
+it is. Nor does an edge check a position against the region's bounds: the region
+refuses one, and checking here would mean holding every region's world.
+
+**Three identifier spaces, and only one of them crosses a tier.** A client names
+entities by a `u32` handle it chose, so it can move one the instant it asks for
+it. The edge maps that to an `EntityKey`, which is never reused and doubles as
+the correlation token on `SpawnEntities` — so there is no fourth space. The
+region allocates the `EntityId`. `ClientId` names one live connection and is
+never reused either: unlike an `EdgeId`, a consumer holds one freely in its own
+tables and timers, and a recycled one would send one player's packets to another.
+
+**The edge names itself.** `docs/adr/0004` makes a fresh name per incarnation a
+correctness requirement, and a correctness requirement is not the consumer's to
+remember, so there is no way to supply one.
+
+**Sending is a handle, not a callback argument.** `EdgeHandle` is cheap to clone
+and callable from anywhere. `Step` earns its shape because spawning is valid only
+inside `Game::step`; nothing an edge does is moment-scoped, and an edge that could
+only speak from inside a callback would force a consumer to queue its own work
+until some unrelated event fired.
+
+**`EdgeGame` is five callbacks, all defaulted to nothing.** A game whose clients
+spawn, move and despawn implements none of them: the library runs that whole
+loop. `ClientId` and `EntityKey` surface only once the consumer originates
+actions of its own.
+
+**Disconnect is ordered so the obvious mistake is free.** Everything the client
+held is despawned, `removed` fires per entity as the regions confirm, and
+`disconnected` fires last. A developer cleaning up out of habit finds
+`entities_of` empty and `despawn` a no-op.
+
+**A stale key is a race, not a mistake.** A removal arrives unprompted — a
+region's game can despawn anything — so acting on an entity that has just gone is
+dropped and counted rather than refused. The only `Err` is a transport failure.
+
+**Two threads own the region side.** `RegionClient` receives and publishes by
+blocking on its runtime, and almost all of an edge runs *inside* that runtime, so
+doing either from a task is not allowed. One thread reads what the regions send;
+one drains a queue of spawns and despawns and flushes queued positions. That
+second thread is also what makes moves cheap: positions are coalesced by entity,
+latest wins, and flushed every 5 ms, so one client's move per tick does not become
+one broker message per client per tick.
+
+**An edge stops moving an entity the moment it gives it back**, rather than when
+the removal is reported. Without that, migrating or churning cost one refused
+move each, which is what the smoke test showed before it was fixed.
+
+**Measured, on one M1 over loopback:** one game client with 256 observers at
+20 Hz, churning 8 a second, relayed 5,100 packets a second carrying about 526,000
+records, with zero undeliverable and zero commands refused by either tier. With a
+second region and 64 entities of the edge's own walking between the two, 336
+migrations completed in 18 seconds with nothing lost and nothing refused. These
+are wiring figures from a laptop; §Whole-pipeline is what to quote for cost.
+
+**Known and not fixed.** A packet at the region's full payload budget plus the
+five-byte datagram header can exceed what the path will carry, and quinn refuses
+rather than fragmenting. That shows up as `undeliverable` rather than as a silent
+truncation, and it has not been seen in any run so far because a full packet is
+rare.
+
+**Not in it.** Migration driven by anything but a consumer, input sequence numbers
+and client prediction, any movement resolution in the region, edge-side interest
+management, and any authorization beyond what QUIC's TLS gives.
+
+### Heartbeats
+
+Both tiers publish one, and the library holds the timer. `docs/adr/0007`
+reversed `docs/adr/0002` on that point: cadence is still a deployment choice —
+`set_heartbeat_interval`, 30 seconds by default, zero to switch it off — but
+every field of a region's load is umwelt's own number, so a consumer assembling
+one was maintaining our data on our behalf.
+
+A region needs no new plumbing for it. `RegionServer` already holds
+`Arc<Inbound>`, and `Inbound` is already driven by the tick: `apply` is handed a
+`Step` and `settle` is handed the simulation, and neither call is optional. So
+`Inbound` accumulates the load, `WorldSimulation` accumulates its own tick
+timing, `settle` reads it off, and the server's timer publishes.
+
+An edge publishes on `umwelt.control.edge.{edge}.heartbeat`, carrying clients
+connected, entities managed and how many observe, which regions hold them, and
+per span: packets relayed, packets undeliverable, commands received and commands
+it refused. Not commands a *region* refused — a region counts those per edge and
+never tells the edge. And no address: an edge's listening address is unlikely to
+be usable by whatever reads the control plane, which may be in another VPC, and
+a client is told where to connect by the game's matchmaking rather than by
+umwelt.
+
 ### The smoke test
 
-`examples/herd-sim.rs` is a region whose game applies whatever its edges sent.
-`examples/herd-edge.rs` asks for a population, walks it, hands observers back and
-asks for replacements, and reads the replication that comes down. Given `--to`
-and `--migrate` it also walks part of that population into a second region and
-back, by the sequence above.
+The smoke test is `herd`, the companion repo, and none of it lives here: herd
+depends on umwelt through a path dependency and therefore sees the public API
+and nothing else. What herd cannot do through that API is a finding about the
+API rather than a reason to reach around it.
 
-`herd-sim` draws a card per attached edge when stdout is a terminal, adding and
-dropping cards as edges come and go, and writes one line a second when stdout is
-redirected. The figures below come from the redirected form. Per-edge counters
-live on `Edges`, since a region's total says nothing about which edge is
-carrying what.
+It is three peers, matching the three programs a consumer writes.
+`herd-sim` owns a `WorldSimulation` and serves a region. `herd-edge` holds an
+`EdgeServer`, and given `--to` and `--migrate` also walks a herd of its own
+between two regions by the sequence above. `herd-game` is the game client: it
+speaks no NATS and knows no region except the ids that come back on its own
+entities.
+
+The figures below predate that split and were taken with a program that drove
+the region side directly, with no client behind it. They measure the region,
+which the split did not touch. Per-edge counters live on `Edges`, since a
+region's total says nothing about which edge is carrying what.
 
 Conditions: one region, eight edges, one M1, loopback, 20 Hz, AC power. Mean
 and worst tick are taken within one second. These are smoke test figures from a
@@ -1343,16 +1465,16 @@ hardware someone would rent, and still wants a definition of comfortable.
 records per second, or 578 MB/s, across eight edges. That is what the reliable
 ordered stream is carrying in place of datagrams.
 
-**Two regions, measured.** One `herd-edge` holding 512 observers against two
-`herd-sim` regions at 20 Hz, migrating 16 observers a second and churning 8. After
+**Two regions, measured**, before the three-peer split, with one program driving
+the region side directly. 512 observers against two regions at 20 Hz, migrating
+16 observers a second and churning 8. After
 a minute the crowd had settled at 300 entities in one region and 212 in the other:
 512 in total, none lost and none duplicated, 960 migrations completed, and no
 command refused by either region. Mean tick was 1.22 ms in one and 0.91 ms in the
 other, which says the run is about the bookkeeping rather than the load.
 
-Not built: the datagram path, the ack path the ghost mark needs, the reliable
-event channel, and the edge server that holds game client sockets. `herd-edge`
-drives the region side of an edge without serving any game clients.
+Not built: the ack path the ghost mark needs, and the reliable event channel.
+The datagram path and the edge server are built; see §The edge server.
 
 ### Slot growth under churn
 
@@ -2662,8 +2784,9 @@ and cell count together rather than one at a time.
 4. ~~Sub-cell subdivision, distance-ordered walk, walk cap~~ (done)
 5. ~~Priority accumulator and budget selection~~ (done)
 6. ~~`WorldSimulation` and the game hook trait; a minimal `herd` game step~~
-   (done). `herd` is now a pair of binaries, `herd-sim` and `herd-edge`, whose
-   game is applying what the edges sent
+   (done). `herd` is now three binaries: `herd-sim` serves a region and runs
+   its own game, `herd-edge` holds an `EdgeServer`, and `herd-game` is a
+   client
 7. Bot harness with adversarial movement patterns
 8. `SimulatorEdge` and the sim-to-edge protocol. The link, its handshake and its
    session are built (§The region link, §The session): edges populate a region,

@@ -92,6 +92,13 @@ impl RegionClient {
         &self.edge
     }
 
+    /// The NATS client, for anything else this edge publishes on the same
+    /// connection. The control plane is the reason it is here.
+    #[inline]
+    pub fn client(&self) -> &async_nats::Client {
+        &self.client
+    }
+
     /// Asks a region what world it runs, and checks the answer.
     ///
     /// Rebuilding the config is also the check that this end decodes the

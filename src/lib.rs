@@ -49,10 +49,10 @@ pub use select::{Policy, Ranked, Selection, Weights, select};
 pub use codec::RecordCodec;
 pub use packet::{PacketHeader, PacketReader, PacketWriter};
 pub use budget::PacketBudget;
-pub use game::Game;
+pub use game::{EdgeGame, Game};
 pub use sim::{
     ClientLimits, Flow, Handoff, NullSink, Overrun, Pacing, PayloadSink, RecordingSink,
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
 pub use subscription::{CellList, Subscription};
-pub use net::{RegionClient, RegionId, RegionServer};
+pub use net::{EdgeHandle, EdgeServer, RegionClient, RegionId, RegionServer};

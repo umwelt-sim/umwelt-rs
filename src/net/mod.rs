@@ -8,11 +8,12 @@
 //! the edges relaying for it: few peers, deployed together and updated
 //! together. See `docs/adr/0001`.
 //!
-//! **Edge to game client** — not built, and it will be its own module. Many
-//! peers, running on someone else's machine and updated on their schedule.
-//! Game clients do not speak NATS. The payloads
+//! **Edge to game client** — [`edge`], built, over QUIC. Many peers, none of
+//! them trusted, running on someone else's machine and updated on someone
+//! else's schedule. Game clients do not speak NATS. The payloads
 //! [`PacketWriter`](crate::PacketWriter) assembles belong to that link:
-//! latest-only, lossy, unordered, MTU-sized.
+//! latest-only, lossy, unordered, MTU-sized, and they reach a client on a
+//! datagram. See `docs/adr/0006`.
 //!
 //! # The pieces, and which side holds them
 //!
@@ -23,14 +24,18 @@
 //! than with connections one at a time.
 //!
 //! [`RegionClient`] is an edge's side: the edge's name plus a connection the
-//! caller made, through which it talks to any number of regions. An edge server
-//! will take a `RegionClient` and start its own socket server on the other side
-//! of itself, speaking the client-facing protocol to game clients. It is not
-//! built, and it is a different type from this one.
+//! caller made, through which it talks to any number of regions.
 //!
-//! Neither type connects to anything. Both take a connected
-//! [`async_nats::Client`] and a Tokio handle, so the broker address,
-//! credentials, TLS and cluster membership stay the caller's.
+//! [`EdgeServer`] holds one of those and a QUIC endpoint, and relays between
+//! them. It is a different type from `RegionClient` and does what that one
+//! deliberately does not: game client connections, the client-facing protocol,
+//! and the mapping from an entity to whoever owns it.
+//!
+//! No type here connects to anything or binds anything. Each takes a connected
+//! [`async_nats::Client`] and a Tokio handle, and `EdgeServer` also takes a
+//! bound `quinn::Endpoint`, so the broker address, credentials, TLS,
+//! certificates, the crypto provider and cluster membership all stay the
+//! caller's.
 //!
 //! # Shape
 //!
@@ -66,10 +71,14 @@
 //! ```
 
 pub mod control;
+pub mod edge;
 mod error;
 pub mod region;
 
 pub use control::{EdgeHeartbeat, EdgeLoad, Heartbeat, RegionLoad};
+pub use edge::{
+    ClientId, EdgeHandle, EdgeServer, EdgeStats, EntityKey, Framer, FromClient, ToClient,
+};
 pub use error::NetError;
 pub use region::{
     Applied, ClaimError, DespawnEntities, EdgeId, EdgeName, EdgeSink, EdgeView,

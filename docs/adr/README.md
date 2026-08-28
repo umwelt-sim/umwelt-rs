@@ -13,6 +13,7 @@ work lands. If a decision is reversed, a new record supersedes it and says so.
 | [0003](0003-ad-hoc-entity-migration.md) | Ad hoc entity migration between regions | Accepted, nothing to build |
 | [0004](0004-region-events-and-entity-addressing.md) | Region events, and entity ids on the wire | Accepted |
 | [0005](0005-where-state-lives.md) | Per-client state at the edge, world state in the region | Accepted, nothing to build |
+| [0006](0006-the-edge-server.md) | The edge server | Accepted, not built |
 
 ## Format
 

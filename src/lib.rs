@@ -49,7 +49,7 @@ pub use select::{Policy, Ranked, Selection, Weights, select};
 pub use codec::RecordCodec;
 pub use packet::{PacketHeader, PacketReader, PacketWriter};
 pub use budget::PacketBudget;
-pub use game::{EdgeGame, Game};
+pub use game::{ClientGame, EdgeGame, Game};
 pub use sim::{
     ClientLimits, Flow, Handoff, NullSink, Overrun, Pacing, PayloadSink, RecordingSink,
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,

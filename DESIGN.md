@@ -1286,15 +1286,25 @@ inside `Game::step`; nothing an edge does is moment-scoped, and an edge that cou
 only speak from inside a callback would force a consumer to queue its own work
 until some unrelated event fired.
 
-**Both halves are built, and a game developer touches neither transport.**
-`EdgeServer` is the edge's side; `EdgeClient` is the game client's, and it is
-what a game developer holds. It offers four commands — spawn, move, despawn, and
-the game's own opaque bytes — and hands back what the edge said. Which of them
-rides a datagram and which rides a reliable stream is decided by the message
-rather than at the call site: a lost move is superseded within a tick and a lost
-spawn is not recoverable by anything, so that is a property of the command, not
-a choice to push onto a consumer. Nobody outside the library frames a message or
-picks a transport.
+**Both halves are built, and a game developer touches neither transport nor a
+receive loop.** `EdgeServer` is the edge's side; `EdgeClient` is the game
+client's. Sending is four commands on a `ClientHandle` — spawn, move, despawn,
+and the game's own opaque bytes. Receiving is a `ClientGame`, called with what
+the edge said.
+
+Which command rides a datagram and which rides a reliable stream is decided by
+the message rather than at the call site: a lost move is superseded within a
+tick and a lost spawn is not recoverable by anything, so that is a property of
+the command and not a choice to push onto a consumer. Nothing asks a consumer to
+poll either. A polling API would have made every game define what a timeout
+means and what to do about one, which is the library's question, not theirs — a
+connection that goes reports itself as `disconnected`.
+
+**Both handles hold weak references.** A server owns its game and the game holds
+a handle; an owning handle would close that cycle and neither end would ever be
+freed. Upgrading costs an atomic on paths that run per batch rather than per
+record, and a call after the server or client is dropped fails cleanly, which is
+the truth.
 
 **`EdgeGame` is five callbacks, all defaulted to nothing.** A game whose clients
 spawn, move and despawn implements none of them: the library runs that whole

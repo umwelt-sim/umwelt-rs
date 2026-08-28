@@ -1,7 +1,8 @@
-//! The two traits a consumer implements.
+//! The three traits a consumer implements.
 //!
 //! [`Game`] is a region's, called once per tick with a [`Step`]. [`EdgeGame`]
 //! is an edge's, called when a client connects, says something, or goes away.
+//! [`ClientGame`] is a game client's, called when the edge says something back.
 //!
 //! They live here rather than beside the tier that calls them because they are
 //! the consumer's extension points and belong together, and because neither
@@ -65,4 +66,44 @@ pub trait EdgeGame: Send + 'static {
 
     /// Bytes on the consumer's own channel. umwelt does not read them.
     fn message(&mut self, client: ClientId, body: &[u8]) {}
+}
+
+/// The consumer's game client, called when its edge says something.
+///
+/// Every method does nothing by default. Nothing here polls, waits or retries:
+/// the library owns the reading, and a connection that goes reports itself
+/// through [`disconnected`](Self::disconnected) rather than as a timeout the
+/// consumer has to interpret.
+///
+/// Calls are serialized and made on the I/O path, so **an implementation must
+/// not block**, on the same terms as [`EdgeGame`].
+///
+/// Sending is on [`ClientHandle`](crate::net::ClientHandle), which the
+/// constructor hands over, for the same reason [`EdgeHandle`](crate::net::EdgeHandle)
+/// is not a callback argument. See `docs/adr/0006`.
+#[allow(unused_variables)]
+pub trait ClientGame: Send + 'static {
+    /// A region allocated an id for the entity this handle asked for. Until
+    /// this arrives the handle is the only name for it.
+    fn spawned(&mut self, handle: u32, region: RegionId, entity: EntityId) {}
+
+    /// Gone, whatever caused it — including a despawn this client never asked
+    /// for, because a region's own game can despawn anything.
+    fn removed(&mut self, handle: u32) {}
+
+    /// One packet, to be read with [`PacketReader`](crate::PacketReader).
+    ///
+    /// Borrowed from the datagram it arrived in, so a consumer that keeps it
+    /// copies it.
+    fn state(&mut self, region: RegionId, packet: &[u8]) {}
+
+    /// The game's own bytes, which umwelt did not read.
+    fn message(&mut self, body: &[u8]) {}
+
+    /// The connection is gone. The last call this game will get.
+    ///
+    /// Reconnecting is the caller's, on the same terms as connecting: it
+    /// supplied the connection, and umwelt has no opinion about where the edge
+    /// is or how long to wait before trying again.
+    fn disconnected(&mut self) {}
 }

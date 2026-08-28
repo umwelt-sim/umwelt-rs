@@ -15,11 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use umwelt::net::{
-    EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, FromEdge, Inbound, RegionId,
+    ClientHandle, EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, Inbound, RegionId,
     RegionServer,
 };
 use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation};
+use umwelt::{
+    ClientGame, EntityId, Game, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation,
+};
 
 /// Entities the client asks for. Small: this is a wiring test, not a load one.
 const WANTED: usize = 16;
@@ -70,6 +72,42 @@ impl Game for Applier {
     }
 }
 
+/// What this test's client does with what the edge tells it.
+///
+/// This is the whole of a consumer's receive side: no polling, no timeout, no
+/// decision about what silence means.
+struct Watcher {
+    region: RegionId,
+    /// Handle to entity id, in the order the handles were spent.
+    ids: Arc<Mutex<Vec<(u32, EntityId)>>>,
+    gone: Arc<Mutex<Vec<u32>>>,
+    /// Positions that made the whole round trip.
+    confirmed: Arc<std::sync::atomic::AtomicU64>,
+    codec: RecordCodec,
+}
+
+impl ClientGame for Watcher {
+    fn spawned(&mut self, handle: u32, region: RegionId, entity: EntityId) {
+        assert_eq!(region, self.region, "an id from a region nobody asked about");
+        self.ids.lock().expect("not poisoned").push((handle, entity));
+    }
+
+    fn removed(&mut self, handle: u32) {
+        self.gone.lock().expect("not poisoned").push(handle);
+    }
+
+    fn state(&mut self, _region: RegionId, packet: &[u8]) {
+        let Some(reader) = PacketReader::new(&self.codec, packet) else { return };
+        // A packet reaching this client is one built for an avatar it owns, and
+        // an avatar always sees itself.
+        for (_, pos) in reader.updates() {
+            if pos.x.floor_meters() > 200 {
+                self.confirmed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Where one entity starts. A column, so they are all in view of each other.
 fn home(n: usize) -> Pos3 {
     Pos3::from_meters(200, 200 + n as i32, 0)
@@ -91,9 +129,6 @@ fn wait_until(what: &str, stop: &AtomicBool, done: impl Fn() -> bool) {
     stop.store(true, Ordering::Relaxed);
     panic!("timed out waiting for {what}");
 }
-
-/// How long a reader waits before checking whether it should stop.
-const POLL: Duration = Duration::from_millis(200);
 
 // -- QUIC, generated for this run ------------------------------------------
 
@@ -240,14 +275,27 @@ fn a_game_client_populates_a_region_through_an_edge() {
             .block_on(async { endpoint.connect(at, "localhost").expect("configured").await })
             .expect("connects to the edge");
         // Everything below goes through the library. A game developer never
-        // frames a message or picks a datagram: which of the four commands
-        // rides which is a property of the command.
-        let client = EdgeClient::new(conn, runtime.handle().clone()).expect("opens a stream");
+        // frames a message, picks a datagram, or polls: which of the four
+        // commands rides which is a property of the command, and what comes
+        // back arrives as calls.
+        let ids: Arc<Mutex<Vec<(u32, EntityId)>>> = Arc::new(Mutex::new(Vec::new()));
+        let gone: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let watcher = Watcher {
+            region,
+            ids: Arc::clone(&ids),
+            gone: Arc::clone(&gone),
+            confirmed: Arc::clone(&confirmed),
+            codec: RecordCodec::new(&cfg),
+        };
+        let client = EdgeClient::new(conn, runtime.handle().clone(), |_handle| watcher)
+            .expect("opens a stream");
+        let sending: ClientHandle = client.handle();
 
         // Spawn before move: a handle this connection never spawned is refused,
         // and counted, rather than reaching a region.
         let before = edge.stats().refused;
-        client.move_entity(9_999, home(0)).expect("publishes");
+        sending.move_entity(9_999, home(0)).expect("publishes");
         wait_until("the edge to refuse a move for an unspawned handle", &stop, || {
             edge.stats().refused > before
         });
@@ -255,61 +303,22 @@ fn a_game_client_populates_a_region_through_an_edge() {
         // The client mints its own handles, spent once and never reused.
         let handles: Vec<u32> = (0..WANTED)
             .map(|n| {
-                client
+                sending
                     .spawn(region, home(n), EntityKind::Observer)
                     .expect("asks for an entity")
             })
             .collect();
 
-        // What the edge said. One receive loop, whichever transport carried it.
-        let ids: Mutex<Vec<Option<EntityId>>> = Mutex::new(vec![None; WANTED]);
-        let gone: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-        let confirmed = std::sync::atomic::AtomicU64::new(0);
-        let codec = RecordCodec::new(&cfg);
-
-        let client = &client;
+        let sending = &sending;
         let handles = &handles;
         std::thread::scope(|inner| {
             let ids = &ids;
             let gone = &gone;
             let stop = &stop;
             let confirmed = &confirmed;
-            inner.spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    // A timeout rather than a blocking receive, so a failure
-                    // elsewhere reports itself instead of hanging the scope.
-                    let Some(message) = client.receive_timeout(POLL) else { continue };
-                    match message {
-                        FromEdge::Spawned { handle, region: from, entity } => {
-                            assert_eq!(from, region, "an id from a region nobody asked");
-                            let at = handles
-                                .iter()
-                                .position(|h| *h == handle)
-                                .expect("a handle this client never spent");
-                            ids.lock().expect("not poisoned")[at] = Some(entity);
-                        }
-                        FromEdge::Removed { handle } => {
-                            gone.lock().expect("not poisoned").push(handle);
-                        }
-                        FromEdge::State { packet, .. } => {
-                            let Some(reader) = PacketReader::new(&codec, &packet) else {
-                                continue;
-                            };
-                            // A packet reaching this client is one built for an
-                            // avatar it owns, and an avatar always sees itself.
-                            for (_, pos) in reader.updates() {
-                                if pos.x.floor_meters() > 200 {
-                                    confirmed.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        FromEdge::Message(_) => {}
-                    }
-                }
-            });
 
             wait_until("the region to report every id", stop, || {
-                ids.lock().expect("not poisoned").iter().all(Option::is_some)
+                ids.lock().expect("not poisoned").len() == WANTED
             });
             assert_eq!(
                 edges.entity_count(umwelt::net::EdgeId::from_raw(0)),
@@ -335,7 +344,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
                             (*handle, to)
                         })
                         .collect();
-                    let _ = client.move_entities(&moves);
+                    let _ = sending.move_entities(&moves);
                     std::thread::sleep(Duration::from_millis(10));
                 }
             });
@@ -350,15 +359,21 @@ fn a_game_client_populates_a_region_through_an_edge() {
                 let culled = *culled.lock().expect("not poisoned");
                 let Some(culled) = culled else { return false };
                 let held = ids.lock().expect("not poisoned");
-                let Some(at) = held.iter().position(|id| *id == Some(culled)) else {
+                let Some(&(handle, _)) = held.iter().find(|(_, id)| *id == culled) else {
                     return false;
                 };
-                gone.lock().expect("not poisoned").contains(&handles[at])
+                gone.lock().expect("not poisoned").contains(&handle)
             });
 
             stop.store(true, Ordering::Relaxed);
             let _ = mover.join();
         });
+
+        // Every packet reached its client, checked while there still is one:
+        // the region goes on building packets for a viewer until it hears the
+        // entity is gone, and the ones built during a teardown reach nobody by
+        // definition. That is what `undeliverable` counts.
+        assert_eq!(edge.stats().undeliverable, 0, "every packet reached its client");
 
         // The client goes. Everything it held goes with it, without anything
         // asking for it.
@@ -366,7 +381,6 @@ fn a_game_client_populates_a_region_through_an_edge() {
         wait_until("the region to lose everything the client held", &stop, || {
             edges.entity_count(umwelt::net::EdgeId::from_raw(0)) == 0
         });
-        assert_eq!(edge.stats().undeliverable, 0, "every packet reached its client");
         assert_eq!(sink.failed(), 0, "no publish failed");
     });
 }

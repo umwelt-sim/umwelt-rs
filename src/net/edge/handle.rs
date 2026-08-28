@@ -8,8 +8,8 @@
 //! `docs/adr/0006`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -348,9 +348,20 @@ pub(crate) fn span(now: EdgeStats, before: EdgeStats) -> EdgeLoad {
 ///
 /// Cheap to clone, and every method takes `&self`. Clone it into a timer or a
 /// task and call it from there.
+///
+/// Holds a weak reference, so a game keeping one does not keep the server
+/// alive — the server owns the game, and an owning handle would make a cycle
+/// neither could break. Every call fails cleanly once the
+/// [`EdgeServer`](crate::net::EdgeServer) has been dropped.
 #[derive(Clone)]
 pub struct EdgeHandle {
-    pub(crate) shared: Arc<Shared>,
+    pub(crate) shared: Weak<Shared>,
+}
+
+impl EdgeHandle {
+    fn live(&self) -> Result<Arc<Shared>, NetError> {
+        self.shared.upgrade().ok_or(NetError::Unknown("edge"))
+    }
 }
 
 impl EdgeHandle {
@@ -370,7 +381,7 @@ impl EdgeHandle {
         at: Pos3,
         kind: EntityKind,
     ) -> Result<EntityKey, NetError> {
-        self.shared.ask(Some(client), None, region, at, kind)
+        self.live()?.ask(Some(client), None, region, at, kind)
     }
 
     /// Several at once. Chunked to the message cap here rather than by the
@@ -394,7 +405,7 @@ impl EdgeHandle {
         at: Pos3,
         kind: EntityKind,
     ) -> Result<EntityKey, NetError> {
-        self.shared.ask(None, None, region, at, kind)
+        self.live()?.ask(None, None, region, at, kind)
     }
 
     /// Sends a new absolute position.
@@ -403,28 +414,33 @@ impl EdgeHandle {
     /// refused: removal arrives unprompted, so this is a race and not a
     /// mistake.
     pub fn move_entity(&self, entity: EntityKey, to: Pos3) -> Result<(), NetError> {
-        if !self.shared.set_position(entity, to) {
-            self.shared.count_refused();
+        let shared = self.live()?;
+        if !shared.set_position(entity, to) {
+            shared.count_refused();
         }
         Ok(())
     }
 
     /// Several at once, however many regions the batch spans.
     pub fn move_entities(&self, moves: &[(EntityKey, Pos3)]) -> Result<(), NetError> {
+        let shared = self.live()?;
         for &(entity, to) in moves {
-            self.move_entity(entity, to)?;
+            if !shared.set_position(entity, to) {
+                shared.count_refused();
+            }
         }
         Ok(())
     }
 
     pub fn despawn(&self, entity: EntityKey) -> Result<(), NetError> {
-        self.shared.release(entity);
+        self.live()?.release(entity);
         Ok(())
     }
 
     pub fn despawn_many(&self, entities: &[EntityKey]) -> Result<(), NetError> {
+        let shared = self.live()?;
         for &entity in entities {
-            self.shared.release(entity);
+            shared.release(entity);
         }
         Ok(())
     }
@@ -433,14 +449,15 @@ impl EdgeHandle {
 
     /// Reliable and ordered.
     pub fn send(&self, client: ClientId, body: &[u8]) -> Result<(), NetError> {
-        self.shared.post(client, ToClient::Message(body))
+        self.live()?.post(client, ToClient::Message(body))
     }
 
     /// An unreliable datagram, for anything latest-only.
     pub fn send_datagram(&self, client: ClientId, body: &[u8]) -> Result<(), NetError> {
         let mut framed = Vec::with_capacity(body.len() + 1);
         ToClient::Message(body).encode(&mut framed);
-        let clients = self.shared.clients();
+        let shared = self.live()?;
+        let clients = shared.clients();
         let held = clients.get(&client).ok_or(NetError::Unknown("client"))?;
         held.conn.send_datagram(framed.into())?;
         Ok(())
@@ -455,7 +472,8 @@ impl EdgeHandle {
     /// Closes a client's connection. Its entities are swept as if it had gone
     /// on its own.
     pub fn disconnect(&self, client: ClientId) {
-        let clients = self.shared.clients();
+        let Ok(shared) = self.live() else { return };
+        let clients = shared.clients();
         if let Some(held) = clients.get(&client) {
             held.conn.close(0u32.into(), b"closed by the edge");
         }
@@ -464,11 +482,12 @@ impl EdgeHandle {
     // -- the mapping, maintained for you ----------------------------------
 
     pub fn client_of(&self, entity: EntityKey) -> Option<ClientId> {
-        self.shared.entities().by_key.get(&entity).and_then(|e| e.client)
+        self.live().ok()?.entities().by_key.get(&entity).and_then(|e| e.client)
     }
 
     pub fn entities_of(&self, client: ClientId) -> Vec<EntityKey> {
-        self.shared
+        let Ok(shared) = self.live() else { return Vec::new() };
+        shared
             .clients()
             .get(&client)
             .map(|held| held.keys.iter().copied().collect())
@@ -476,18 +495,19 @@ impl EdgeHandle {
     }
 
     pub fn key_of(&self, region: RegionId, id: EntityId) -> Option<EntityKey> {
-        self.shared.entities().by_id.get(&(region, id)).copied()
+        self.live().ok()?.entities().by_id.get(&(region, id)).copied()
     }
 
     pub fn entity_id(&self, entity: EntityKey) -> Option<(RegionId, EntityId)> {
-        let entities = self.shared.entities();
+        let shared = self.live().ok()?;
+        let entities = shared.entities();
         let held = entities.by_key.get(&entity)?;
         Some((held.region, held.id?))
     }
 
     /// What this edge has done since it started.
     pub fn stats(&self) -> EdgeStats {
-        self.shared.stats()
+        self.live().map(|shared| shared.stats()).unwrap_or_default()
     }
 
 }

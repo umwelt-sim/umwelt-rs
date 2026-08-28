@@ -9,9 +9,10 @@
 //! - [`ids`] is the two identities an edge mints.
 //!
 //! [`EdgeClient`] is a game client's side, and it is what a game developer
-//! holds: four commands, and what the edge says back. Which of them rides a
-//! datagram and which rides a stream is decided here rather than at the call
-//! site.
+//! holds: four commands on a [`ClientHandle`], and a
+//! [`ClientGame`](crate::ClientGame) called with whatever the edge says back.
+//! Which command rides a datagram and which rides a stream is decided here
+//! rather than at the call site, and nothing asks a consumer to poll.
 //!
 //! An [`EdgeServer`] holds a [`RegionClient`](crate::net::RegionClient) on one
 //! side and a QUIC endpoint on the other, and relays. It connects to nothing
@@ -25,7 +26,7 @@ pub mod ids;
 pub mod protocol;
 mod server;
 
-pub use client::{EdgeClient, FromEdge};
+pub use client::{ClientHandle, EdgeClient};
 pub use handle::{EdgeHandle, EdgeStats};
 pub use server::{DEFAULT_HEARTBEAT, EdgeServer};
 pub use ids::{ClientId, EntityKey};

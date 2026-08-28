@@ -98,7 +98,7 @@ impl EdgeServer {
         });
         // The handle exists before the game, and the game before the server, so
         // neither has to be constructed twice.
-        let built = game(EdgeHandle { shared: Arc::clone(&shared) });
+        let built = game(EdgeHandle { shared: Arc::downgrade(&shared) });
         *shared.game.lock().expect("not poisoned") = Box::new(built);
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -150,7 +150,7 @@ impl EdgeServer {
     /// A handle to send through. Cheap to clone.
     #[inline]
     pub fn handle(&self) -> EdgeHandle {
-        EdgeHandle { shared: Arc::clone(&self.shared) }
+        EdgeHandle { shared: Arc::downgrade(&self.shared) }
     }
 
     /// What this edge has done since it started.

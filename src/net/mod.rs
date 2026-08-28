@@ -1,8 +1,14 @@
 //! Networking, in two protocols that are kept apart.
 //!
 //! There are two links in this architecture and they have almost nothing in
-//! common. Sharing types between them would be the easy mistake, so they are
-//! separate modules and this one holds only what is genuinely common.
+//! common. Sharing a *message* between them would be the easy mistake, so they
+//! are separate modules and neither reaches into the other's protocol.
+//!
+//! What they do share is the vocabulary underneath both — [`RegionId`],
+//! [`EntityId`](crate::EntityId), [`EntityKind`] — because those name things in
+//! the world rather than things on a wire, and duplicating them per link would
+//! mean converting between two spellings of the same id at every hop. They also
+//! share one decoder, `wire::Cursor`, which belongs to neither.
 //!
 //! **Region to edge** — [`region`], built, over NATS. A region simulation and
 //! the edges relaying for it: few peers, deployed together and updated
@@ -74,6 +80,7 @@ pub mod control;
 pub mod edge;
 mod error;
 pub mod region;
+pub(crate) mod wire;
 
 pub use control::{EdgeHeartbeat, EdgeLoad, Heartbeat, RegionLoad};
 pub use edge::{

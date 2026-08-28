@@ -8,19 +8,17 @@
 //! `docs/adr/0006`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::entity::EntityId;
 use crate::game::EdgeGame;
 use crate::net::control::EdgeLoad;
 use crate::net::edge::ids::{ClientId, EntityKey, Mint};
-use crate::net::edge::protocol::{Framer, ToClient};
+use crate::net::edge::protocol::{EdgeInfo, ToClient};
 use crate::net::error::NetError;
 use crate::net::region::RegionClient;
-use crate::net::edge::protocol::EdgeInfo;
 use crate::net::region::protocol::{EntityKind, Presence, RegionId, Spawn};
 use crate::pos::Pos3;
 
@@ -48,6 +46,10 @@ pub struct EdgeStats {
 
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
+    /// Entities with a client behind them, kept current rather than counted on
+    /// demand: `stats` is on a path a consumer may call every second, and
+    /// scanning every entity for it holds the lock the relay path needs.
+    observers: AtomicU32,
     relayed: AtomicU64,
     undeliverable: AtomicU64,
     commands: AtomicU64,
@@ -60,10 +62,16 @@ pub(crate) struct Client {
     /// Reliable messages, drained by this connection's writer task. A channel
     /// because writing a QUIC stream is async and sending is not.
     pub(crate) out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    /// This connection's own names for the entities it asked for.
+    /// An index into [`keys`](Self::keys): this connection's own names for
+    /// the entities it asked for.
+    ///
+    /// Kept separate rather than folded in because it is read on the per-move
+    /// path — every move a client sends names a handle — and one map keyed by
+    /// [`EntityKey`] would make that a scan. The two are maintained together in
+    /// `ask` and `forget`, and a test pins that they agree.
     pub(crate) handles: HashMap<u32, EntityKey>,
-    /// Everything bound to it, including entities the consumer asked for on
-    /// its behalf.
+    /// Everything bound to this client, including entities the consumer asked
+    /// for on its behalf, which have no handle of the client's own.
     pub(crate) keys: HashSet<EntityKey>,
     /// Its entities are being swept. `disconnected` fires when the last one
     /// is gone, so nothing about it is delivered after that call.
@@ -76,13 +84,15 @@ pub(crate) struct Entity {
     /// The asking client's own name for it, if a client asked.
     pub(crate) handle: Option<u32>,
     pub(crate) region: RegionId,
-    pub(crate) observes: bool,
+    pub(crate) kind: EntityKind,
     /// `None` until the region reports the id it allocated.
     pub(crate) id: Option<EntityId>,
     /// Where it should be, held until the region reports an id to move. At
     /// most one, because a position is latest-only.
     pub(crate) pending: Option<Pos3>,
-    /// Given back before the region confirmed it. Despawned on arrival.
+    /// Given back, and waiting for the region to say it has gone. Nothing is
+    /// sent under it in the meantime; an entity given back before the region
+    /// answered at all is forgotten outright instead.
     pub(crate) doomed: bool,
 }
 
@@ -90,6 +100,15 @@ pub(crate) struct Entity {
 pub(crate) struct Entities {
     pub(crate) by_key: HashMap<EntityKey, Entity>,
     pub(crate) by_id: HashMap<(RegionId, EntityId), EntityKey>,
+}
+
+/// Which way a message travels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transport {
+    /// Reliable and ordered.
+    Stream,
+    /// Unreliable, unordered, one message per packet.
+    Datagram,
 }
 
 /// Something to say to a region.
@@ -165,59 +184,95 @@ impl Shared {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Puts one message on a client's connection.
-    ///
-    /// Latest-only messages ride a datagram and everything else rides the
-    /// reliable stream, which is what [`ToClient::is_latest_only`] decides.
+    /// Puts one message on a client's connection, on the transport its kind
+    /// calls for: latest-only messages ride a datagram, everything else the
+    /// reliable stream.
     pub(crate) fn post(&self, client: ClientId, message: ToClient<'_>) -> Result<(), NetError> {
-        let mut body = Vec::new();
-        message.encode(&mut body);
+        let by = if message.is_latest_only() {
+            Transport::Datagram
+        } else {
+            Transport::Stream
+        };
+        self.post_by(client, message, by)
+    }
+
+    /// Puts one message on a named transport.
+    ///
+    /// Separate from [`post`](Self::post) only because a consumer's own
+    /// messages can go either way, and the kind alone cannot say which.
+    pub(crate) fn post_by(
+        &self,
+        client: ClientId,
+        message: ToClient<'_>,
+        by: Transport,
+    ) -> Result<(), NetError> {
+        // Framed in place: the length prefix is reserved and filled in, rather
+        // than encoding once and copying into a second buffer to prefix it.
+        let mut framed = vec![0u8; 4];
+        message.encode_onto(&mut framed);
+        let body = &framed[4..];
         let clients = self.clients();
         let held = clients.get(&client).ok_or(NetError::Unknown("client"))?;
-        if message.is_latest_only() {
+        if by == Transport::Datagram {
             // Dropped rather than queued when the connection has no room. State
             // is latest-only, so a packet waiting behind staler ones is worth
             // less than the one after it, and filling a send buffer with them
             // only delays what a client actually wants. `Handoff` makes the
             // same call on the region side, for the same data.
-            if held.conn.datagram_send_buffer_space() < body.len() {
+            // Two ways not to fit, given the same answer rather than one
+            // anticipated and one discovered: no room left in the send buffer,
+            // and a packet larger than the path will carry at all. quinn
+            // refuses the second rather than fragmenting.
+            if held.conn.max_datagram_size().is_none_or(|room| room < body.len())
+                || held.conn.datagram_send_buffer_space() < body.len()
+            {
                 return Err(NetError::Congested);
             }
-            // A packet at the region's full budget plus this header can exceed
-            // what the path will carry, and quinn refuses rather than
-            // fragmenting. That shows up as `undeliverable` rather than as a
-            // silent truncation.
-            held.conn.send_datagram(body.into())?;
+            held.conn.send_datagram(framed.split_off(4).into())?;
         } else {
-            let mut framed = Vec::with_capacity(body.len() + 4);
-            Framer::frame(&body, &mut framed);
+            let len = (framed.len() - 4) as u32;
+            framed[..4].copy_from_slice(&len.to_le_bytes());
             held.out.send(framed).map_err(|_| NetError::Unknown("client"))?;
         }
         Ok(())
     }
 
-    /// Where an entity should be. `false` if this edge does not hold the key.
+    /// Where entities should be, for those this edge is still holding.
     ///
-    /// Held rather than sent if the region has not yet said which id it is. At
-    /// most one is held, because a position is latest-only.
-    pub(crate) fn set_position(&self, key: EntityKey, to: Pos3) -> bool {
-        let mut entities = self.entities();
-        let Some(held) = entities.by_key.get_mut(&key) else { return false };
-        // Already given back. Whoever is still moving it has not been told yet,
-        // so this is not their mistake — but a region refuses a move for an
-        // entity it has despawned, and there is no reason to send one.
-        if held.doomed {
-            return true;
-        }
-        let region = held.region;
-        match held.id {
-            Some(id) => {
-                drop(entities);
-                self.queue_move(region, id, to);
+    /// A position is held rather than queued if the region has not yet said
+    /// which id it is; at most one is held, because a position is latest-only.
+    /// A key this edge is not holding is skipped: removal arrives unprompted,
+    /// so acting on an entity that has just gone is a race.
+    ///
+    /// Takes each lock once for the whole batch. A client with any real number
+    /// of entities moves them all at once, so taking them per entity made the
+    /// number of acquisitions the number of entities.
+    pub(crate) fn set_positions(&self, moves: impl IntoIterator<Item = (EntityKey, Pos3)>) {
+        let mut queued: Vec<((RegionId, EntityId), Pos3)> = Vec::new();
+        {
+            let mut entities = self.entities();
+            for (key, to) in moves {
+                let Some(held) = entities.by_key.get_mut(&key) else { continue };
+                if held.doomed {
+                    continue;
+                }
+                match held.id {
+                    Some(id) => queued.push(((held.region, id), to)),
+                    None => held.pending = Some(to),
+                }
             }
-            None => held.pending = Some(to),
         }
-        true
+        if queued.is_empty() {
+            return;
+        }
+        let mut waiting = self.moves.lock().expect("not poisoned");
+        waiting.extend(queued);
+    }
+
+    /// One entity's position. Use [`set_positions`](Self::set_positions) for
+    /// more than one.
+    pub(crate) fn set_position(&self, key: EntityKey, to: Pos3) {
+        self.set_positions([(key, to)]);
     }
 
     /// Queues a position, latest wins.
@@ -258,7 +313,7 @@ impl Shared {
                 client,
                 handle,
                 region,
-                observes: kind.observes(),
+                kind,
                 id: None,
                 pending: None,
                 doomed: false,
@@ -271,7 +326,14 @@ impl Shared {
                 if let Some(handle) = handle {
                     held.handles.insert(handle, key);
                 }
+                debug_assert!(
+                    held.handles.values().all(|k| held.keys.contains(k)),
+                    "the handle index named an entity this client does not hold"
+                );
             }
+        }
+        if kind.observes() {
+            self.counters.observers.fetch_add(1, Ordering::Relaxed);
         }
         // The key is the correlation token: unique to this edge, never reused,
         // and echoed back by the region without being looked inside.
@@ -306,6 +368,9 @@ impl Shared {
     pub(crate) fn forget(&self, key: EntityKey) -> Option<Entity> {
         let mut entities = self.entities();
         let entity = entities.by_key.remove(&key)?;
+        if entity.kind.observes() {
+            self.counters.observers.fetch_sub(1, Ordering::Relaxed);
+        }
         if let Some(id) = entity.id {
             entities.by_id.remove(&(entity.region, id));
         }
@@ -317,6 +382,10 @@ impl Shared {
                 if let Some(handle) = entity.handle {
                     held.handles.remove(&handle);
                 }
+                debug_assert!(
+                    held.handles.values().all(|k| held.keys.contains(k)),
+                    "the handle index outlived the entity it named"
+                );
             }
         }
         Some(entity)
@@ -328,7 +397,7 @@ impl Shared {
         EdgeStats {
             clients,
             entities: entities.by_key.len() as u32,
-            observers: entities.by_key.values().filter(|e| e.observes).count() as u32,
+            observers: self.counters.observers.load(Ordering::Relaxed),
             relayed: self.counters.relayed.load(Ordering::Relaxed),
             undeliverable: self.counters.undeliverable.load(Ordering::Relaxed),
             commands: self.counters.commands.load(Ordering::Relaxed),
@@ -399,15 +468,22 @@ impl EdgeHandle {
         self.live()?.ask(Some(client), None, region, at, kind)
     }
 
-    /// Several at once. Chunked to the message cap here rather than by the
-    /// caller.
+    /// Several at once.
+    ///
+    /// Each is queued for the region thread, which groups a batch by region
+    /// and hands it to `RegionClient`; the message cap is applied there, not
+    /// by the caller and not here.
     pub fn spawn_many(
         &self,
         client: ClientId,
         region: RegionId,
         wanted: &[(Pos3, EntityKind)],
     ) -> Result<Vec<EntityKey>, NetError> {
-        wanted.iter().map(|&(at, kind)| self.spawn(client, region, at, kind)).collect()
+        let shared = self.live()?;
+        wanted
+            .iter()
+            .map(|&(at, kind)| shared.ask(Some(client), None, region, at, kind))
+            .collect()
     }
 
     /// An entity with no client behind it, which lives until this edge does.
@@ -436,10 +512,7 @@ impl EdgeHandle {
 
     /// Several at once, however many regions the batch spans.
     pub fn move_entities(&self, moves: &[(EntityKey, Pos3)]) -> Result<(), NetError> {
-        let shared = self.live()?;
-        for &(entity, to) in moves {
-            shared.set_position(entity, to);
-        }
+        self.live()?.set_positions(moves.iter().copied());
         Ok(())
     }
 
@@ -464,14 +537,12 @@ impl EdgeHandle {
     }
 
     /// An unreliable datagram, for anything latest-only.
+    ///
+    /// Dropped rather than queued when the connection has no room, on the same
+    /// terms as the state umwelt sends: a datagram waiting behind staler ones
+    /// is worth less than the one after it.
     pub fn send_datagram(&self, client: ClientId, body: &[u8]) -> Result<(), NetError> {
-        let mut framed = Vec::with_capacity(body.len() + 1);
-        ToClient::Message(body).encode(&mut framed);
-        let shared = self.live()?;
-        let clients = shared.clients();
-        let held = clients.get(&client).ok_or(NetError::Unknown("client"))?;
-        held.conn.send_datagram(framed.into())?;
-        Ok(())
+        self.live()?.post_by(client, ToClient::Message(body), Transport::Datagram)
     }
 
     /// To whoever owns this entity, if anyone does.
@@ -592,5 +663,9 @@ pub(crate) fn finish_leaving(shared: &Arc<Shared>, client: ClientId) {
         return;
     }
     shared.clients().remove(&client);
+    // Nothing will name this client again and its id is never reused, so every
+    // record of it goes. Left behind, `told` gains an entry per client per
+    // region for the life of the process.
+    shared.told.lock().expect("not poisoned").retain(|(held, _)| *held != client);
     shared.with_game(|game| game.disconnected(client));
 }

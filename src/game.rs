@@ -4,16 +4,21 @@
 //! is an edge's, called when a client connects, says something, or goes away.
 //! [`ClientGame`] is a game client's, called when the edge says something back.
 //!
-//! They live here rather than beside the tier that calls them because they are
-//! the consumer's extension points and belong together, and because neither
-//! belongs inside a networking module. See `docs/adr/0006`.
+//! They live here rather than beside the tier that calls each one because they
+//! are the consumer's extension points and a consumer looks for them together,
+//! not one per module. See `docs/adr/0006`.
+//!
+//! Two of the three are written in networking vocabulary, and this module
+//! depends on `net` to say so. That is the cost of keeping them together: the
+//! alternative is a consumer hunting three modules for the three things it has
+//! to write.
 
 use std::net::SocketAddr;
 
 use crate::entity::EntityId;
 use crate::net::edge::{ClientId, EntityKey};
-use crate::packet::PacketReader;
 use crate::net::region::protocol::RegionId;
+use crate::packet::PacketReader;
 use crate::sim::Step;
 
 /// The consumer's game, called once per tick.

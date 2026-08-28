@@ -320,8 +320,12 @@ pub struct Outbound<'a> {
 /// skipped, and only the simulation knows how many viewers it served. So the
 /// simulation accumulates both, and whatever publishes a heartbeat drains it.
 /// See `docs/adr/0007`.
+///
+/// Not public: the only thing that can fill one is the pacing loop, and the
+/// only thing that drains one is the heartbeat. A consumer handed the type
+/// could do neither.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TickSpan {
+pub(crate) struct TickSpan {
     pub ticks: u32,
     /// Viewers served, summed over the span rather than averaged, so a reader
     /// can divide by whatever window it cares about.
@@ -338,7 +342,7 @@ pub struct TickSpan {
 impl TickSpan {
     /// Folds another span into this one. Worst takes the larger; everything
     /// else adds.
-    pub fn merge(&mut self, o: TickSpan) {
+    pub(crate) fn merge(&mut self, o: TickSpan) {
         self.ticks += o.ticks;
         self.viewers += o.viewers;
         self.spent += o.spent;
@@ -348,7 +352,7 @@ impl TickSpan {
     }
 
     /// Mean time inside a tick over the span, or zero if it holds no ticks.
-    pub fn mean(&self) -> Duration {
+    pub(crate) fn mean(&self) -> Duration {
         self.spent.checked_div(self.ticks).unwrap_or_default()
     }
 }

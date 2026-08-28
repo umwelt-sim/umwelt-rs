@@ -1373,10 +1373,15 @@ second region and 64 entities of the edge's own walking between the two, 336
 migrations completed in 18 seconds with nothing lost and nothing refused. These
 are wiring figures from a laptop; §Whole-pipeline is what to quote for cost.
 
-**A client's moves are batched, up to 68 to a datagram.** One datagram per
-entity is one per entity per tick: 163,840 a second at 8,192 entities and 20 Hz,
-each carrying sixteen bytes of payload. Batching saves almost no bytes — 68
-moves are 1,093 together against 1,156 apart — and 68 times the packets.
+**A client's moves are batched.** One datagram per entity is one per entity per
+tick: 163,840 a second at 8,192 entities and 20 Hz, each carrying sixteen bytes
+of payload. Batching saves almost no bytes and about seventy times the packets.
+
+How many fit is the connection's answer rather than a constant's. A sender asks
+`max_datagram_size` and takes whichever is smaller, that or the protocol's cap;
+sizing to a guess would mean every batch refused on a path with a smaller MTU
+than the one it was guessed against. The cap stays fixed because a decoder has
+to bound what it allocates for a claimed count.
 
 **Neither end queues state it cannot send.** Both check the connection's
 datagram send buffer and drop rather than enqueue, which is the call `Handoff`

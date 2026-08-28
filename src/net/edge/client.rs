@@ -25,7 +25,9 @@ use tokio::task::JoinHandle;
 use crate::codec::RecordCodec;
 use crate::game::ClientGame;
 use crate::packet::PacketReader;
-use crate::net::edge::protocol::{Framer, FromClient, MAX_MOVES_PER_DATAGRAM, ToClient};
+use crate::net::edge::protocol::{
+    Framer, FromClient, MAX_MOVES_PER_DATAGRAM, MOVES_HEADER_BYTES, MOVE_BYTES, ToClient,
+};
 use crate::net::error::NetError;
 use crate::net::region::protocol::{EntityKind, RegionId};
 use crate::pos::Pos3;
@@ -204,6 +206,13 @@ impl ClientHandle {
     /// datagram can reach the edge before the spawn that named the handle.
     pub fn move_entities(&self, moves: &[(u32, Pos3)]) -> Result<(), NetError> {
         let shared = self.live()?;
+        // How many fit is the connection's answer, not a constant's: the path
+        // decides what a datagram may carry, and a smaller one than loopback's
+        // would refuse every batch sized to a guess. The protocol cap still
+        // applies, because a decoder has to bound what it allocates.
+        let room = shared.conn.max_datagram_size().unwrap_or(0);
+        let per_batch = room.saturating_sub(MOVES_HEADER_BYTES) / MOVE_BYTES;
+        let per_batch = per_batch.clamp(1, MAX_MOVES_PER_DATAGRAM);
         let mut batch: Vec<(u32, Pos3)> = Vec::new();
         for &(handle, to) in moves {
             let first = {
@@ -218,7 +227,7 @@ impl ClientHandle {
                 continue;
             }
             batch.push((handle, to));
-            if batch.len() == MAX_MOVES_PER_DATAGRAM {
+            if batch.len() == per_batch {
                 datagram(&shared, &FromClient::Moves(std::mem::take(&mut batch)))?;
             }
         }

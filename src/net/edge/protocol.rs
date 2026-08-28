@@ -19,7 +19,8 @@
 use crate::entity::EntityId;
 use crate::fixed::Fixed;
 use crate::net::error::NetError;
-use crate::net::region::protocol::{Cursor, EntityKind, RegionId};
+use crate::net::region::protocol::{EntityKind, RegionId};
+use crate::net::wire::Cursor;
 use crate::pos::Pos3;
 
 /// One kind space across both directions, so a message is never ambiguous
@@ -45,16 +46,22 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const POS_BYTES: usize = 12;
 
 /// Bytes one move in a batch takes: a handle and a position.
-const MOVE_BYTES: usize = 4 + POS_BYTES;
+pub const MOVE_BYTES: usize = 4 + POS_BYTES;
+
+/// Bytes a batch spends before its first move: the kind byte and the count.
+pub const MOVES_HEADER_BYTES: usize = 5;
 
 /// Most moves one [`FromClient::Moves`] may carry.
 ///
-/// Sized to fit a datagram at any path MTU worth serving, with room for the
-/// kind byte and the count. A client with more entities than this sends more
-/// datagrams — but one each, which is what a naive client does, is a datagram
-/// per entity per tick: 163,840 a second at 8,192 entities and 20 Hz, each
-/// carrying sixteen bytes of payload in a twelve-hundred-byte packet.
-pub const MAX_MOVES_PER_DATAGRAM: usize = (1100 - 5) / MOVE_BYTES;
+/// A decoder has to bound what it allocates for a claimed count, so this is
+/// fixed. A *sender* sizes each batch against what its connection says a
+/// datagram may carry and takes whichever is smaller — a path with a smaller
+/// MTU than this assumes would otherwise have every batch refused.
+///
+/// Sending one datagram per entity instead is one per entity per tick: 163,840
+/// a second at 8,192 entities and 20 Hz, each carrying sixteen bytes of payload
+/// in a twelve-hundred-byte packet.
+pub const MAX_MOVES_PER_DATAGRAM: usize = (1200 - MOVES_HEADER_BYTES) / MOVE_BYTES;
 
 /// What a client is told about a region: only what it needs to read that
 /// region's packets.
@@ -232,6 +239,13 @@ impl ToClient<'_> {
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
+        self.encode_onto(out);
+    }
+
+    /// Appends, so a caller framing on a stream can reserve the length prefix
+    /// first and fill it in after, rather than encoding into one buffer and
+    /// copying into another to put four bytes in front.
+    pub(crate) fn encode_onto(&self, out: &mut Vec<u8>) {
         match self {
             ToClient::Region(info) => {
                 out.push(KIND_REGION);
@@ -477,8 +491,8 @@ mod tests {
         let mut framed = Vec::new();
         FromClient::Moves(batch.clone()).encode(&mut framed);
         assert!(
-            framed.len() <= 1100,
-            "a full batch is {} bytes and must fit a datagram",
+            framed.len() <= 1200,
+            "a full batch is {} bytes and must fit the protocol's own cap",
             framed.len()
         );
         assert_eq!(FromClient::decode(&framed).expect("well formed"), FromClient::Moves(batch));

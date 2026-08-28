@@ -15,6 +15,6 @@ pub use handoff::Handoff;
 pub use sink::{NullSink, PayloadSink, RecordingSink};
 pub use viewer::{ClientLimits, ViewerId};
 pub use world::{
-    DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP, Outbound, Step, TickStats,
+    DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP, Outbound, Step, TickSpan, TickStats,
     WorldSimulation,
 };

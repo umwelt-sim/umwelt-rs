@@ -925,6 +925,11 @@ impl<'a> Cursor<'a> {
         Ok(self.take(1)?[0])
     }
 
+    /// A run of bytes, for a length-prefixed field.
+    pub(crate) fn bytes(&mut self, n: usize) -> Result<&'a [u8], NetError> {
+        self.take(n)
+    }
+
     pub(crate) fn u16(&mut self) -> Result<u16, NetError> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))

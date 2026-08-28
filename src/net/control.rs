@@ -17,6 +17,7 @@ use core::fmt;
 use std::time::Duration;
 
 use crate::net::error::NetError;
+use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{Cursor, ProtocolVersion, RegionId, ServerVersion};
 
 /// One region's heartbeat subject.
@@ -27,6 +28,16 @@ pub fn subject(region: RegionId) -> String {
 /// Every region's, for a watcher that wants the whole tier.
 pub fn all_subjects() -> &'static str {
     "umwelt.control.region.*.heartbeat"
+}
+
+/// One edge's heartbeat subject.
+pub fn edge_subject(edge: &EdgeName) -> String {
+    format!("umwelt.control.edge.{edge}.heartbeat")
+}
+
+/// Every edge's. Edges are cattle, and a herd is still worth watching.
+pub fn all_edge_subjects() -> &'static str {
+    "umwelt.control.edge.*.heartbeat"
 }
 
 /// What only the region's own loop can report.
@@ -135,6 +146,128 @@ impl fmt::Display for Heartbeat {
     }
 }
 
+/// What only an edge can count about itself.
+///
+/// The counters are over the span since the previous heartbeat, not a fixed
+/// second, because the interval is a deployment choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeLoad {
+    /// Game clients connected right now.
+    pub clients: u32,
+    /// Entities this edge manages, across every region.
+    pub entities: u32,
+    /// How many of those have a client behind them and so cost a viewer.
+    pub observers: u32,
+    /// State packets put on a client's connection.
+    pub relayed: u64,
+    /// State packets that reached no client: it had gone, or its datagram
+    /// queue was full.
+    pub undeliverable: u64,
+    /// Commands read off client connections.
+    pub commands: u64,
+    /// Commands this edge declined: an unknown handle, or one belonging to
+    /// another connection.
+    ///
+    /// Not commands a *region* declined. A region counts those per edge and
+    /// never tells the edge, so an edge cannot report a number it does not
+    /// have. See `docs/adr/0007`.
+    pub refused: u64,
+}
+
+/// An edge saying what it is and how it is doing.
+///
+/// No address. An edge's listening address is unlikely to be usable by whatever
+/// reads the control plane, which may be on another host, another VM or in
+/// another VPC, and a game client is told where to connect by the game's
+/// matchmaking rather than by umwelt. See `docs/adr/0007`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeHeartbeat {
+    pub edge: EdgeName,
+    pub protocol: ProtocolVersion,
+    pub server: ServerVersion,
+    /// Regions this edge currently holds entities in.
+    pub regions: Vec<RegionId>,
+    pub load: EdgeLoad,
+}
+
+impl EdgeHeartbeat {
+    /// Everything but the name and the region list, both of which vary.
+    pub const FIXED_BYTES: usize = 55;
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        let name = self.edge.as_str().as_bytes();
+        // An `EdgeName` is at most 64 bytes, checked when it was built.
+        out.push(name.len() as u8);
+        out.extend_from_slice(name);
+        out.extend_from_slice(&self.protocol.raw().to_le_bytes());
+        out.extend_from_slice(&self.server.major.to_le_bytes());
+        out.extend_from_slice(&self.server.minor.to_le_bytes());
+        out.extend_from_slice(&self.server.patch.to_le_bytes());
+        out.extend_from_slice(&(self.regions.len() as u16).to_le_bytes());
+        for region in &self.regions {
+            out.extend_from_slice(&region.raw().to_le_bytes());
+        }
+        out.extend_from_slice(&self.load.clients.to_le_bytes());
+        out.extend_from_slice(&self.load.entities.to_le_bytes());
+        out.extend_from_slice(&self.load.observers.to_le_bytes());
+        out.extend_from_slice(&self.load.relayed.to_le_bytes());
+        out.extend_from_slice(&self.load.undeliverable.to_le_bytes());
+        out.extend_from_slice(&self.load.commands.to_le_bytes());
+        out.extend_from_slice(&self.load.refused.to_le_bytes());
+    }
+
+    pub fn decode(body: &[u8]) -> Result<EdgeHeartbeat, NetError> {
+        let mut c = Cursor::new(body, "edge heartbeat");
+        let len = c.u8()? as usize;
+        let name = core::str::from_utf8(c.bytes(len)?)
+            .map_err(|_| NetError::Malformed("edge heartbeat"))?;
+        // Through the same validation any other name goes through, so a name
+        // that could address another edge's subjects does not decode.
+        let edge = EdgeName::new(name)?;
+        let protocol = ProtocolVersion::from_raw(c.u16()?);
+        let server = ServerVersion { major: c.u16()?, minor: c.u16()?, patch: c.u16()? };
+        let count = c.u16()? as usize;
+        let mut regions = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            regions.push(RegionId::from_raw(c.u32()?));
+        }
+        let load = EdgeLoad {
+            clients: c.u32()?,
+            entities: c.u32()?,
+            observers: c.u32()?,
+            relayed: c.u64()?,
+            undeliverable: c.u64()?,
+            commands: c.u64()?,
+            refused: c.u64()?,
+        };
+        c.finish()?;
+        Ok(EdgeHeartbeat { edge, protocol, server, regions, load })
+    }
+}
+
+impl fmt::Display for EdgeHeartbeat {
+    /// One line, for a watcher that has nothing more elaborate to do with it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "edge {} umwelt {} proto {} | {} clients | {} entities, {} observing | \
+             {} regions | relayed {}, undeliverable {} | commands {}, refused {}",
+            self.edge,
+            self.server,
+            self.protocol,
+            self.load.clients,
+            self.load.entities,
+            self.load.observers,
+            self.regions.len(),
+            self.load.relayed,
+            self.load.undeliverable,
+            self.load.commands,
+            self.load.refused,
+        )
+    }
+}
+
 /// A tick longer than four seconds saturates rather than wrapping. Anything
 /// near it is already a failure the numbers beside it will show.
 fn nanos(d: Duration) -> u32 {
@@ -190,6 +323,82 @@ mod tests {
         sample().encode(&mut buf);
         buf.push(0);
         assert!(Heartbeat::decode(&buf).is_err());
+    }
+
+    fn edge_sample() -> EdgeHeartbeat {
+        EdgeHeartbeat {
+            edge: EdgeName::new("herd-3fd3d8").expect("valid name"),
+            protocol: PROTOCOL_VERSION,
+            server: ServerVersion::CURRENT,
+            regions: vec![RegionId::from_raw(7), RegionId::from_raw(8)],
+            load: EdgeLoad {
+                clients: 512,
+                entities: 1_024,
+                observers: 512,
+                relayed: 10_240,
+                undeliverable: 3,
+                commands: 20_480,
+                refused: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn an_edge_heartbeat_round_trips() {
+        let m = edge_sample();
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(EdgeHeartbeat::decode(&buf).expect("well formed"), m);
+    }
+
+    #[test]
+    fn an_edge_heartbeat_is_its_fixed_part_plus_what_varies() {
+        let m = edge_sample();
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        let varies = m.edge.as_str().len() + m.regions.len() * 4;
+        assert_eq!(buf.len(), EdgeHeartbeat::FIXED_BYTES + varies);
+    }
+
+    #[test]
+    fn an_edge_heartbeat_carries_no_regions_when_it_holds_nothing() {
+        let mut m = edge_sample();
+        m.regions.clear();
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        assert_eq!(EdgeHeartbeat::decode(&buf).expect("well formed"), m);
+    }
+
+    #[test]
+    fn a_truncated_edge_heartbeat_is_refused() {
+        let mut buf = Vec::new();
+        edge_sample().encode(&mut buf);
+        for cut in 0..buf.len() {
+            assert!(
+                EdgeHeartbeat::decode(&buf[..cut]).is_err(),
+                "{cut} bytes must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_after_an_edge_heartbeat_are_refused() {
+        let mut buf = Vec::new();
+        edge_sample().encode(&mut buf);
+        buf.push(0);
+        assert!(EdgeHeartbeat::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn an_edge_name_that_could_address_another_edge_does_not_decode() {
+        // The name is validated on the way back in, not only on the way out, so
+        // a hand-built message cannot smuggle a wildcard through a watcher.
+        let mut buf = Vec::new();
+        edge_sample().encode(&mut buf);
+        let name = b"herd-3fd3d8";
+        let at = 1 + name.iter().position(|&b| b == b'3').expect("in the name");
+        buf[at] = b'*';
+        assert!(EdgeHeartbeat::decode(&buf).is_err());
     }
 
     #[test]

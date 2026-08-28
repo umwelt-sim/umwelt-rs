@@ -48,7 +48,8 @@ use crate::net::region::protocol::{
 use crate::net::region::subjects;
 use crate::pos::Pos3;
 use crate::game::Game;
-use crate::sim::{ClientLimits, PayloadSink, Step, ViewerId, WorldSimulation};
+use crate::net::control::RegionLoad;
+use crate::sim::{ClientLimits, PayloadSink, Step, TickSpan, ViewerId, WorldSimulation};
 
 /// No viewer watches this entity. Reserved in the entity-to-viewer map.
 const NO_WATCHER: u32 = u32::MAX;
@@ -88,6 +89,23 @@ pub struct Settled {
     pub reported: u32,
 }
 
+/// What a region has been doing, between heartbeats.
+///
+/// `Inbound` holds it because `Inbound` is the one thing both ends touch: the
+/// tick calls [`apply`](Inbound::apply) and [`settle`](Inbound::settle), and
+/// [`RegionServer`](crate::net::RegionServer) holds an `Arc` of it. Neither
+/// call is optional, so nothing has to be wired up for this to fill in. See
+/// `docs/adr/0007`.
+#[derive(Debug, Default)]
+struct Load {
+    /// Overwritten every tick: what the region holds right now.
+    tick_count: u32,
+    entities: u32,
+    slots: u32,
+    /// Accumulated until a heartbeat drains it.
+    span: TickSpan,
+}
+
 /// Commands from every edge, and the bookkeeping that outlives one tick.
 #[derive(Debug)]
 pub struct Inbound {
@@ -105,6 +123,7 @@ pub struct Inbound {
     watchers: Mutex<Vec<u32>>,
     received: AtomicU64,
     refused: AtomicU64,
+    load: Mutex<Load>,
 }
 
 impl Inbound {
@@ -117,6 +136,29 @@ impl Inbound {
             watchers: Mutex::new(Vec::new()),
             received: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            load: Mutex::new(Load::default()),
+        }
+    }
+
+    /// Takes the load accumulated since the last call.
+    ///
+    /// Not public: a heartbeat drains this, and a second caller would silently
+    /// take half the numbers away from the first.
+    pub(crate) fn take_load(&self) -> RegionLoad {
+        let mut load = self.load.lock().expect("not poisoned");
+        let span = std::mem::take(&mut load.span);
+        RegionLoad {
+            tick_count: load.tick_count,
+            entities: load.entities,
+            slots: load.slots,
+            viewers: span
+                .viewers
+                .checked_div(u64::from(span.ticks))
+                .unwrap_or_default() as u32,
+            mean_tick: span.mean(),
+            worst_tick: span.worst,
+            late: span.late,
+            dropped: span.dropped,
         }
     }
 
@@ -329,6 +371,17 @@ impl Inbound {
             if sink.presence(edge, added).is_ok() {
                 out.reported += 1;
             }
+        }
+
+        // The heartbeat's numbers, taken where the tick and the server meet.
+        // This is the only call that holds the simulation and is also reachable
+        // from `RegionServer`, so it is where the two are joined.
+        {
+            let mut load = self.load.lock().expect("not poisoned");
+            load.tick_count = sim.tick_count();
+            load.entities = sim.entity_count() as u32;
+            load.slots = sim.slots() as u32;
+            load.span.merge(sim.take_span());
         }
 
         out

@@ -12,6 +12,7 @@
 //! that thread is the one that publishes. See `docs/adr/0001`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -19,7 +20,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::config::WorldConfig;
-use crate::net::control::{self, Heartbeat, RegionLoad};
+use crate::net::control::{self, Heartbeat};
 use crate::net::error::NetError;
 use crate::net::region::edges::Edges;
 use crate::net::region::protocol::{
@@ -31,13 +32,28 @@ use crate::net::region::subjects;
 /// How often silence is checked against the caller's timeout.
 const SWEEP: Duration = Duration::from_secs(1);
 
+/// How often a region publishes what it is carrying, until told otherwise.
+///
+/// A control plane runs at human timescales, so this is far slower than
+/// anything else here. See `docs/adr/0007`.
+pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// How often the heartbeat task wakes to see whether it is due.
+///
+/// Coarse on purpose: the interval it is checking against is measured in tens
+/// of seconds, and a quarter second of slop against that is not worth a timer
+/// that has to be rebuilt every time the interval changes.
+const HEARTBEAT_GRANULARITY: Duration = Duration::from_millis(250);
+
 /// A region's front door.
 pub struct RegionServer {
     region: RegionId,
     config: WorldConfig,
     client: async_nats::Client,
-    runtime: Handle,
     edges: Arc<Edges>,
+    /// Nanoseconds between heartbeats, read by the task each time it wakes.
+    /// Zero switches them off.
+    heartbeat: Arc<AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -82,7 +98,17 @@ impl RegionServer {
             }
         }));
 
-        Ok(RegionServer { region, config, client, runtime, edges, tasks })
+        let heartbeat = Arc::new(AtomicU64::new(DEFAULT_HEARTBEAT.as_nanos() as u64));
+        tasks.push(runtime.spawn(Self::beat(
+            client.clone(),
+            region,
+            config,
+            Arc::clone(&edges),
+            Arc::clone(&inbound),
+            Arc::clone(&heartbeat),
+        )));
+
+        Ok(RegionServer { region, config, client, edges, heartbeat, tasks })
     }
 
     #[inline]
@@ -101,26 +127,62 @@ impl RegionServer {
         &self.edges
     }
 
-    /// Publishes one heartbeat.
+    /// How often this region says what it is carrying.
     ///
-    /// Called by the consumer, as often as it wants. The library holds no timer
-    /// and defines no cadence; see `docs/adr/0002`. The consumer supplies what
-    /// only its loop knows, and this fills in the region, the versions, the
-    /// world digest and the edge count.
-    pub fn heartbeat(&self, load: RegionLoad) -> Result<(), NetError> {
-        let beat = Heartbeat {
-            region: self.region,
-            protocol: PROTOCOL_VERSION,
-            server: ServerVersion::CURRENT,
-            protocol_hash: self.config.protocol_hash(),
-            edges: self.edges.len() as u32,
-            load,
-        };
-        let mut body = Vec::with_capacity(Heartbeat::BYTES);
-        beat.encode(&mut body);
-        self.runtime
-            .block_on(self.client.publish(control::subject(self.region), body.into()))?;
-        Ok(())
+    /// [`DEFAULT_HEARTBEAT`] until told otherwise, and zero switches heartbeats
+    /// off. The library holds the timer; how much resolution an operator wants
+    /// and how much traffic that is worth stay the deployment's. See
+    /// `docs/adr/0007`.
+    ///
+    /// Silence now means a region that has stopped, so switching heartbeats off
+    /// is a deliberate act rather than the default it used to be.
+    pub fn set_heartbeat_interval(&self, every: Duration) {
+        self.heartbeat.store(every.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Publishes what the region is carrying, as often as it is asked to.
+    ///
+    /// The numbers come off `Inbound`, which the tick fills in as a side effect
+    /// of `settle`. Nothing is wired up by the consumer, and nothing here
+    /// touches the tick thread.
+    async fn beat(
+        client: async_nats::Client,
+        region: RegionId,
+        config: WorldConfig,
+        edges: Arc<Edges>,
+        inbound: Arc<Inbound>,
+        interval: Arc<AtomicU64>,
+    ) {
+        let subject: async_nats::Subject = control::subject(region).into();
+        let mut wake = tokio::time::interval(HEARTBEAT_GRANULARITY);
+        let mut since = Duration::ZERO;
+        loop {
+            wake.tick().await;
+            let every = Duration::from_nanos(interval.load(Ordering::Relaxed));
+            if every.is_zero() {
+                // Switched off. The span keeps accumulating, so switching them
+                // back on reports the whole interval rather than a slice.
+                continue;
+            }
+            since += HEARTBEAT_GRANULARITY;
+            if since < every {
+                continue;
+            }
+            since = Duration::ZERO;
+            let beat = Heartbeat {
+                region,
+                protocol: PROTOCOL_VERSION,
+                server: ServerVersion::CURRENT,
+                protocol_hash: config.protocol_hash(),
+                edges: edges.len() as u32,
+                load: inbound.take_load(),
+            };
+            let mut body = Vec::with_capacity(Heartbeat::BYTES);
+            beat.encode(&mut body);
+            // Nothing to do about a publish that fails: there is no consumer to
+            // tell, and the next beat carries the span this one would have.
+            let _ = client.publish(subject.clone(), body.into()).await;
+        }
     }
 
     /// The NATS client, for a sink that publishes payloads.

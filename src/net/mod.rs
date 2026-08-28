@@ -9,7 +9,8 @@
 //! together. See `docs/adr/0001`.
 //!
 //! **Edge to game client** — not built, and it will be its own module. Many
-//! peers, running on someone else's machine and updated on their schedule. Game clients do not speak NATS. The payloads
+//! peers, running on someone else's machine and updated on their schedule.
+//! Game clients do not speak NATS. The payloads
 //! [`PacketWriter`](crate::PacketWriter) assembles belong to that link:
 //! latest-only, lossy, unordered, MTU-sized.
 //!
@@ -68,7 +69,7 @@ pub mod control;
 mod error;
 pub mod region;
 
-pub use control::{Heartbeat, RegionLoad};
+pub use control::{EdgeHeartbeat, EdgeLoad, Heartbeat, RegionLoad};
 pub use error::NetError;
 pub use region::{
     Applied, ClaimError, DespawnEntities, EdgeId, EdgeName, EdgeSink, EdgeView,

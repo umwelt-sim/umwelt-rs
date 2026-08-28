@@ -16,6 +16,8 @@
 //! Not here: the clock that drives the tick, events, and any transport past the
 //! sink.
 
+use std::time::Duration;
+
 use crate::budget::PacketBudget;
 use crate::codec::RecordCodec;
 use crate::config::WorldConfig;
@@ -312,6 +314,45 @@ pub struct Outbound<'a> {
     pub candidates: &'a DiscoveredEntities,
 }
 
+/// What the ticks since somebody last looked cost.
+///
+/// Only the pacing loop knows how late a tick was and whether a deadline was
+/// skipped, and only the simulation knows how many viewers it served. So the
+/// simulation accumulates both, and whatever publishes a heartbeat drains it.
+/// See `docs/adr/0007`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickSpan {
+    pub ticks: u32,
+    /// Viewers served, summed over the span rather than averaged, so a reader
+    /// can divide by whatever window it cares about.
+    pub viewers: u64,
+    /// Time inside those ticks, summed.
+    pub spent: Duration,
+    pub worst: Duration,
+    /// Ticks that started after their deadline.
+    pub late: u32,
+    /// Deadlines skipped under [`Overrun::Drop`](crate::Overrun).
+    pub dropped: u32,
+}
+
+impl TickSpan {
+    /// Folds another span into this one. Worst takes the larger; everything
+    /// else adds.
+    pub fn merge(&mut self, o: TickSpan) {
+        self.ticks += o.ticks;
+        self.viewers += o.viewers;
+        self.spent += o.spent;
+        self.worst = self.worst.max(o.worst);
+        self.late += o.late;
+        self.dropped += o.dropped;
+    }
+
+    /// Mean time inside a tick over the span, or zero if it holds no ticks.
+    pub fn mean(&self) -> Duration {
+        self.spent.checked_div(self.ticks).unwrap_or_default()
+    }
+}
+
 /// One region's simulation.
 pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     cfg: WorldConfig,
@@ -339,6 +380,8 @@ pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     policy: Policy,
     codec: RecordCodec,
     tick: u32,
+    /// Accumulated by the pacing loop, drained by whoever reports load.
+    span: TickSpan,
 }
 
 impl<G: Game> WorldSimulation<G, NullSink> {
@@ -389,6 +432,7 @@ impl<G: Game> WorldSimulation<G, NullSink> {
             policy,
             codec,
             tick: 0,
+            span: TickSpan::default(),
         };
         sim.set_thread_count(threads);
         sim
@@ -424,6 +468,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             policy: self.policy,
             codec: self.codec,
             tick: self.tick,
+            span: self.span,
         }
     }
 
@@ -505,6 +550,34 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     #[inline]
     pub fn entity_count(&self) -> usize {
         self.live.live()
+    }
+
+    /// Every entity slot ever allocated, live or not.
+    ///
+    /// Despawn clears a liveness bit and does not reclaim the slot, so this
+    /// climbs with churn while [`entity_count`](Self::entity_count) does not.
+    /// See §Slot growth under churn.
+    #[inline]
+    pub fn slots(&self) -> usize {
+        self.xs.len()
+    }
+
+    /// Records one tick against the span. Called by the pacing loop.
+    pub(crate) fn record_tick(&mut self, took: Duration, late: bool, dropped: u32, viewers: u64) {
+        self.span.ticks += 1;
+        self.span.viewers += viewers;
+        self.span.spent += took;
+        self.span.worst = self.span.worst.max(took);
+        self.span.late += u32::from(late);
+        self.span.dropped += dropped;
+    }
+
+    /// Takes the span and starts a new one.
+    ///
+    /// Not public: whatever publishes a heartbeat drains this, and a second
+    /// caller would silently take half the numbers away from the first.
+    pub(crate) fn take_span(&mut self) -> TickSpan {
+        std::mem::take(&mut self.span)
     }
 
     /// Where one entity is, or `None` if it is not live.

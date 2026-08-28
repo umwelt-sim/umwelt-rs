@@ -200,6 +200,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
 
             summary.ticks += 1;
             summary.worst_tick = summary.worst_tick.max(took);
+            self.record_tick(took, !late.is_zero(), dropped, stats.viewers);
             let report = TickReport { tick: self.tick_count(), stats, took, late, dropped };
             if on_tick(report, self) == Flow::Stop {
                 break;

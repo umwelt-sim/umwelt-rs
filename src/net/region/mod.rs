@@ -23,5 +23,5 @@ pub use protocol::{
     Presence, ProtocolVersion, RegionId, ServerInfo, ServerVersion, Spawn, SpawnEntities,
     WorldParams,
 };
-pub use server::RegionServer;
+pub use server::{DEFAULT_HEARTBEAT, RegionServer};
 pub use session::{Applied, EdgeSink, Inbound, Settled};

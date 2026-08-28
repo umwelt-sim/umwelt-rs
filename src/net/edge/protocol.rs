@@ -32,6 +32,7 @@ pub const KIND_REMOVED: u8 = 5;
 pub const KIND_STATE: u8 = 6;
 /// The consumer's own, and the only kind that travels both ways.
 pub const KIND_MESSAGE: u8 = 7;
+pub const KIND_REGION: u8 = 8;
 
 /// The largest body either end will frame on a stream.
 ///
@@ -41,6 +42,30 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Bytes a position occupies: three raw [`Fixed`] axes, as on the region wire.
 const POS_BYTES: usize = 12;
+
+/// What a client is told about a region: only what it needs to read that
+/// region's packets.
+///
+/// Deliberately not [`ServerInfo`](crate::net::ServerInfo) or
+/// [`WorldParams`](crate::net::WorldParams). Those describe a region to an
+/// edge — protocol and crate versions to check, a view radius, a speed cap, a
+/// tick rate, a digest — none of which a game has any say in or use for. The
+/// two links share no types even where a field would look the same; see the
+/// `net` module.
+///
+/// The two extents are the whole of the wire layout: horizontal bits come from
+/// the region size and vertical bits from the extent, and a test in `codec`
+/// pins that nothing else changes what a decoder does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdgeInfo {
+    pub region: RegionId,
+    pub region_size_m: i32,
+    pub vertical_extent_m: i32,
+}
+
+impl EdgeInfo {
+    pub const BYTES: usize = 12;
+}
 
 /// What a game client sends its edge.
 ///
@@ -139,13 +164,23 @@ impl FromClient {
 /// does not lose authority by passing through a relay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToClient<'a> {
+    /// How to read a region's packets, sent before anything else about that
+    /// region.
+    ///
+    /// Not sent at connect time, because an edge has no home region: it learns
+    /// which regions a client cares about when the client asks for one.
+    Region(EdgeInfo),
     /// A region allocated an id for the entity this handle asked for.
     Spawned { handle: u32, region: RegionId, entity: EntityId },
     /// Gone, whatever caused it.
     Removed { handle: u32 },
-    /// One packet, to be read with [`PacketReader`](crate::PacketReader).
+    /// What one of this client's entities can see. Named by the handle that
+    /// asked for it, not by the entity or the region: the edge knows which
+    /// avatar a packet was built for and which of this client's handles that
+    /// is, and a game has no use for the other two.
+    ///
     /// Latest-only, so this rides a datagram.
-    State { region: RegionId, packet: &'a [u8] },
+    State { handle: u32, packet: &'a [u8] },
     /// The game's own, which umwelt does not read.
     Message(&'a [u8]),
 }
@@ -159,6 +194,12 @@ impl ToClient<'_> {
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         match self {
+            ToClient::Region(info) => {
+                out.push(KIND_REGION);
+                out.extend_from_slice(&info.region.raw().to_le_bytes());
+                out.extend_from_slice(&info.region_size_m.to_le_bytes());
+                out.extend_from_slice(&info.vertical_extent_m.to_le_bytes());
+            }
             ToClient::Spawned { handle, region, entity } => {
                 out.push(KIND_SPAWNED);
                 out.extend_from_slice(&handle.to_le_bytes());
@@ -169,9 +210,9 @@ impl ToClient<'_> {
                 out.push(KIND_REMOVED);
                 out.extend_from_slice(&handle.to_le_bytes());
             }
-            ToClient::State { region, packet } => {
+            ToClient::State { handle, packet } => {
                 out.push(KIND_STATE);
-                out.extend_from_slice(&region.raw().to_le_bytes());
+                out.extend_from_slice(&handle.to_le_bytes());
                 out.extend_from_slice(packet);
             }
             ToClient::Message(body) => {
@@ -184,6 +225,14 @@ impl ToClient<'_> {
     pub fn decode(frame: &[u8]) -> Result<ToClient<'_>, NetError> {
         let (&kind, body) = frame.split_first().ok_or(NetError::Malformed("edge message"))?;
         match kind {
+            KIND_REGION => {
+                let mut c = Cursor::new(body, "region info");
+                let region = RegionId::from_raw(c.u32()?);
+                let region_size_m = c.i32()?;
+                let vertical_extent_m = c.i32()?;
+                c.finish()?;
+                Ok(ToClient::Region(EdgeInfo { region, region_size_m, vertical_extent_m }))
+            }
             KIND_SPAWNED => {
                 let mut c = Cursor::new(body, "spawned");
                 let handle = c.u32()?;
@@ -202,10 +251,8 @@ impl ToClient<'_> {
                 if body.len() < 4 {
                     return Err(NetError::Malformed("state"));
                 }
-                let region = RegionId::from_raw(u32::from_le_bytes([
-                    body[0], body[1], body[2], body[3],
-                ]));
-                Ok(ToClient::State { region, packet: &body[4..] })
+                let handle = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                Ok(ToClient::State { handle, packet: &body[4..] })
             }
             KIND_MESSAGE => Ok(ToClient::Message(body)),
             got => Err(NetError::Unexpected { expected: "an edge message", got }),
@@ -311,14 +358,19 @@ mod tests {
 
     fn down() -> Vec<ToClient<'static>> {
         vec![
+            ToClient::Region(EdgeInfo {
+                region: RegionId::from_raw(9),
+                region_size_m: 4096,
+                vertical_extent_m: 1024,
+            }),
             ToClient::Spawned {
                 handle: 7,
                 region: RegionId::from_raw(9),
                 entity: EntityId::from_raw(42),
             },
             ToClient::Removed { handle: 7 },
-            ToClient::State { region: RegionId::from_raw(9), packet: b"a packet" },
-            ToClient::State { region: RegionId::from_raw(9), packet: b"" },
+            ToClient::State { handle: 7, packet: b"a packet" },
+            ToClient::State { handle: 7, packet: b"" },
             ToClient::Message(b"the game's own"),
         ]
     }

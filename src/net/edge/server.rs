@@ -28,11 +28,18 @@ use crate::net::edge::handle::{
     on_presence, span,
 };
 use crate::net::edge::ids::{ClientId, EntityKey, Mint};
-use crate::net::edge::protocol::{Framer, FromClient, ToClient};
+use crate::net::edge::protocol::{EdgeInfo, Framer, FromClient, ToClient};
 use crate::net::error::NetError;
 use crate::net::region::{Incoming, RegionClient};
 use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{PROTOCOL_VERSION, RegionId, ServerVersion, Spawn};
+
+/// How long a region is given to say what world it runs.
+///
+/// Asked once per region, on the thread that publishes, the first time a client
+/// spawns into one. A client cannot read that region's packets until the answer
+/// reaches it.
+const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often queued positions are published.
 ///
@@ -90,6 +97,8 @@ impl EdgeServer {
             clients: Mutex::new(HashMap::new()),
             entities: Mutex::new(Entities::default()),
             moves: Mutex::new(HashMap::new()),
+            worlds: Mutex::new(HashMap::new()),
+            told: Mutex::new(HashSet::new()),
             outbound: Mutex::new(outbound),
             game: Mutex::new(Box::new(NoGame)),
             client_ids: Mint::new(),
@@ -439,6 +448,7 @@ fn publish_to_regions(
         // Spawns first: a despawn in the same batch can only name an entity
         // from an earlier one, so nothing here depends on the other order.
         for (region, batch) in spawns {
+            tell_the_world(shared, region, &batch);
             let _ = shared.link.spawn(region, &batch);
         }
         for (region, batch) in gone {
@@ -448,22 +458,76 @@ fn publish_to_regions(
     }
 }
 
+/// Tells whoever asked what world the region runs, once each.
+///
+/// On the publishing thread because asking blocks on the runtime, and before
+/// the spawn itself so the answer is on the client's stream ahead of anything
+/// encoded against it.
+fn tell_the_world(shared: &Arc<Shared>, region: RegionId, batch: &[Spawn]) {
+    let owners: Vec<ClientId> = {
+        let entities = shared.entities();
+        let told = shared.told.lock().expect("not poisoned");
+        batch
+            .iter()
+            .filter_map(|spawn| entities.by_key.get(&EntityKey::from_raw(spawn.token)))
+            .filter_map(|held| held.client)
+            .filter(|client| !told.contains(&(*client, region)))
+            .collect()
+    };
+    if owners.is_empty() {
+        return;
+    }
+
+    let info = {
+        let known = shared.worlds.lock().expect("not poisoned").get(&region).copied();
+        match known {
+            Some(info) => info,
+            // Not cached on failure: a region that is not up yet may be by the
+            // next spawn.
+            None => match shared.link.info(region, INFO_TIMEOUT) {
+                Ok(offer) => {
+                    // Only the two extents cross to a client. What the region
+                    // told this edge — versions, view radius, speed cap, tick
+                    // rate, digest — is this link's business and stops here.
+                    let info = EdgeInfo {
+                        region,
+                        region_size_m: offer.config.region_size().floor_meters(),
+                        vertical_extent_m: offer.config.vertical_extent().floor_meters(),
+                    };
+                    shared.worlds.lock().expect("not poisoned").insert(region, info);
+                    info
+                }
+                Err(_) => return,
+            },
+        }
+    };
+
+    for client in owners {
+        if shared.post(client, ToClient::Region(info)).is_ok() {
+            shared.told.lock().expect("not poisoned").insert((client, region));
+        }
+    }
+}
+
 /// One packet, from the region that built it to the client that owns its
 /// avatar. The bytes are not decoded on the way through.
 fn relay(shared: &Arc<Shared>, region: RegionId, entity: crate::EntityId, packet: &[u8]) {
-    let client = {
+    // The edge knows which avatar a packet was built for and which of that
+    // client's handles it is, so the client is told the handle rather than the
+    // region and the id. Neither of those is a game's business.
+    let owner = {
         let entities = shared.entities();
         entities
             .by_id
             .get(&(region, entity))
             .and_then(|key| entities.by_key.get(key))
-            .and_then(|held| held.client)
+            .and_then(|held| Some((held.client?, held.handle?)))
     };
-    let Some(client) = client else {
+    let Some((client, handle)) = owner else {
         shared.count_relayed(false);
         return;
     };
-    let sent = shared.post(client, ToClient::State { region, packet }).is_ok();
+    let sent = shared.post(client, ToClient::State { handle, packet }).is_ok();
     shared.count_relayed(sent);
 }
 

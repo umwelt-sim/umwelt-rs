@@ -24,6 +24,31 @@ pub struct RecordCodec {
 }
 
 impl RecordCodec {
+    /// A codec for a region described only by its extents.
+    ///
+    /// The wire layout depends on exactly two numbers: horizontal bits are the
+    /// region size's, vertical bits the extent's. View radius, speed cap and
+    /// tick rate change nothing a decoder does, which is why a client is never
+    /// told them — see `net::edge::protocol::EdgeInfo`. The three the builder
+    /// still needs are set to valid values here and reach nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the extents do not describe a world at all.
+    pub fn for_extents(
+        region_size_m: i32,
+        vertical_extent_m: i32,
+    ) -> Result<RecordCodec, crate::config::ConfigError> {
+        let cfg = WorldConfig::builder()
+            .region_size_m(region_size_m)
+            .vertical_extent_m(vertical_extent_m)
+            .horizontal_view_radius_m((region_size_m / 16).max(1))
+            .max_horizontal_speed_m_per_sec(1)
+            .tick_hz(20)
+            .build()?;
+        Ok(RecordCodec::new(&cfg))
+    }
+
     pub fn new(cfg: &WorldConfig) -> RecordCodec {
         let h_bits = cfg.horizontal_bits();
         let v_bits = cfg.vertical_bits();
@@ -84,6 +109,41 @@ impl RecordCodec {
                 ((packed >> (2 * self.h_bits)) & vmask) as u32,
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+    use crate::pos::Pos3;
+
+    /// Everything a decoder does comes from the two extents. If that ever stops
+    /// being true, a client told only those two would decode packets into
+    /// nonsense, and this is what says so.
+    #[test]
+    fn the_extents_are_the_whole_of_the_wire_layout() {
+        for (size, vertical) in [(4096, 1024), (2048, 512), (8192, 1024)] {
+            for (radius, speed, hz) in [(256, 40, 20), (128, 5, 50), (512, 100, 10)] {
+                let cfg = WorldConfig::builder()
+                    .region_size_m(size)
+                    .vertical_extent_m(vertical)
+                    .horizontal_view_radius_m(radius)
+                    .max_horizontal_speed_m_per_sec(speed)
+                    .tick_hz(hz)
+                    .build()
+                    .expect("a valid world");
+                let full = RecordCodec::new(&cfg);
+                let thin = RecordCodec::for_extents(size, vertical).expect("valid extents");
+                assert_eq!(full.record_bytes(), thin.record_bytes(), "{size}/{vertical}");
+
+                let at = Pos3::from_meters(size / 3, vertical / 3, vertical / 5);
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                full.encode(EntityId::from_raw(9), at, &mut a);
+                thin.encode(EntityId::from_raw(9), at, &mut b);
+                assert_eq!(a, b, "{size}/{vertical} at {radius}/{speed}/{hz}");
+                assert_eq!(thin.decode(&a), full.decode(&b));
+            }
+        }
     }
 }
 

@@ -19,9 +19,7 @@ use umwelt::net::{
     RegionServer,
 };
 use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{
-    ClientGame, EntityId, Game, PacketReader, Pos3, RecordCodec, WorldConfig, WorldSimulation,
-};
+use umwelt::{ClientGame, EntityId, Game, PacketReader, Pos3, WorldConfig, WorldSimulation};
 
 /// Entities the client asks for. Small: this is a wiring test, not a load one.
 const WANTED: usize = 16;
@@ -83,7 +81,6 @@ struct Watcher {
     gone: Arc<Mutex<Vec<u32>>>,
     /// Positions that made the whole round trip.
     confirmed: Arc<std::sync::atomic::AtomicU64>,
-    codec: RecordCodec,
 }
 
 impl ClientGame for Watcher {
@@ -96,11 +93,12 @@ impl ClientGame for Watcher {
         self.gone.lock().expect("not poisoned").push(handle);
     }
 
-    fn state(&mut self, _region: RegionId, packet: &[u8]) {
-        let Some(reader) = PacketReader::new(&self.codec, packet) else { return };
-        // A packet reaching this client is one built for an avatar it owns, and
-        // an avatar always sees itself.
-        for (_, pos) in reader.updates() {
+    fn state(&mut self, _handle: u32, region: RegionId, state: &PacketReader<'_>) {
+        assert_eq!(region, self.region, "a packet from a region nobody asked about");
+        // Already decoded: no codec here, and no world the region was built
+        // with. A packet reaching this client is one built for an avatar it
+        // owns, and an avatar always sees itself.
+        for (_, pos) in state.updates() {
             if pos.x.floor_meters() > 200 {
                 self.confirmed.fetch_add(1, Ordering::Relaxed);
             }
@@ -286,7 +284,6 @@ fn a_game_client_populates_a_region_through_an_edge() {
             ids: Arc::clone(&ids),
             gone: Arc::clone(&gone),
             confirmed: Arc::clone(&confirmed),
-            codec: RecordCodec::new(&cfg),
         };
         let client = EdgeClient::new(conn, runtime.handle().clone(), |_handle| watcher)
             .expect("opens a stream");

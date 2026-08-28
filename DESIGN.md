@@ -1292,6 +1292,24 @@ client's. Sending is four commands on a `ClientHandle` — spawn, move, despawn,
 and the game's own opaque bytes. Receiving is a `ClientGame`, called with what
 the edge said.
 
+**A game is told nothing about how a region is configured.** It never sees a
+`WorldConfig`, a `RecordCodec`, or a packet: `ClientGame::state` is handed a
+decoded reader. It has no say in a region's tick rate, view radius or speed cap,
+and being given them would only invite it to act as though it did.
+
+What it does see is the `RegionId`, because a game is the only tier that watches
+more than one region at once — which is how seamless movement will work when it
+is built — and because the entity ids inside a packet are that region's and mean
+nothing in another one.
+
+**The client link has its own info type.** `EdgeInfo` carries a region's two
+extents and nothing else, because those are the whole of the wire layout:
+horizontal bits come from the region size, vertical bits from the extent, and a
+test in `codec` pins that view radius, speed cap and tick rate change nothing a
+decoder does. It is deliberately not `ServerInfo` or `WorldParams`, which
+describe a region to an *edge*. The two links share no types even where a field
+would look the same.
+
 Which command rides a datagram and which rides a reliable stream is decided by
 the message rather than at the call site: a lost move is superseded within a
 tick and a lost spawn is not recoverable by anything, so that is a property of

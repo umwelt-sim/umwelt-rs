@@ -20,6 +20,7 @@ use crate::net::edge::ids::{ClientId, EntityKey, Mint};
 use crate::net::edge::protocol::{Framer, ToClient};
 use crate::net::error::NetError;
 use crate::net::region::RegionClient;
+use crate::net::edge::protocol::EdgeInfo;
 use crate::net::region::protocol::{EntityKind, Presence, RegionId, Spawn};
 use crate::pos::Pos3;
 
@@ -114,6 +115,12 @@ pub(crate) struct Shared {
     /// Drained by the thread that owns the region side. A `Sender` is `Send`
     /// but not `Sync`, so it is behind a lock like everything else here.
     pub(crate) outbound: Mutex<Sender<Outgoing>>,
+    /// What world each region runs, asked for the first time an entity is
+    /// spawned into one, and which clients have been told. A client cannot
+    /// decode a packet without it, and cannot be told at connect time because
+    /// an edge has no home region.
+    pub(crate) worlds: Mutex<HashMap<RegionId, EdgeInfo>>,
+    pub(crate) told: Mutex<HashSet<(ClientId, RegionId)>>,
     pub(crate) game: Mutex<Box<dyn EdgeGame>>,
     pub(crate) client_ids: Mint,
     pub(crate) entity_keys: Mint,
@@ -410,14 +417,12 @@ impl EdgeHandle {
 
     /// Sends a new absolute position.
     ///
-    /// A key whose entity has already gone is dropped and counted rather than
-    /// refused: removal arrives unprompted, so this is a race and not a
-    /// mistake.
+    /// A key whose entity has already gone is dropped, silently. Removal
+    /// arrives unprompted — a region's game can despawn anything, and an entity
+    /// can die between a caller reading its keys and sending the batch — so
+    /// this is a race rather than a mistake, and `refused` counts mistakes.
     pub fn move_entity(&self, entity: EntityKey, to: Pos3) -> Result<(), NetError> {
-        let shared = self.live()?;
-        if !shared.set_position(entity, to) {
-            shared.count_refused();
-        }
+        self.live()?.set_position(entity, to);
         Ok(())
     }
 
@@ -425,9 +430,7 @@ impl EdgeHandle {
     pub fn move_entities(&self, moves: &[(EntityKey, Pos3)]) -> Result<(), NetError> {
         let shared = self.live()?;
         for &(entity, to) in moves {
-            if !shared.set_position(entity, to) {
-                shared.count_refused();
-            }
+            shared.set_position(entity, to);
         }
         Ok(())
     }

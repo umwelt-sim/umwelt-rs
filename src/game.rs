@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 
 use crate::entity::EntityId;
 use crate::net::edge::{ClientId, EntityKey};
+use crate::packet::PacketReader;
 use crate::net::region::protocol::RegionId;
 use crate::sim::Step;
 
@@ -83,19 +84,31 @@ pub trait EdgeGame: Send + 'static {
 /// is not a callback argument. See `docs/adr/0006`.
 #[allow(unused_variables)]
 pub trait ClientGame: Send + 'static {
-    /// A region allocated an id for the entity this handle asked for. Until
-    /// this arrives the handle is the only name for it.
+    /// The entity this handle asked for exists, in this region, under this id.
+    ///
+    /// A game is the only tier that sees more than one region at a time, so
+    /// keeping that map is its job — the region a handle ended up in is the
+    /// game's own knowledge, unlike how that region happens to be configured.
     fn spawned(&mut self, handle: u32, region: RegionId, entity: EntityId) {}
 
     /// Gone, whatever caused it — including a despawn this client never asked
     /// for, because a region's own game can despawn anything.
     fn removed(&mut self, handle: u32) {}
 
-    /// One packet, to be read with [`PacketReader`](crate::PacketReader).
+    /// What one of this client's entities can see: which to forget, and where
+    /// the rest are.
     ///
-    /// Borrowed from the datagram it arrived in, so a consumer that keeps it
-    /// copies it.
-    fn state(&mut self, region: RegionId, packet: &[u8]) {}
+    /// Already decoded. A game does not see the packet, the codec, or the world
+    /// the region was configured with — it has no say in any of those, and
+    /// being handed them would only invite it to act as though it did.
+    ///
+    /// It does see the region, because the ids inside are that region's and
+    /// mean nothing in another one. A game watching two at once has to key by
+    /// both.
+    ///
+    /// Borrowed from the datagram it arrived in, so a consumer that keeps
+    /// anything copies it.
+    fn state(&mut self, handle: u32, region: RegionId, state: &PacketReader<'_>) {}
 
     /// The game's own bytes, which umwelt did not read.
     fn message(&mut self, body: &[u8]) {}

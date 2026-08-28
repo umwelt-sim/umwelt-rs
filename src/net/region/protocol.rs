@@ -224,7 +224,7 @@ impl WorldParams {
         Ok(cfg)
     }
 
-    fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.region_size_m.to_le_bytes());
         out.extend_from_slice(&self.vertical_extent_m.to_le_bytes());
         out.extend_from_slice(&self.horizontal_view_radius_m.to_le_bytes());
@@ -233,7 +233,7 @@ impl WorldParams {
         out.extend_from_slice(&self.protocol_hash.to_le_bytes());
     }
 
-    fn decode(c: &mut Cursor<'_>) -> Result<WorldParams, NetError> {
+    pub(crate) fn decode(c: &mut Cursor<'_>) -> Result<WorldParams, NetError> {
         Ok(WorldParams {
             region_size_m: c.i32()?,
             vertical_extent_m: c.i32()?,

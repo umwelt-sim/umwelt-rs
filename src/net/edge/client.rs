@@ -15,13 +15,16 @@
 //! endpoint, its certificates and the crypto provider stay with whoever is
 //! deploying, and so does reconnecting. See `docs/adr/0006`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::codec::RecordCodec;
 use crate::game::ClientGame;
+use crate::packet::PacketReader;
 use crate::net::edge::protocol::{Framer, FromClient, ToClient};
 use crate::net::error::NetError;
 use crate::net::region::protocol::{EntityKind, RegionId};
@@ -37,6 +40,15 @@ struct Shared {
     /// a stale one names nothing rather than something else.
     handles: AtomicU32,
     game: Mutex<Box<dyn ClientGame>>,
+    /// How to read each region's packets, learned from the edge before any of
+    /// them arrive, and which region each handle ended up in. A game sees
+    /// neither: it is told which of its handles, and what that one can see.
+    codecs: Mutex<HashMap<RegionId, RecordCodec>>,
+    wheres: Mutex<HashMap<u32, RegionId>>,
+    /// Handles the edge has said are gone. A game learns the same thing, but
+    /// not before its next pass, and moves sent in between would be refused
+    /// there for naming something this end already knows is not there.
+    dead: Mutex<HashSet<u32>>,
 }
 
 impl Shared {
@@ -77,6 +89,9 @@ impl EdgeClient {
             out: queue,
             handles: AtomicU32::new(1),
             game: Mutex::new(Box::new(NoGame)),
+            codecs: Mutex::new(HashMap::new()),
+            wheres: Mutex::new(HashMap::new()),
+            dead: Mutex::new(HashSet::new()),
         });
         let built = game(ClientHandle { shared: Arc::downgrade(&shared) });
         *shared.game.lock().expect("not poisoned") = Box::new(built);
@@ -163,13 +178,21 @@ impl ClientHandle {
     /// next, and waiting for a retransmission of a position two ticks stale
     /// helps nobody.
     pub fn move_entity(&self, handle: u32, to: Pos3) -> Result<(), NetError> {
-        datagram(&*self.live()?, &FromClient::Move { handle, position: to })
+        let shared = self.live()?;
+        if shared.dead.lock().expect("not poisoned").contains(&handle) {
+            return Ok(());
+        }
+        datagram(&shared, &FromClient::Move { handle, position: to })
     }
 
     /// Several at once. Each is its own datagram, since each has to fit one.
     pub fn move_entities(&self, moves: &[(u32, Pos3)]) -> Result<(), NetError> {
         let shared = self.live()?;
+        let dead = shared.dead.lock().expect("not poisoned");
         for &(handle, to) in moves {
+            if dead.contains(&handle) {
+                continue;
+            }
             datagram(&shared, &FromClient::Move { handle, position: to })?;
         }
         Ok(())
@@ -178,7 +201,11 @@ impl ClientHandle {
     /// Gives an entity back. The edge confirms with
     /// [`ClientGame::removed`](crate::ClientGame::removed).
     pub fn despawn(&self, handle: u32) -> Result<(), NetError> {
-        reliable(&*self.live()?, &FromClient::Despawn { handle })
+        let shared = self.live()?;
+        // Dead here rather than when the edge confirms it. A move for an entity
+        // just given back is refused there, and there is no reason to send one.
+        shared.dead.lock().expect("not poisoned").insert(handle);
+        reliable(&shared, &FromClient::Despawn { handle })
     }
 
     /// The game's own bytes, reliable and ordered. umwelt does not read them.
@@ -260,12 +287,50 @@ async fn read_datagrams(conn: quinn::Connection, shared: Arc<Shared>) {
     shared.with_game(|game| game.disconnected());
 }
 
+fn shared_forget(shared: &Shared, handle: u32) {
+    shared.wheres.lock().expect("not poisoned").remove(&handle);
+    shared.dead.lock().expect("not poisoned").insert(handle);
+}
+
 fn deliver(shared: &Shared, body: &[u8]) {
     let Ok(message) = ToClient::decode(body) else { return };
+    // How to read a region's packets stops here. It is not something a game
+    // can act on, so it is kept rather than passed on.
+    if let ToClient::Region(info) = message {
+        if let Ok(codec) =
+            RecordCodec::for_extents(info.region_size_m, info.vertical_extent_m)
+        {
+            shared.codecs.lock().expect("not poisoned").insert(info.region, codec);
+        }
+        return;
+    }
+    if let ToClient::State { handle, packet } = message {
+        let Some(region) = shared.wheres.lock().expect("not poisoned").get(&handle).copied()
+        else {
+            return;
+        };
+        let codecs = shared.codecs.lock().expect("not poisoned");
+        // The world arrives before the first spawn into a region, on the
+        // reliable stream, so a missing codec means a handle this client never
+        // spent.
+        let Some(codec) = codecs.get(&region) else { return };
+        let Some(state) = PacketReader::new(codec, packet) else { return };
+        shared.with_game(|game| game.state(handle, region, &state));
+        return;
+    }
+    // Kept here so a state packet can be decoded without the wire having to
+    // repeat the region on every one. The game is told it too, since it is the
+    // only tier that sees more than one region at a time.
+    if let ToClient::Spawned { handle, region, .. } = message {
+        shared.wheres.lock().expect("not poisoned").insert(handle, region);
+    }
     shared.with_game(|game| match message {
         ToClient::Spawned { handle, region, entity } => game.spawned(handle, region, entity),
-        ToClient::Removed { handle } => game.removed(handle),
-        ToClient::State { region, packet } => game.state(region, packet),
+        ToClient::Removed { handle } => {
+            shared_forget(shared, handle);
+            game.removed(handle)
+        }
         ToClient::Message(body) => game.message(body),
+        ToClient::Region(_) | ToClient::State { .. } => unreachable!("handled above"),
     });
 }

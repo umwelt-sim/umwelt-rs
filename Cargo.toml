@@ -29,18 +29,6 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 [dev-dependencies]
 criterion = "0.8.2"
 
-[[example]]
-name = "herd-sim"
-path = "examples/herd-sim.rs"
-
-[[example]]
-name = "herd-edge"
-path = "examples/herd-edge.rs"
-
-[[example]]
-name = "herd-watch"
-path = "examples/herd-watch.rs"
-
 [[bench]]
 name = "subscription"
 harness = false

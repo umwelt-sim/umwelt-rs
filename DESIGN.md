@@ -1373,11 +1373,35 @@ second region and 64 entities of the edge's own walking between the two, 336
 migrations completed in 18 seconds with nothing lost and nothing refused. These
 are wiring figures from a laptop; §Whole-pipeline is what to quote for cost.
 
+**A client's moves are batched, up to 68 to a datagram.** One datagram per
+entity is one per entity per tick: 163,840 a second at 8,192 entities and 20 Hz,
+each carrying sixteen bytes of payload. Batching saves almost no bytes — 68
+moves are 1,093 together against 1,156 apart — and 68 times the packets.
+
+**Neither end queues state it cannot send.** Both check the connection's
+datagram send buffer and drop rather than enqueue, which is the call `Handoff`
+already makes on the region side for the same data: a packet waiting behind
+staler ones is worth less than the one after it. Without that check, driving the
+buffer into its overflow path reaches an assertion inside `quinn-proto`
+(`datagrams.outgoing.payload_bytes desynchronized`) that aborts the process. That
+is an upstream defect, reproduced at 2,048 entities on one connection and not
+diagnosed further; not filling the buffer avoids it and is the right behavior
+for latest-only state regardless.
+
+**Measured on one M1, everything on loopback, 20 Hz.** One connection carries
+about 2,500 entities: 41,984 packets a second delivered at 2,048 with none
+undeliverable, 89% at 2,560, and zero at 3,072. The failure is a cliff rather
+than a slope — once the send buffer is saturated it stays saturated. Spread
+across connections the edge does better: 8 clients of 512 delivered 84,910 a
+second with none undeliverable and the region at 10.6 ms of its 50 ms budget. At
+16 clients of 512 half the packets are undeliverable, with the whole stack on one
+machine.
+
 **Known and not fixed.** A packet at the region's full payload budget plus the
 five-byte datagram header can exceed what the path will carry, and quinn refuses
 rather than fragmenting. That shows up as `undeliverable` rather than as a silent
-truncation, and it has not been seen in any run so far because a full packet is
-rare.
+truncation. `herd` sets its own smaller budget for this reason and has a test
+pinning it.
 
 **Not in it.** Migration driven by anything but a consumer, input sequence numbers
 and client prediction, any movement resolution in the region, edge-side interest

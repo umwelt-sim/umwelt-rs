@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use umwelt::net::{
-    ClientHandle, EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, Inbound, RegionId,
-    RegionServer,
+    ClientHandle, EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, FromClient, Inbound,
+    RegionId, RegionServer,
 };
 use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
 use umwelt::{ClientGame, EntityId, Game, PacketReader, Pos3, WorldConfig, WorldSimulation};
@@ -289,23 +289,25 @@ fn a_game_client_populates_a_region_through_an_edge() {
             .expect("opens a stream");
         let sending: ClientHandle = client.handle();
 
-        // A command this connection could not have meant is refused and
-        // counted. Giving back something never asked for is one: it cannot be
-        // a race, because a despawn travels on the ordered stream.
-        let before = edge.stats().refused;
-        sending.despawn(9_999).expect("publishes");
-        wait_until("the edge to refuse a despawn for a handle nobody spent", &stop, || {
-            edge.stats().refused > before
-        });
+        // Giving back something this client is not holding is a mistake in the
+        // game, and is reported to it rather than put on the wire.
+        assert!(sending.despawn(9_999).is_err(), "a handle nobody spent must be refused here");
 
-        // A stray *move*, by contrast, is dropped and not counted: a region's
-        // game can despawn anything, so a client can be moving something it has
-        // not yet been told is gone. `refused` is for mistakes, and that is a
-        // race. It reaches no region either way.
+        // A move for a handle it is not holding is dropped without a word: it
+        // may have been despawned a moment ago, and the game has not caught up.
         let quiet = edge.stats().refused;
-        sending.move_entity(9_998, home(0)).expect("publishes");
+        sending.move_entity(9_998, home(0)).expect("dropped, not an error");
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(edge.stats().refused, quiet, "a stray move must not count as a mistake");
+        assert_eq!(edge.stats().refused, quiet, "a stray move must not reach the edge");
+
+        // The edge still counts one from a client that is not this one. Built
+        // by hand and sent raw, which is what a client in another language is.
+        let mut body = Vec::new();
+        FromClient::Despawn { handle: 9_997 }.encode(&mut body);
+        client.connection().send_datagram(body.into()).expect("fits");
+        wait_until("the edge to refuse a despawn nobody spent", &stop, || {
+            edge.stats().refused > quiet
+        });
 
         // The client mints its own handles, spent once and never reused.
         let handles: Vec<u32> = (0..WANTED)

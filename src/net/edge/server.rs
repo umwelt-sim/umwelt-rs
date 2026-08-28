@@ -30,6 +30,7 @@ use crate::net::edge::handle::{
 use crate::net::edge::ids::{ClientId, EntityKey, Mint};
 use crate::net::edge::protocol::{EdgeInfo, Framer, FromClient, ToClient};
 use crate::net::error::NetError;
+use crate::pos::Pos3;
 use crate::net::region::{Incoming, RegionClient};
 use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{PROTOCOL_VERSION, RegionId, ServerVersion, Spawn};
@@ -363,6 +364,21 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
         FromClient::Move { handle, position } => {
             if let Some(key) = key_of(shared, client, handle) {
                 shared.set_position(key, position);
+            }
+        }
+        FromClient::Moves(moves) => {
+            // Resolved in one pass under one lock, rather than taking it again
+            // for every move in the batch.
+            let resolved: Vec<(EntityKey, Pos3)> = {
+                let clients = shared.clients();
+                let Some(held) = clients.get(&client) else { return };
+                moves
+                    .iter()
+                    .filter_map(|&(handle, to)| Some((held.handles.get(&handle).copied()?, to)))
+                    .collect()
+            };
+            for (key, to) in resolved {
+                shared.set_position(key, to);
             }
         }
         FromClient::Despawn { handle } => match key_of(shared, client, handle) {

@@ -175,6 +175,14 @@ impl Shared {
         let clients = self.clients();
         let held = clients.get(&client).ok_or(NetError::Unknown("client"))?;
         if message.is_latest_only() {
+            // Dropped rather than queued when the connection has no room. State
+            // is latest-only, so a packet waiting behind staler ones is worth
+            // less than the one after it, and filling a send buffer with them
+            // only delays what a client actually wants. `Handoff` makes the
+            // same call on the region side, for the same data.
+            if held.conn.datagram_send_buffer_space() < body.len() {
+                return Err(NetError::Congested);
+            }
             // A packet at the region's full budget plus this header can exceed
             // what the path will carry, and quinn refuses rather than
             // fragmenting. That shows up as `undeliverable` rather than as a

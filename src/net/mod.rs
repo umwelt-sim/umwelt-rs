@@ -78,7 +78,7 @@ pub mod region;
 pub use control::{EdgeHeartbeat, EdgeLoad, Heartbeat, RegionLoad};
 pub use edge::{
     ClientHandle, ClientId, EdgeClient, EdgeHandle, EdgeServer, EdgeStats, EntityKey,
-    Framer, FromClient, ToClient,
+    Framer, FromClient, MAX_MOVES_PER_DATAGRAM, ToClient,
 };
 pub use error::NetError;
 pub use region::{

@@ -33,6 +33,7 @@ pub const KIND_STATE: u8 = 6;
 /// The consumer's own, and the only kind that travels both ways.
 pub const KIND_MESSAGE: u8 = 7;
 pub const KIND_REGION: u8 = 8;
+pub const KIND_MOVES: u8 = 9;
 
 /// The largest body either end will frame on a stream.
 ///
@@ -42,6 +43,18 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Bytes a position occupies: three raw [`Fixed`] axes, as on the region wire.
 const POS_BYTES: usize = 12;
+
+/// Bytes one move in a batch takes: a handle and a position.
+const MOVE_BYTES: usize = 4 + POS_BYTES;
+
+/// Most moves one [`FromClient::Moves`] may carry.
+///
+/// Sized to fit a datagram at any path MTU worth serving, with room for the
+/// kind byte and the count. A client with more entities than this sends more
+/// datagrams — but one each, which is what a naive client does, is a datagram
+/// per entity per tick: 163,840 a second at 8,192 entities and 20 Hz, each
+/// carrying sixteen bytes of payload in a twelve-hundred-byte packet.
+pub const MAX_MOVES_PER_DATAGRAM: usize = (1100 - 5) / MOVE_BYTES;
 
 /// What a client is told about a region: only what it needs to read that
 /// region's packets.
@@ -84,6 +97,9 @@ pub enum FromClient {
     Spawn { handle: u32, region: RegionId, position: Pos3, kind: EntityKind },
     /// A new absolute position. Latest-only, so this rides a datagram.
     Move { handle: u32, position: Pos3 },
+    /// Several new positions at once, which is what a client with more than a
+    /// handful of entities sends. Latest-only, so this rides a datagram too.
+    Moves(Vec<(u32, Pos3)>),
     /// Gives an entity back.
     Despawn { handle: u32 },
     /// The game's own, which umwelt does not read.
@@ -95,7 +111,7 @@ impl FromClient {
     /// the stream. A lost `Move` is superseded within a tick; a lost `Spawn`
     /// is not recoverable by anything.
     pub fn is_latest_only(&self) -> bool {
-        matches!(self, FromClient::Move { .. })
+        matches!(self, FromClient::Move { .. } | FromClient::Moves(_))
     }
 
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -112,6 +128,14 @@ impl FromClient {
                 out.push(KIND_MOVE);
                 out.extend_from_slice(&handle.to_le_bytes());
                 put_pos(*position, out);
+            }
+            FromClient::Moves(moves) => {
+                out.push(KIND_MOVES);
+                out.extend_from_slice(&(moves.len() as u32).to_le_bytes());
+                for (handle, position) in moves {
+                    out.extend_from_slice(&handle.to_le_bytes());
+                    put_pos(*position, out);
+                }
             }
             FromClient::Despawn { handle } => {
                 out.push(KIND_DESPAWN);
@@ -143,6 +167,21 @@ impl FromClient {
                 let position = get_pos(&mut c)?;
                 c.finish()?;
                 Ok(FromClient::Move { handle, position })
+            }
+            KIND_MOVES => {
+                let mut c = Cursor::new(body, "client moves");
+                let count = c.u32()? as usize;
+                // The cap bounds what a decoder allocates for a claimed count,
+                // so it does not move to suit a caller.
+                if count > MAX_MOVES_PER_DATAGRAM {
+                    return Err(NetError::Malformed("client moves count"));
+                }
+                let mut moves = Vec::with_capacity(count);
+                for _ in 0..count {
+                    moves.push((c.u32()?, get_pos(&mut c)?));
+                }
+                c.finish()?;
+                Ok(FromClient::Moves(moves))
             }
             KIND_DESPAWN => {
                 let mut c = Cursor::new(body, "client despawn");
@@ -350,6 +389,8 @@ mod tests {
                 kind: EntityKind::Unattended,
             },
             FromClient::Move { handle: 9, position: pos() },
+            FromClient::Moves(vec![(1, pos()), (2, pos()), (3, pos())]),
+            FromClient::Moves(Vec::new()),
             FromClient::Despawn { handle: 4_000_000_000 },
             FromClient::Message(b"the game's own".to_vec()),
             FromClient::Message(Vec::new()),
@@ -426,6 +467,31 @@ mod tests {
     }
 
     #[test]
+    fn a_full_batch_of_moves_fits_one_datagram() {
+        // What batching saves is packets, not bytes: sixty-eight moves are
+        // 1,093 bytes together against 1,156 apart, but one datagram against
+        // sixty-eight, each of which would carry its own UDP and QUIC headers
+        // and cost a send.
+        let batch: Vec<(u32, Pos3)> =
+            (0..MAX_MOVES_PER_DATAGRAM as u32).map(|n| (n, pos())).collect();
+        let mut framed = Vec::new();
+        FromClient::Moves(batch.clone()).encode(&mut framed);
+        assert!(
+            framed.len() <= 1100,
+            "a full batch is {} bytes and must fit a datagram",
+            framed.len()
+        );
+        assert_eq!(FromClient::decode(&framed).expect("well formed"), FromClient::Moves(batch));
+    }
+
+    #[test]
+    fn a_batch_past_the_cap_is_refused() {
+        let mut body = vec![KIND_MOVES];
+        body.extend_from_slice(&(u32::MAX).to_le_bytes());
+        assert!(FromClient::decode(&body).is_err(), "an absurd count must not be believed");
+    }
+
+    #[test]
     fn the_wire_sizes_are_what_they_look_like() {
         let mut buf = Vec::new();
         FromClient::Move { handle: 1, position: pos() }.encode(&mut buf);
@@ -474,7 +540,8 @@ mod tests {
     #[test]
     fn only_the_latest_only_kinds_ride_datagrams() {
         for m in up() {
-            assert_eq!(m.is_latest_only(), matches!(m, FromClient::Move { .. }), "{m:?}");
+            let expected = matches!(m, FromClient::Move { .. } | FromClient::Moves(_));
+            assert_eq!(m.is_latest_only(), expected, "{m:?}");
         }
         for m in down() {
             assert_eq!(m.is_latest_only(), matches!(m, ToClient::State { .. }), "{m:?}");

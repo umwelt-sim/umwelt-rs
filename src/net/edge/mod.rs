@@ -30,4 +30,6 @@ pub use client::{ClientHandle, EdgeClient};
 pub use handle::{EdgeHandle, EdgeStats};
 pub use server::{DEFAULT_HEARTBEAT, EdgeServer};
 pub use ids::{ClientId, EntityKey};
-pub use protocol::{FromClient, Framer, MAX_MESSAGE_BYTES, ToClient};
+pub use protocol::{
+    EdgeInfo, Framer, FromClient, MAX_MESSAGE_BYTES, MAX_MOVES_PER_DATAGRAM, ToClient,
+};

@@ -14,6 +14,9 @@ pub enum NetError {
     /// The client link failed: a connection lost, a stream that could not be
     /// written, or a datagram the peer will not take.
     Quic(Box<dyn std::error::Error + Send + Sync>),
+    /// The peer's send buffer has no room for a latest-only message, so it was
+    /// dropped rather than queued behind staler ones.
+    Congested,
     /// Named a client or an entity this edge does not hold.
     ///
     /// A race rather than a mistake, in most cases: a removal can arrive
@@ -48,6 +51,7 @@ impl fmt::Display for NetError {
         match self {
             Nats(e) => write!(f, "nats: {e}"),
             Quic(e) => write!(f, "quic: {e}"),
+            Congested => write!(f, "no room to send without queuing stale state"),
             Unknown(what) => write!(f, "no such {what}"),
             Malformed(what) => write!(f, "malformed {what}"),
             Unexpected { expected, got } => {

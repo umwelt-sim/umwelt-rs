@@ -17,10 +17,10 @@ use core::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 /// devoted to the fractional portion. Using this fixed shift value is how
 /// we end up with a base unit of distance (1/1024m) that allows us to
 /// do simulation calculations with cheap and fast integer math.
-pub const FIXED_SHIFT: u32 = 10;
+pub(crate) const FIXED_SHIFT: u32 = 10;
 
 /// One meter in raw units.
-pub const FIXED_ONE: i32 = 1 << FIXED_SHIFT;
+pub(crate) const FIXED_ONE: i32 = 1 << FIXED_SHIFT;
 
 /// A scalar distance or coordinate.
 ///
@@ -32,9 +32,13 @@ pub const FIXED_ONE: i32 = 1 << FIXED_SHIFT;
 pub struct Fixed(i32);
 
 impl Fixed {
+    /// Zero.
     pub const ZERO: Fixed = Fixed(0);
+    /// One meter.
     pub const ONE: Fixed = Fixed(FIXED_ONE);
+    /// The most negative value, about -2,097,152 m.
     pub const MIN: Fixed = Fixed(i32::MIN);
+    /// The largest value, about 2,097,152 m.
     pub const MAX: Fixed = Fixed(i32::MAX);
 
     /// Smallest representable step: 1/1024 m.
@@ -77,16 +81,19 @@ impl Fixed {
         self.0 as f32 / FIXED_ONE as f32
     }
 
+    /// Magnitude. Saturates rather than wrapping on [`Fixed::MIN`].
     #[inline]
     pub const fn abs(self) -> Fixed {
         Fixed(self.0.abs())
     }
 
+    /// The smaller of the two.
     #[inline]
     pub const fn min(self, other: Fixed) -> Fixed {
         if self.0 < other.0 { self } else { other }
     }
 
+    /// The larger of the two.
     #[inline]
     pub const fn max(self, other: Fixed) -> Fixed {
         if self.0 > other.0 { self } else { other }
@@ -105,6 +112,7 @@ impl Fixed {
     // state, pick explicitly: checked at boundaries where bad input can
     // arrive, plain ops in the hot path where ranges are already validated.
 
+    /// Sum, or `None` if it leaves the range.
     #[inline]
     pub const fn checked_add(self, rhs: Fixed) -> Option<Fixed> {
         match self.0.checked_add(rhs.0) {
@@ -113,6 +121,7 @@ impl Fixed {
         }
     }
 
+    /// Difference, or `None` if it leaves the range.
     #[inline]
     pub const fn checked_sub(self, rhs: Fixed) -> Option<Fixed> {
         match self.0.checked_sub(rhs.0) {
@@ -132,11 +141,13 @@ impl Fixed {
         }
     }
 
+    /// Sum, clamped to the range rather than wrapping.
     #[inline]
     pub const fn saturating_add(self, rhs: Fixed) -> Fixed {
         Fixed(self.0.saturating_add(rhs.0))
     }
 
+    /// Difference, clamped to the range rather than wrapping.
     #[inline]
     pub const fn saturating_sub(self, rhs: Fixed) -> Fixed {
         Fixed(self.0.saturating_sub(rhs.0))
@@ -260,13 +271,14 @@ impl fmt::Debug for Fixed {
 /// magnitude overflows `i32`: across a 4 km region the largest squared
 /// separation is around 5.3e13, which needs 64 bits.
 ///
-/// Ordering is preserved by squaring, so comparisons work directly and 
-/// ranking algorithms never need a square root. 
+/// Ordering is preserved by squaring, so comparisons work directly and
+/// ranking algorithms never need a square root.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct DistSq(u64);
 
 impl DistSq {
+    /// No distance at all.
     pub const ZERO: DistSq = DistSq(0);
 
     /// Square a radius so it can be compared against a [`DistSq`].
@@ -276,11 +288,13 @@ impl DistSq {
         DistSq((raw * raw) as u64)
     }
 
+    /// From a squared raw distance, which is what the comparison is done on.
     #[inline]
     pub const fn from_raw(raw: u64) -> DistSq {
         DistSq(raw)
     }
 
+    /// The squared raw distance.
     #[inline]
     pub const fn raw(self) -> u64 {
         self.0

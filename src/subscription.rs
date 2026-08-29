@@ -1,3 +1,12 @@
+//! Which cells a viewer draws from.
+//!
+//! A [`Subscription`] is the box of cells within the view radius of a viewer's
+//! own cell, clipped to the region. A move that stays inside a cell leaves it
+//! unchanged; a move that crosses one changes it by at most a row and a column,
+//! which is what makes rebuilding it cheap enough to do every tick.
+//!
+//! [`CellList`] is that box flattened into the walk order a gather uses.
+
 use crate::config::{MAX_SUB_GRID_CELLS, WorldConfig};
 use crate::pos::CellCoord;
 use core::fmt;
@@ -16,9 +25,13 @@ use core::fmt;
 /// move.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Subscription {
+    /// West edge, in cells, inclusive.
     pub x0: i32,
+    /// East edge, in cells, inclusive.
     pub x1: i32,
+    /// South edge, in cells, inclusive.
     pub y0: i32,
+    /// North edge, in cells, inclusive.
     pub y1: i32,
 }
 
@@ -29,6 +42,7 @@ impl Subscription {
         ((self.x1 - self.x0 + 1) * (self.y1 - self.y0 + 1)) as usize
     }
 
+    /// Whether it covers no cells.
     #[inline]
     pub const fn is_empty(&self) -> bool {
         self.x1 < self.x0 || self.y1 < self.y0
@@ -47,7 +61,8 @@ impl Subscription {
     #[inline]
     pub fn cells(self) -> impl Iterator<Item = CellCoord> {
         let Subscription { x0, x1, y0, y1 } = self;
-        (y0..=y1).flat_map(move |y| (x0..=x1).map(move |x| CellCoord::new(x as u16, y as u16)))
+        (y0..=y1)
+            .flat_map(move |y| (x0..=x1).map(move |x| CellCoord::new(x as u16, y as u16)))
     }
 
     /// The subscription for a viewer occupying `center`.
@@ -84,29 +99,31 @@ pub struct CellList {
 }
 
 impl CellList {
+    /// Empty.
     #[inline]
     pub const fn new() -> Self {
-        Self {
-            cells: [CellCoord::new(0, 0); MAX_SUB_GRID_CELLS],
-            len: 0,
-        }
+        Self { cells: [CellCoord::new(0, 0); MAX_SUB_GRID_CELLS], len: 0 }
     }
 
+    /// Cells in the list.
     #[inline]
     pub const fn len(&self) -> usize {
         self.len as usize
     }
 
+    /// Whether the list is empty.
     #[inline]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// The cells, in walk order.
     #[inline]
     pub fn as_slice(&self) -> &[CellCoord] {
         &self.cells[..self.len as usize]
     }
 
+    /// Over the cells, in walk order.
     #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, CellCoord> {
         self.as_slice().iter()
@@ -135,6 +152,7 @@ impl CellList {
         self.len += 1;
     }
 
+    /// Drops every cell.
     #[inline]
     pub fn clear(&mut self) {
         self.len = 0;
@@ -228,9 +246,8 @@ mod tests {
     #[test]
     fn cells_are_row_major() {
         let cfg = WorldConfig::default();
-        let cells: Vec<_> = Subscription::at_center(&cfg, CellCoord::new(10, 10))
-            .cells()
-            .collect();
+        let cells: Vec<_> =
+            Subscription::at_center(&cfg, CellCoord::new(10, 10)).cells().collect();
         assert_eq!(cells[0], CellCoord::new(8, 8));
         assert_eq!(cells[1], CellCoord::new(9, 8));
         assert_eq!(cells[5], CellCoord::new(8, 9));
@@ -276,7 +293,8 @@ mod tests {
         let cfg = WorldConfig::default();
         for y in 0..cfg.cells_per_axis() as u16 {
             for x in 0..cfg.cells_per_axis() as u16 {
-                let set = CellList::from(Subscription::at_center(&cfg, CellCoord::new(x, y)));
+                let set =
+                    CellList::from(Subscription::at_center(&cfg, CellCoord::new(x, y)));
                 assert!(set.len() <= MAX_SUB_GRID_CELLS);
             }
         }
@@ -356,10 +374,7 @@ mod tests {
 
         for center in snake_path(axis) {
             let sub = Subscription::at_center(&cfg, center);
-            assert!(
-                sub.contains(center),
-                "{center:?} not in its own subscription"
-            );
+            assert!(sub.contains(center), "{center:?} not in its own subscription");
         }
     }
 

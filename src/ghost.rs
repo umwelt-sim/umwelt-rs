@@ -58,6 +58,7 @@ fn home(id: u32, bits: u32) -> usize {
 }
 
 impl GhostTable {
+    /// Empty. One viewer holds one of these.
     pub fn new() -> GhostTable {
         GhostTable::default()
     }
@@ -77,6 +78,7 @@ impl GhostTable {
         self.len
     }
 
+    /// Whether this client is believed to hold nothing.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -183,6 +185,7 @@ impl GhostTable {
         }
     }
 
+    /// Forgets everything, as if the client had just arrived.
     pub fn clear(&mut self) {
         self.slots.fill(Ghost::VACANT);
         self.len = 0;
@@ -403,10 +406,18 @@ mod tests {
                 t.evict(100, 5, &mut gone);
 
                 assert_eq!(t.len(), live, "n {n} seed {seed}: wrong survivor count");
-                assert_eq!(gone.len(), n - live, "n {n} seed {seed}: wrong departure count");
+                assert_eq!(
+                    gone.len(),
+                    n - live,
+                    "n {n} seed {seed}: wrong departure count"
+                );
                 for (k, &e) in ids.iter().enumerate() {
                     if k % 3 == 0 {
-                        assert_eq!(t.mark(id(e)), Some(k as u32), "n {n} seed {seed}: lost {e}");
+                        assert_eq!(
+                            t.mark(id(e)),
+                            Some(k as u32),
+                            "n {n} seed {seed}: lost {e}"
+                        );
                     } else {
                         assert_eq!(t.mark(id(e)), None, "n {n} seed {seed}: kept {e}");
                     }

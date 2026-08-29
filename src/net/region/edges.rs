@@ -1,16 +1,15 @@
 //! The edges relaying for one region, and the entities each one manages.
 //!
-//! An edge claims the entities whose game clients it holds the connections for.
-//! [`Edges::edge_for`] answers which edge manages a given entity, which is what
-//! a [`PayloadSink`](crate::PayloadSink) needs in order to address a payload. It
-//! is called once per served viewer per tick, so it takes a read lock and no
-//! more; claiming and releasing take the write lock and happen when a game
-//! client arrives or leaves.
+//! An edge claims the entities whose game clients it holds the connections
+//! for. [`Edges::edge_for`] answers which edge manages a given entity, which
+//! is what a [`PayloadSink`](crate::PayloadSink) needs in order to address a
+//! payload. It is called once per served viewer per tick, so it takes a read
+//! lock and no more; claiming and releasing take the write lock and happen
+//! when a game client arrives or leaves.
 //!
 //! Edges arrive by name rather than by connection. Under NATS there is nothing
 //! to accept, so an edge becomes known the first time it sends a command, and
-//! stops being known when it has been silent long enough. See
-//! `docs/adr/0001`.
+//! stops being known when it has been silent long enough.
 
 use core::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -44,11 +43,14 @@ impl EdgeName {
             return Err(NetError::BadEdgeName("length must be 1 to 64 bytes"));
         }
         if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-            return Err(NetError::BadEdgeName("only letters, digits, dash and underscore"));
+            return Err(NetError::BadEdgeName(
+                "only letters, digits, dash and underscore",
+            ));
         }
         Ok(EdgeName(name))
     }
 
+    /// The name as text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -72,11 +74,13 @@ impl fmt::Display for EdgeName {
 pub struct EdgeId(u32);
 
 impl EdgeId {
+    /// From the raw value. Only meaningful to the region that handed it out.
     #[inline]
     pub const fn from_raw(raw: u32) -> EdgeId {
         EdgeId(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u32 {
         self.0
@@ -100,7 +104,12 @@ impl fmt::Debug for EdgeId {
 pub enum ClaimError {
     /// Another edge already manages this entity. Two edges managing one avatar
     /// would send one viewer's packets to two clients.
-    AlreadyClaimed { entity: EntityId, by: EdgeId },
+    AlreadyClaimed {
+        /// The entity asked for.
+        entity: EntityId,
+        /// The edge already managing it.
+        by: EdgeId,
+    },
     /// That edge is not attached.
     NoSuchEdge(EdgeId),
 }
@@ -131,18 +140,26 @@ pub(crate) struct EdgeStats {
 /// One edge's state, sampled together under a single lock.
 #[derive(Clone, Debug)]
 pub struct EdgeView {
+    /// This region's index for it.
     pub id: EdgeId,
+    /// What it calls itself.
     pub name: EdgeName,
     /// How long this edge has been attached.
     pub uptime: Duration,
     /// Since its last command. An edge silent past the region's expiry is
     /// dropped.
     pub silent: Duration,
+    /// Entities it manages here.
     pub entities: usize,
+    /// How many of those observe.
     pub observers: usize,
+    /// Packets sent to it.
     pub payloads: u64,
+    /// Bytes in those packets.
     pub bytes: u64,
+    /// Commands it has sent.
     pub messages: u64,
+    /// How many were declined.
     pub refused: u64,
 }
 
@@ -175,6 +192,7 @@ pub struct Edges {
 }
 
 impl Edges {
+    /// With no edge attached.
     pub fn new() -> Edges {
         Edges::default()
     }
@@ -194,6 +212,7 @@ impl Edges {
         self.live.load(Ordering::Relaxed)
     }
 
+    /// Whether no edge is attached.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -211,7 +230,9 @@ impl Edges {
     /// edge exists.
     pub fn admit(&self, name: &EdgeName) -> EdgeId {
         let mut slots = self.slots.lock().expect("not poisoned");
-        if let Some(at) = slots.iter().position(|h| h.as_ref().is_some_and(|r| &r.name == name)) {
+        if let Some(at) =
+            slots.iter().position(|h| h.as_ref().is_some_and(|r| &r.name == name))
+        {
             let rec = slots[at].as_mut().expect("just matched");
             rec.heard = Instant::now();
             return EdgeId::from_raw(at as u32);
@@ -263,6 +284,7 @@ impl Edges {
         stale.len()
     }
 
+    /// What an edge calls itself, or `None` if the slot is free.
     pub fn name(&self, id: EdgeId) -> Option<EdgeName> {
         let slots = self.slots.lock().expect("not poisoned");
         slots.get(id.index()).and_then(|h| h.as_ref()).map(|r| r.name.clone())
@@ -317,7 +339,10 @@ impl Edges {
             return Ok(());
         }
         if held_by != UNOWNED {
-            return Err(ClaimError::AlreadyClaimed { entity, by: EdgeId::from_raw(held_by) });
+            return Err(ClaimError::AlreadyClaimed {
+                entity,
+                by: EdgeId::from_raw(held_by),
+            });
         }
         owners[entity.index()] = edge.raw();
         rec.entities.push(entity);
@@ -354,7 +379,11 @@ impl Edges {
     /// How many entities one edge manages.
     pub fn entity_count(&self, edge: EdgeId) -> usize {
         let slots = self.slots.lock().expect("not poisoned");
-        slots.get(edge.index()).and_then(|h| h.as_ref()).map(|r| r.entities.len()).unwrap_or(0)
+        slots
+            .get(edge.index())
+            .and_then(|h| h.as_ref())
+            .map(|r| r.entities.len())
+            .unwrap_or(0)
     }
 
     /// Entities orphaned by an edge going away, taken once. The tick loop

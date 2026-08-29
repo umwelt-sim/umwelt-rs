@@ -3,7 +3,7 @@
 //! One edge server, and the game clients connected to it. Many peers, none of
 //! them trusted, running on someone else's machine and updated on someone
 //! else's schedule — the opposite of `net::region` in every way that matters,
-//! which is why the two share no types. See `docs/adr/0006`.
+//! which is why the two share no types.
 //!
 //! - [`protocol`] is the messages and how they are framed.
 //!
@@ -25,12 +25,11 @@
 
 mod client;
 mod handle;
-pub mod protocol;
 mod server;
+
+// The wire itself, on both ends of the QUIC link.
+pub(crate) mod protocol;
 
 pub use client::{ClientHandle, EdgeClient};
 pub use handle::{EdgeHandle, EdgeStats};
-pub use server::{DEFAULT_HEARTBEAT, EdgeServer};
-pub use protocol::{
-    EdgeInfo, Framer, FromClient, MAX_MESSAGE_BYTES, MAX_MOVES_PER_DATAGRAM, ToClient,
-};
+pub use server::EdgeServer;

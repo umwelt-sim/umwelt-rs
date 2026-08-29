@@ -67,7 +67,8 @@ impl Weights {
     /// error subtends a smaller angle the further away it is, so a packet is
     /// better spent on what is close. This curve matches that fall-off.
     ///
-    /// Anchored at [`NEAR_BAND`]. A band is `ilog2` of a squared separation, so
+    /// Anchored at the band of a one-meter separation. A band is `ilog2` of a
+    /// squared separation, so
     /// one band is half a doubling of distance and a shift of one half per band
     /// is `1/d`. A table indexed from band 0 would be constant across
     /// everything inside a view radius and would weight nothing at all.
@@ -94,7 +95,8 @@ impl Weights {
     /// Weights floor at 1 rather than reaching zero, which a zero would starve.
     /// A table spans 4096 to 1 and the default view radius is eight doublings
     /// of distance from a meter, so anything steeper than `d^-1.5` hits that
-    /// floor inside the radius and is flat from there out; see [`NEAR_BAND`].
+    /// floor inside the radius and is flat from there out, measured from the
+    /// band of a one-meter separation.
     pub fn inverse_power(k_halves: u32) -> Weights {
         let mut t = [0u16; BANDS];
         for (b, slot) in t.iter_mut().enumerate() {
@@ -136,8 +138,16 @@ pub struct Policy {
     /// this is in ticks but is measured in serves: below a client's send period
     /// it behaves as zero. See [`DEFAULT_GRACE`](crate::sim::DEFAULT_GRACE).
     pub grace: u32,
-    /// See [`DEFAULT_UNSEEN_DRIFT`].
+    /// What an entity a client has never been told about is treated as having
+    /// drifted, in raw units.
+    ///
+    /// The natural scale is the view radius: a client told nothing about an
+    /// entity could be wrong about it by up to the whole radius, which is what
+    /// [`WorldSimulation::new`](crate::WorldSimulation::new) uses. Raising it
+    /// introduces strangers sooner at the cost of refreshing known entities
+    /// less often.
     pub unseen_drift: u32,
+    /// How the parts of a score are traded off.
     pub weights: Weights,
 }
 
@@ -174,6 +184,7 @@ impl Ranked {
         self.at & NEW_BIT != 0
     }
 
+    /// What it scored. Higher is sent sooner.
     #[inline]
     pub fn score(&self) -> u32 {
         self.score
@@ -193,10 +204,12 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// Empty.
     pub fn new() -> Selection {
         Selection::default()
     }
 
+    /// Empty, with room for `candidates` before it grows.
     pub fn with_capacity(candidates: usize) -> Selection {
         Selection {
             ranked: Vec::with_capacity(candidates),
@@ -423,7 +436,10 @@ mod tests {
         for tick in 2..=20u32 {
             w.tick();
             select(tick, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
-            assert!(sel.records().is_empty(), "tick {tick}: nothing moved, so nothing to say");
+            assert!(
+                sel.records().is_empty(),
+                "tick {tick}: nothing moved, so nothing to say"
+            );
             assert_eq!(sel.ranked().len(), n, "the ghosts are still correct, not gone");
         }
     }
@@ -538,7 +554,10 @@ mod tests {
         let p = policy(2, 2);
 
         select(1, &inside, &w.odo, &p, 98, &mut ghosts, &mut sel);
-        assert!(ghosts.mark(EntityId::from_raw(2)).is_some(), "entity 2 starts as a ghost");
+        assert!(
+            ghosts.mark(EntityId::from_raw(2)).is_some(),
+            "entity 2 starts as a ghost"
+        );
 
         let mut gone = false;
         for tick in 2..=10u32 {
@@ -576,7 +595,10 @@ mod tests {
             }
             w.tick();
             select(tick, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
-            assert!(sel.departed().is_empty(), "tick {tick}: a stable set must not depart");
+            assert!(
+                sel.departed().is_empty(),
+                "tick {tick}: a stable set must not depart"
+            );
             assert!(
                 !sel.records().iter().any(|r| r.is_new()),
                 "tick {tick}: nothing should still be arriving"
@@ -713,7 +735,11 @@ mod tests {
         // its floor exactly there at `d^-1.5` and sooner past it.
         assert_eq!(Weights::inverse_power(3).at(NEAR_BAND + 16), 1);
         assert!(Weights::inverse_power(3).at(NEAR_BAND + 15) > 1);
-        assert_eq!(Weights::inverse_power(4).at(NEAR_BAND + 12), 1, "d^-2 floors at 64 m");
+        assert_eq!(
+            Weights::inverse_power(4).at(NEAR_BAND + 12),
+            1,
+            "d^-2 floors at 64 m"
+        );
         assert_eq!(Weights::inverse_power(8).at(NEAR_BAND + 6), 1, "d^-4 floors at 8 m");
     }
 }

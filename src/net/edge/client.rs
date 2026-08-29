@@ -1,19 +1,24 @@
 //! A game client's side of the link.
 //!
 //! [`EdgeClient`] is what a game developer holds, and [`ClientHandle`] is what
-//! it sends through. Between them they speak four commands — spawn, move,
-//! despawn, and whatever the game's own protocol carries — and hand what comes
-//! back to a [`ClientGame`].
+//! it sends through. A game asks for entities, moves them, moves them between
+//! regions, gives them back, and sends whatever its own protocol carries; what
+//! comes back reaches a [`ClientGame`].
 //!
-//! Which command rides a reliable stream and which rides a datagram is umwelt's
-//! decision, not the consumer's: a lost move is superseded within a tick and a
-//! lost spawn is not recoverable by anything, so it is a property of the message
-//! rather than a choice at the call site. Nothing here asks a consumer to poll,
-//! to pick a timeout, or to decide what one means.
+//! For the commands umwelt owns, which one rides a reliable stream and which
+//! rides a datagram is decided here rather than at the call site: a lost move
+//! is superseded within a tick and a lost spawn is not recoverable by
+//! anything, so it follows from the message rather than from the caller. The
+//! game's own bytes are the exception, because only the game knows whether
+//! losing one matters — [`send`](ClientHandle::send) is reliable and
+//! [`send_datagram`](ClientHandle::send_datagram) is not.
+//!
+//! Nothing here asks a consumer to poll, to pick a timeout, or to decide what
+//! one means.
 //!
 //! It connects to nothing. The caller supplies a `quinn::Connection`, so the
 //! endpoint, its certificates and the crypto provider stay with whoever is
-//! deploying, and so does reconnecting. See `docs/adr/0006`.
+//! deploying, and so does reconnecting.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,15 +27,15 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::id::RegionId;
 use crate::codec::RecordCodec;
+use crate::entity::EntityKind;
 use crate::game::ClientGame;
-use crate::packet::PacketReader;
+use crate::id::{EntityHandle, RegionId};
 use crate::net::edge::protocol::{
-    Framer, FromClient, MAX_MOVES_PER_DATAGRAM, MOVES_HEADER_BYTES, MOVE_BYTES, ToClient,
+    Framer, FromClient, MAX_MOVES_PER_DATAGRAM, MOVE_BYTES, MOVES_HEADER_BYTES, ToClient,
 };
 use crate::net::error::NetError;
-use crate::net::region::protocol::EntityKind;
+use crate::packet::PacketReader;
 use crate::pos::Pos3;
 
 /// What a client holds, shared with every handle to it.
@@ -50,7 +55,7 @@ struct Shared {
     /// given back or reported gone, so this is bounded by what is alive rather
     /// than by everything ever spawned, and a command naming something absent
     /// is one this end declines to send.
-    live: Mutex<HashMap<u32, Held>>,
+    live: Mutex<HashMap<EntityHandle, Held>>,
 }
 
 /// One entity this client is holding.
@@ -66,7 +71,7 @@ struct Held {
     walked: bool,
     /// The handle this one is replacing, if [`ClientHandle::migrate`] asked for
     /// it. Given back the moment this one exists.
-    replacing: Option<u32>,
+    replacing: Option<EntityHandle>,
 }
 
 impl Shared {
@@ -76,9 +81,9 @@ impl Shared {
         region: RegionId,
         at: Pos3,
         kind: EntityKind,
-        replacing: Option<u32>,
-    ) -> Result<u32, NetError> {
-        let handle = self.handles.fetch_add(1, Ordering::Relaxed);
+        replacing: Option<EntityHandle>,
+    ) -> Result<EntityHandle, NetError> {
+        let handle = EntityHandle::from_raw(self.handles.fetch_add(1, Ordering::Relaxed));
         self.live
             .lock()
             .expect("not poisoned")
@@ -91,7 +96,7 @@ impl Shared {
     ///
     /// Forgotten here rather than when the edge confirms, so nothing else is
     /// sent under the handle in between.
-    fn give_back(&self, handle: u32) -> bool {
+    fn give_back(&self, handle: EntityHandle) -> bool {
         if self.live.lock().expect("not poisoned").remove(&handle).is_none() {
             return false;
         }
@@ -110,6 +115,44 @@ impl Shared {
 ///
 /// Held for the whole session: dropping it stops reading and closes nothing,
 /// which is the caller's to do through [`connection`](Self::connection).
+///
+/// ```no_run
+/// use umwelt::{ClientGame, EdgeClient, EntityHandle, EntityId, EntityKind};
+/// use umwelt::{PacketReader, Pos3, RegionId};
+///
+/// /// A game that counts what it can see.
+/// #[derive(Default)]
+/// struct Watcher {
+///     seen: usize,
+/// }
+///
+/// impl ClientGame for Watcher {     fn spawned(&mut self, handle:
+/// EntityHandle, region: RegionId, entity: EntityId) {
+/// println!("{handle} is {entity} in {region}");     }
+///
+///     fn state(&mut self, _: EntityHandle, _: RegionId, state:
+/// &PacketReader<'_>) {         self.seen += state.header().updates as usize;
+/// } }
+///
+/// // The caller connects. Where the edge is, and what it has to present to
+/// // be trusted, is the game's own business.
+/// let runtime = tokio::runtime::Runtime::new()?;
+/// let conn: quinn::Connection = // dialed by the caller
+/// # unimplemented!();
+///
+/// let client = EdgeClient::new(conn, runtime.handle().clone(), |_|
+/// Watcher::default())?; let sending = client.handle();
+///
+/// // Valid at once: a move under this handle is held at the edge until the
+/// // region answers.
+/// let avatar = sending.spawn(
+///     RegionId::from_raw(7),
+///     Pos3::from_meters(2048, 2048, 0),
+///     EntityKind::Observer,
+/// )?;
+/// sending.move_entity(avatar, Pos3::from_meters(2049, 2048, 0))?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub struct EdgeClient {
     shared: Arc<Shared>,
     tasks: Vec<JoinHandle<()>>,
@@ -203,14 +246,13 @@ impl ClientHandle {
     ///
     /// The region is named because an edge has none — it reaches every region
     /// through one wildcard subscription and has no business deciding where a
-    /// player belongs. That is the game's, kept out of band; see
-    /// `docs/adr/0003`.
+    /// player belongs. That is the game's, kept out of band;.
     pub fn spawn(
         &self,
         region: RegionId,
         at: Pos3,
         kind: EntityKind,
-    ) -> Result<u32, NetError> {
+    ) -> Result<EntityHandle, NetError> {
         self.live()?.ask(region, at, kind, None)
     }
 
@@ -218,8 +260,8 @@ impl ClientHandle {
     ///
     /// Asks the destination for it and gives the origin's copy back the moment
     /// the destination has it. Spawn first, despawn second: ordered the other
-    /// way there is a window where the entity exists nowhere, and nothing needs
-    /// that window. See `docs/adr/0003`.
+    /// way there is a window where the entity exists nowhere, and nothing
+    /// needs that window.
     ///
     /// Returns the handle it goes by from here on, valid at once — a move sent
     /// under it is held until the region answers. The old handle stops working
@@ -232,11 +274,15 @@ impl ClientHandle {
     /// [`ClientGame::spawned`](crate::ClientGame::spawned) reports for the
     /// handle this returns.
     ///
-    /// `docs/adr/0003` declined to offer this to an *edge*, because waiting for
-    /// the destination there would mean eating messages meant for the edge's own
-    /// loop. Here the receive loop belongs to this crate, so the wait costs
-    /// nobody anything.
-    pub fn migrate(&self, handle: u32, to: RegionId, at: Pos3) -> Result<u32, NetError> {
+    /// This is not offered to an *edge*: waiting for the destination there
+    /// would mean eating messages meant for the edge's own loop. Here the
+    /// receive loop belongs to this crate, so the wait costs nobody anything.
+    pub fn migrate(
+        &self,
+        handle: EntityHandle,
+        to: RegionId,
+        at: Pos3,
+    ) -> Result<EntityHandle, NetError> {
         let shared = self.live()?;
         let kind = shared
             .live
@@ -252,7 +298,7 @@ impl ClientHandle {
     ///
     /// A handle this client is not holding is dropped: it has been given back
     /// or reported gone, and there is nothing to move.
-    pub fn move_entity(&self, handle: u32, to: Pos3) -> Result<(), NetError> {
+    pub fn move_entity(&self, handle: EntityHandle, to: Pos3) -> Result<(), NetError> {
         self.move_entities(&[(handle, to)])
     }
 
@@ -260,7 +306,7 @@ impl ClientHandle {
     /// entities does every tick.
     ///
     /// Latest-only, so these ride datagrams, batched up to
-    /// [`MAX_MOVES_PER_DATAGRAM`](crate::net::MAX_MOVES_PER_DATAGRAM) each.
+    /// what a datagram on this connection will carry.
     /// Sending one datagram per entity means one per entity per tick, which at
     /// any real entity count is a flood of packets carrying sixteen bytes
     /// apiece.
@@ -268,7 +314,7 @@ impl ClientHandle {
     /// The first move for a handle goes on the ordered stream instead. A spawn
     /// travels there and a datagram can pass it, so a first move sent as a
     /// datagram can reach the edge before the spawn that named the handle.
-    pub fn move_entities(&self, moves: &[(u32, Pos3)]) -> Result<(), NetError> {
+    pub fn move_entities(&self, moves: &[(EntityHandle, Pos3)]) -> Result<(), NetError> {
         let shared = self.live()?;
         // How many fit is the connection's answer, not a constant's: the path
         // decides what a datagram may carry, and a smaller one than loopback's
@@ -277,7 +323,7 @@ impl ClientHandle {
         let room = shared.conn.max_datagram_size().unwrap_or(0);
         let per_batch = room.saturating_sub(MOVES_HEADER_BYTES) / MOVE_BYTES;
         let per_batch = per_batch.clamp(1, MAX_MOVES_PER_DATAGRAM);
-        let mut batch: Vec<(u32, Pos3)> = Vec::new();
+        let mut batch: Vec<(EntityHandle, Pos3)> = Vec::new();
         for &(handle, to) in moves {
             let first = {
                 let mut live = shared.live.lock().expect("not poisoned");
@@ -301,16 +347,18 @@ impl ClientHandle {
         Ok(())
     }
 
-    /// Gives an entity back. The edge confirms with
-    /// [`ClientGame::removed`](crate::ClientGame::removed).
     /// Gives an entity back.
     ///
     /// Forgotten here rather than when the edge confirms it, so nothing else is
     /// sent under the handle in between. Giving back something this client is
     /// not holding is a mistake in the game, and is reported as one rather than
     /// put on the wire for the edge to refuse.
-    pub fn despawn(&self, handle: u32) -> Result<(), NetError> {
-        if self.live()?.give_back(handle) { Ok(()) } else { Err(NetError::Unknown("handle")) }
+    pub fn despawn(&self, handle: EntityHandle) -> Result<(), NetError> {
+        if self.live()?.give_back(handle) {
+            Ok(())
+        } else {
+            Err(NetError::Unknown("handle"))
+        }
     }
 
     /// The game's own bytes, reliable and ordered. umwelt does not read them.
@@ -398,10 +446,6 @@ async fn read_datagrams(conn: quinn::Connection, shared: Arc<Shared>) {
     shared.with_game(|game| game.disconnected());
 }
 
-fn shared_forget(shared: &Shared, handle: u32) {
-    shared.live.lock().expect("not poisoned").remove(&handle);
-}
-
 fn deliver(shared: &Shared, body: &[u8]) {
     let Ok(message) = ToClient::decode(body) else { return };
     // How to read a region's packets stops here. It is not something a game
@@ -437,7 +481,7 @@ fn deliver(shared: &Shared, body: &[u8]) {
         && let Some(held) = shared.live.lock().expect("not poisoned").get_mut(&handle)
     {
         held.region = Some(region);
-        // Step three of docs/adr/0003: the destination has it, so the origin's
+        // The destination has it, so the origin's
         // copy goes back, and only now.
         replaced = held.replacing.take();
     }
@@ -445,9 +489,11 @@ fn deliver(shared: &Shared, body: &[u8]) {
         shared.give_back(old);
     }
     shared.with_game(|game| match message {
-        ToClient::Spawned { handle, region, entity } => game.spawned(handle, region, entity),
+        ToClient::Spawned { handle, region, entity } => {
+            game.spawned(handle, region, entity)
+        }
         ToClient::Removed { handle } => {
-            shared_forget(shared, handle);
+            shared.live.lock().expect("not poisoned").remove(&handle);
             game.removed(handle)
         }
         ToClient::Message(body) => game.message(body),

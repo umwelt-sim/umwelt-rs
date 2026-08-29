@@ -23,6 +23,7 @@ use crate::sim::viewer::ViewerId;
 /// `payload` borrows a worker's buffer and is overwritten by the next viewer,
 /// so a sink that keeps the bytes copies them.
 pub trait PayloadSink: Sync {
+    /// Takes one viewer's payload. Called once per served viewer per tick.
     fn send(&self, viewer: ViewerId, payload: &[u8]);
 
     /// The burst of sends is over: push anything held back.
@@ -61,6 +62,7 @@ pub struct RecordingSink {
 }
 
 impl RecordingSink {
+    /// Holding nothing.
     pub fn new() -> RecordingSink {
         RecordingSink::default()
     }
@@ -76,6 +78,7 @@ impl RecordingSink {
         held.get(viewer.index()).filter(|p| !p.is_empty()).cloned()
     }
 
+    /// Drops what was recorded, keeping the counts.
     pub fn clear(&self) {
         self.latest.lock().expect("not poisoned").clear();
         self.sends.store(0, Ordering::Relaxed);

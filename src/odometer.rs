@@ -27,10 +27,12 @@ pub struct Odometer {
 }
 
 impl Odometer {
+    /// Empty.
     pub fn new() -> Odometer {
         Odometer::default()
     }
 
+    /// Empty, with room for `slots` entities before it grows.
     pub fn with_capacity(slots: usize) -> Odometer {
         Odometer {
             total: Vec::with_capacity(slots),
@@ -90,7 +92,13 @@ impl Odometer {
     ///
     /// If the three slices differ in length, or if `live` covers fewer slots
     /// than the arrays hold.
-    pub fn accumulate(&mut self, xs: &[Fixed], ys: &[Fixed], zs: &[Fixed], live: &LiveSet) {
+    pub fn accumulate(
+        &mut self,
+        xs: &[Fixed],
+        ys: &[Fixed],
+        zs: &[Fixed],
+        live: &LiveSet,
+    ) {
         assert_eq!(xs.len(), ys.len(), "position arrays must be parallel");
         assert_eq!(xs.len(), zs.len(), "position arrays must be parallel");
         assert!(
@@ -130,6 +138,7 @@ impl Odometer {
         }
     }
 
+    /// Forgets every entity.
     pub fn clear(&mut self) {
         self.total.clear();
         self.prev_x.clear();

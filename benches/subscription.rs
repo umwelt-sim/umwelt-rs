@@ -11,7 +11,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use umwelt::{CellCoord, Fixed, Pos2, Subscription, WorldConfig};
+use umwelt::internals::Subscription;
+use umwelt::{CellCoord, Fixed, Pos2, WorldConfig};
 
 /// xorshift64. Deterministic across runs so successive benchmarks compare.
 struct Rng(u64);
@@ -52,10 +53,7 @@ fn viewer_positions(cfg: &WorldConfig, n: usize, seed: u64) -> (Vec<Fixed>, Vec<
 /// Cells for viewers already known to have moved, for the delta benchmark
 /// once it exists.
 fn viewer_cells(cfg: &WorldConfig, xs: &[Fixed], ys: &[Fixed]) -> Vec<CellCoord> {
-    xs.iter()
-        .zip(ys)
-        .map(|(&x, &y)| cfg.cell_of(Pos2::new(x, y)))
-        .collect()
+    xs.iter().zip(ys).map(|(&x, &y)| cfg.cell_of(Pos2::new(x, y))).collect()
 }
 
 /// Position to cell to subscription, once per viewer.
@@ -153,11 +151,5 @@ fn membership(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    full_tick,
-    from_known_cells,
-    iterate_cells,
-    membership
-);
+criterion_group!(benches, full_tick, from_known_cells, iterate_cells, membership);
 criterion_main!(benches);

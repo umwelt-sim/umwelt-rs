@@ -9,7 +9,7 @@
 //! address, credentials, TLS, cluster membership and reconnect policy are the
 //! caller's to choose. The tick loop never touches either:
 //! [`Handoff`](crate::Handoff) already moves payloads off the tick thread, and
-//! that thread is the one that publishes. See `docs/adr/0001`.
+//! that thread is the one that publishes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,12 +19,14 @@ use futures::StreamExt;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::id::RegionId;
 use crate::config::WorldConfig;
+use crate::id::RegionId;
 use crate::net::control::{self, Heartbeat};
 use crate::net::error::NetError;
 use crate::net::region::edges::Edges;
-use crate::net::region::protocol::{PROTOCOL_VERSION, ServerInfo, ServerVersion, WorldParams};
+use crate::net::region::protocol::{
+    PROTOCOL_VERSION, ServerInfo, ServerVersion, WorldParams,
+};
 use crate::net::region::session::Inbound;
 use crate::net::region::subjects;
 
@@ -34,7 +36,7 @@ const SWEEP: Duration = Duration::from_secs(1);
 /// How often a region publishes what it is carrying, until told otherwise.
 ///
 /// A control plane runs at human timescales, so this is far slower than
-/// anything else here. See `docs/adr/0007`.
+/// anything else here.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// How often the heartbeat task wakes to see whether it is due.
@@ -110,11 +112,13 @@ impl RegionServer {
         Ok(RegionServer { region, config, client, edges, heartbeat, tasks })
     }
 
+    /// Which region this serves.
     #[inline]
     pub fn region(&self) -> RegionId {
         self.region
     }
 
+    /// The world it answers with.
     #[inline]
     pub fn config(&self) -> &WorldConfig {
         &self.config
@@ -128,10 +132,9 @@ impl RegionServer {
 
     /// How often this region says what it is carrying.
     ///
-    /// [`DEFAULT_HEARTBEAT`] until told otherwise, and zero switches heartbeats
-    /// off. The library holds the timer; how much resolution an operator wants
-    /// and how much traffic that is worth stay the deployment's. See
-    /// `docs/adr/0007`.
+    /// Thirty seconds until told otherwise, and zero switches heartbeats off.
+    /// The library holds the timer; how much resolution an operator wants and
+    /// how much traffic that is worth stay the deployment's.
     ///
     /// Silence now means a region that has stopped, so switching heartbeats off
     /// is a deliberate act rather than the default it used to be.

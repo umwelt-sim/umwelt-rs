@@ -33,19 +33,24 @@ pub const MAX_SUB_AXIS: u32 = 16;
 pub struct CellOccupants<'a> {
     /// Ascending by entity id.
     pub ids: &'a [EntityId],
+    /// East, in the same order as `ids`.
     pub xs: &'a [Fixed],
+    /// North, in the same order as `ids`.
     pub ys: &'a [Fixed],
+    /// Up, in the same order as `ids`.
     pub zs: &'a [Fixed],
     /// Index of `ids[0]` within the snapshot's entity arrays.
     base: u32,
 }
 
 impl<'a> CellOccupants<'a> {
+    /// Entities in this cell.
     #[inline]
     pub fn len(&self) -> usize {
         self.ids.len()
     }
 
+    /// Whether the cell holds nothing.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
@@ -199,7 +204,11 @@ impl CellSnapshot {
     ///
     /// If `sub_axis` is zero, not a power of two, or finer than `cell_shift`
     /// permits.
-    pub fn with_subdivision(cfg: &WorldConfig, sub_axis: u32, sub_threshold: u32) -> CellSnapshot {
+    pub fn with_subdivision(
+        cfg: &WorldConfig,
+        sub_axis: u32,
+        sub_threshold: u32,
+    ) -> CellSnapshot {
         assert!(sub_axis > 0, "sub_axis must be positive");
         assert!(sub_axis.is_power_of_two(), "sub_axis must be a power of two");
         assert!(
@@ -274,11 +283,13 @@ impl CellSnapshot {
         (ox as u32, oy as u32)
     }
 
+    /// Sub-cells along one axis of a divided cell.
     #[inline]
     pub fn sub_axis(&self) -> u32 {
         self.sub_axis
     }
 
+    /// Occupants above which a cell is divided.
     #[inline]
     pub fn sub_threshold(&self) -> u32 {
         self.sub_threshold
@@ -314,16 +325,19 @@ impl CellSnapshot {
         &self.cfg
     }
 
+    /// Entities in the snapshot.
     #[inline]
     pub fn len(&self) -> usize {
         self.ids.len()
     }
 
+    /// Whether the snapshot holds no entities.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
 
+    /// Cells in the snapshot, occupied or not.
     #[inline]
     pub fn cell_count(&self) -> usize {
         self.cells
@@ -519,7 +533,8 @@ impl CellSnapshot {
 
 fn build_cell_order(cell_radius: u32) -> Vec<(i8, i8)> {
     let r = cell_radius as i32;
-    let mut v: Vec<(i32, (i8, i8))> = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
+    let mut v: Vec<(i32, (i8, i8))> =
+        Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
     for dy in -r..=r {
         for dx in -r..=r {
             v.push((dx * dx + dy * dy, (dx as i8, dy as i8)));
@@ -656,7 +671,10 @@ mod tests {
 
         for c in 0..snap.cell_count() {
             let cell = snap.entities_for_cell(CellId::from_raw(c as u32));
-            assert!(cell.ids.windows(2).all(|w| w[0] < w[1]), "cell {c} is not ascending by id");
+            assert!(
+                cell.ids.windows(2).all(|w| w[0] < w[1]),
+                "cell {c} is not ascending by id"
+            );
         }
     }
 
@@ -726,7 +744,12 @@ mod tests {
             .collect()
     }
 
-    fn sorted(cfg: &WorldConfig, pts: &[Pos3], axis: u32, threshold: u32) -> CellSnapshot {
+    fn sorted(
+        cfg: &WorldConfig,
+        pts: &[Pos3],
+        axis: u32,
+        threshold: u32,
+    ) -> CellSnapshot {
         let (xs, ys, zs) = axes(pts);
         let mut snap = CellSnapshot::with_subdivision(cfg, axis, threshold);
         snap.update(&xs, &ys, &zs, &all_live(pts.len()));
@@ -736,7 +759,13 @@ mod tests {
     // -- distance-ordered walk -----------------------------------------
 
     /// The world position of a sub-cell's low corner.
-    fn sub_corner(cfg: &WorldConfig, cell: CellCoord, axis: u32, sx: u32, sy: u32) -> Pos2 {
+    fn sub_corner(
+        cfg: &WorldConfig,
+        cell: CellCoord,
+        axis: u32,
+        sx: u32,
+        sy: u32,
+    ) -> Pos2 {
         let sub_shift = cfg.cell_shift() - axis.trailing_zeros();
         let cx = (cell.x as i32) << cfg.cell_shift();
         let cy = (cell.y as i32) << cfg.cell_shift();
@@ -795,7 +824,10 @@ mod tests {
                     assert!(
                         d2(w[0]) <= d2(w[1]),
                         "order from ({ox}, {oy}) goes {} then {}, distances {} then {}",
-                        w[0], w[1], d2(w[0]), d2(w[1])
+                        w[0],
+                        w[1],
+                        d2(w[0]),
+                        d2(w[1])
                     );
                 }
             }
@@ -974,15 +1006,30 @@ mod tests {
         let cfg = WorldConfig::default();
         let mut pts = crowd_in_one_cell(&cfg, 1000, 2048, 0x1234);
         let cid = cfg.cell_id(cfg.cell_of(pts[0].horizontal()));
-        let cell_lo = (Fixed::from_meters(2048).raw() as u32) & !(cfg.cell_size().raw() as u32 - 1);
+        let cell_lo =
+            (Fixed::from_meters(2048).raw() as u32) & !(cfg.cell_size().raw() as u32 - 1);
 
         // Park entity 0 in sub-cell (0, 0), then move it to (7, 7).
-        pts[0] = Pos3::new(Fixed::from_raw(cell_lo as i32), Fixed::from_raw(cell_lo as i32), Fixed::ZERO);
+        pts[0] = Pos3::new(
+            Fixed::from_raw(cell_lo as i32),
+            Fixed::from_raw(cell_lo as i32),
+            Fixed::ZERO,
+        );
         let snap = sorted(&cfg, &pts, 8, 512);
-        assert!(snap.sub_cells(cid).unwrap().occupants(0, 0).ids.contains(&EntityId::from_raw(0)));
+        assert!(
+            snap.sub_cells(cid)
+                .unwrap()
+                .occupants(0, 0)
+                .ids
+                .contains(&EntityId::from_raw(0))
+        );
 
         let far = cell_lo + cfg.cell_size().raw() as u32 - 1;
-        pts[0] = Pos3::new(Fixed::from_raw(far as i32), Fixed::from_raw(far as i32), Fixed::ZERO);
+        pts[0] = Pos3::new(
+            Fixed::from_raw(far as i32),
+            Fixed::from_raw(far as i32),
+            Fixed::ZERO,
+        );
         let snap = sorted(&cfg, &pts, 8, 512);
         let sub = snap.sub_cells(cid).unwrap();
         assert!(!sub.occupants(0, 0).ids.contains(&EntityId::from_raw(0)));
@@ -1009,7 +1056,10 @@ mod tests {
         assert_ne!(a, b);
         let (sa, sb) = (snap.sub_cells(a).unwrap(), snap.sub_cells(b).unwrap());
         let count = |s: &SubCells| -> usize {
-            (0..s.axis()).flat_map(|y| (0..s.axis()).map(move |x| (x, y))).map(|(x, y)| s.count(x, y)).sum()
+            (0..s.axis())
+                .flat_map(|y| (0..s.axis()).map(move |x| (x, y)))
+                .map(|(x, y)| s.count(x, y))
+                .sum()
         };
         assert_eq!(count(&sa), 1000);
         assert_eq!(count(&sb), 1000);
@@ -1044,7 +1094,8 @@ mod tests {
     #[test]
     fn surviving_ids_do_not_shift() {
         let cfg = WorldConfig::default();
-        let pts: Vec<Pos3> = (0..64).map(|i| Pos3::from_meters(100 + i, 100, 0)).collect();
+        let pts: Vec<Pos3> =
+            (0..64).map(|i| Pos3::from_meters(100 + i, 100, 0)).collect();
         let (xs, ys, zs) = axes(&pts);
 
         let mut live = all_live(pts.len());
@@ -1061,7 +1112,11 @@ mod tests {
             for i in 0..cell.len() {
                 let id = cell.ids[i];
                 assert!(live.contains(id), "{id:?} is dead but present");
-                assert_eq!(cell.pos(i), pts[id.index()], "{id:?} points at the wrong slot");
+                assert_eq!(
+                    cell.pos(i),
+                    pts[id.index()],
+                    "{id:?} points at the wrong slot"
+                );
             }
         }
     }

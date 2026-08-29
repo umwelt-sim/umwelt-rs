@@ -7,7 +7,7 @@
 //! umwelt owns the movement and lifetime vocabulary here because that is what
 //! it replicates. Everything else a game says to its clients rides in
 //! [`FromClient::Message`] and [`ToClient::Message`] as bytes umwelt does not
-//! read. See `docs/adr/0006`.
+//! read.
 //!
 //! # Framing
 //!
@@ -16,26 +16,26 @@
 //! as a `u32`. Both carry the same bodies, and the leading kind byte says which
 //! message it is either way.
 
-use crate::id::RegionId;
-use crate::entity::EntityId;
+use crate::entity::{EntityId, EntityKind};
 use crate::fixed::Fixed;
+use crate::id::{EntityHandle, RegionId};
 use crate::net::error::NetError;
-use crate::net::region::protocol::{EntityKind};
 use crate::net::wire::Cursor;
 use crate::pos::Pos3;
 
 /// One kind space across both directions, so a message is never ambiguous
-/// about which way it was meant to travel.
-pub const KIND_SPAWN: u8 = 1;
-pub const KIND_MOVE: u8 = 2;
-pub const KIND_DESPAWN: u8 = 3;
-pub const KIND_SPAWNED: u8 = 4;
-pub const KIND_REMOVED: u8 = 5;
-pub const KIND_STATE: u8 = 6;
+/// about which way it was meant to travel. Not public: a consumer reads
+/// [`FromClient`] and [`ToClient`], never the tag in front of one.
+pub(crate) const KIND_SPAWN: u8 = 1;
+pub(crate) const KIND_MOVE: u8 = 2;
+pub(crate) const KIND_DESPAWN: u8 = 3;
+pub(crate) const KIND_SPAWNED: u8 = 4;
+pub(crate) const KIND_REMOVED: u8 = 5;
+pub(crate) const KIND_STATE: u8 = 6;
 /// The consumer's own, and the only kind that travels both ways.
-pub const KIND_MESSAGE: u8 = 7;
-pub const KIND_REGION: u8 = 8;
-pub const KIND_MOVES: u8 = 9;
+pub(crate) const KIND_MESSAGE: u8 = 7;
+pub(crate) const KIND_REGION: u8 = 8;
+pub(crate) const KIND_MOVES: u8 = 9;
 
 /// The largest body either end will frame on a stream.
 ///
@@ -47,10 +47,10 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const POS_BYTES: usize = 12;
 
 /// Bytes one move in a batch takes: a handle and a position.
-pub const MOVE_BYTES: usize = 4 + POS_BYTES;
+pub(crate) const MOVE_BYTES: usize = 4 + POS_BYTES;
 
 /// Bytes a batch spends before its first move: the kind byte and the count.
-pub const MOVES_HEADER_BYTES: usize = 5;
+pub(crate) const MOVES_HEADER_BYTES: usize = 5;
 
 /// Most moves one [`FromClient::Moves`] may carry.
 ///
@@ -67,24 +67,20 @@ pub const MAX_MOVES_PER_DATAGRAM: usize = (1200 - MOVES_HEADER_BYTES) / MOVE_BYT
 /// What a client is told about a region: only what it needs to read that
 /// region's packets.
 ///
-/// Deliberately not [`ServerInfo`](crate::net::ServerInfo) or
-/// [`WorldParams`](crate::net::WorldParams). Those describe a region to an
-/// edge — protocol and crate versions to check, a view radius, a speed cap, a
-/// tick rate, a digest — none of which a game has any say in or use for. The
-/// two links share no types even where a field would look the same; see the
-/// `net` module.
-///
 /// The two extents are the whole of the wire layout: horizontal bits come from
-/// the region size and vertical bits from the extent, and a test in `codec`
-/// pins that nothing else changes what a decoder does.
+/// the region size and vertical bits from the extent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EdgeInfo {
+    /// Which region.
     pub region: RegionId,
+    /// Its horizontal extent, in meters.
     pub region_size_m: i32,
+    /// Its vertical extent, in meters.
     pub vertical_extent_m: i32,
 }
 
 impl EdgeInfo {
+    /// Its width on the wire.
     pub const BYTES: usize = 12;
 }
 
@@ -92,7 +88,7 @@ impl EdgeInfo {
 ///
 /// A client names entities by a handle it chose, not by the id a region
 /// allocated, so it can move one the instant it asks for it. The edge maps
-/// handles to regions and ids; see `docs/adr/0006`.
+/// handles to regions and ids;.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FromClient {
     /// Asks for an entity, in the region the game put this client in.
@@ -102,14 +98,31 @@ pub enum FromClient {
     /// region through a wildcard subscription and has no way to know, or any
     /// business deciding, where a player belongs. That is the game's, and the
     /// game is what told this client which region it is in.
-    Spawn { handle: u32, region: RegionId, position: Pos3, kind: EntityKind },
+    Spawn {
+        /// This connection's name for it from here on.
+        handle: EntityHandle,
+        /// Where the game decided this client belongs.
+        region: RegionId,
+        /// Where to put it.
+        position: Pos3,
+        /// What is behind it.
+        kind: EntityKind,
+    },
     /// A new absolute position. Latest-only, so this rides a datagram.
-    Move { handle: u32, position: Pos3 },
+    Move {
+        /// Which entity.
+        handle: EntityHandle,
+        /// Where it is now.
+        position: Pos3,
+    },
     /// Several new positions at once, which is what a client with more than a
     /// handful of entities sends. Latest-only, so this rides a datagram too.
-    Moves(Vec<(u32, Pos3)>),
+    Moves(Vec<(EntityHandle, Pos3)>),
     /// Gives an entity back.
-    Despawn { handle: u32 },
+    Despawn {
+        /// Which entity.
+        handle: EntityHandle,
+    },
     /// The game's own, which umwelt does not read.
     Message(Vec<u8>),
 }
@@ -122,32 +135,33 @@ impl FromClient {
         matches!(self, FromClient::Move { .. } | FromClient::Moves(_))
     }
 
+    /// Appends the encoded message.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         match self {
             FromClient::Spawn { handle, region, position, kind } => {
                 out.push(KIND_SPAWN);
-                out.extend_from_slice(&handle.to_le_bytes());
+                out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(&region.raw().to_le_bytes());
                 put_pos(*position, out);
                 out.push(kind.as_u8());
             }
             FromClient::Move { handle, position } => {
                 out.push(KIND_MOVE);
-                out.extend_from_slice(&handle.to_le_bytes());
+                out.extend_from_slice(&handle.raw().to_le_bytes());
                 put_pos(*position, out);
             }
             FromClient::Moves(moves) => {
                 out.push(KIND_MOVES);
                 out.extend_from_slice(&(moves.len() as u32).to_le_bytes());
                 for (handle, position) in moves {
-                    out.extend_from_slice(&handle.to_le_bytes());
+                    out.extend_from_slice(&handle.raw().to_le_bytes());
                     put_pos(*position, out);
                 }
             }
             FromClient::Despawn { handle } => {
                 out.push(KIND_DESPAWN);
-                out.extend_from_slice(&handle.to_le_bytes());
+                out.extend_from_slice(&handle.raw().to_le_bytes());
             }
             FromClient::Message(body) => {
                 out.push(KIND_MESSAGE);
@@ -156,12 +170,14 @@ impl FromClient {
         }
     }
 
+    /// Reads one back from a whole frame.
     pub fn decode(frame: &[u8]) -> Result<FromClient, NetError> {
-        let (&kind, body) = frame.split_first().ok_or(NetError::Malformed("client message"))?;
+        let (&kind, body) =
+            frame.split_first().ok_or(NetError::Malformed("client message"))?;
         match kind {
             KIND_SPAWN => {
                 let mut c = Cursor::new(body, "client spawn");
-                let handle = c.u32()?;
+                let handle = EntityHandle::from_raw(c.u32()?);
                 let region = RegionId::from_raw(c.u32()?);
                 let position = get_pos(&mut c)?;
                 let kind = EntityKind::from_u8(c.u8()?)
@@ -171,7 +187,7 @@ impl FromClient {
             }
             KIND_MOVE => {
                 let mut c = Cursor::new(body, "client move");
-                let handle = c.u32()?;
+                let handle = EntityHandle::from_raw(c.u32()?);
                 let position = get_pos(&mut c)?;
                 c.finish()?;
                 Ok(FromClient::Move { handle, position })
@@ -186,14 +202,14 @@ impl FromClient {
                 }
                 let mut moves = Vec::with_capacity(count);
                 for _ in 0..count {
-                    moves.push((c.u32()?, get_pos(&mut c)?));
+                    moves.push((EntityHandle::from_raw(c.u32()?), get_pos(&mut c)?));
                 }
                 c.finish()?;
                 Ok(FromClient::Moves(moves))
             }
             KIND_DESPAWN => {
                 let mut c = Cursor::new(body, "client despawn");
-                let handle = c.u32()?;
+                let handle = EntityHandle::from_raw(c.u32()?);
                 c.finish()?;
                 Ok(FromClient::Despawn { handle })
             }
@@ -218,16 +234,31 @@ pub enum ToClient<'a> {
     /// which regions a client cares about when the client asks for one.
     Region(EdgeInfo),
     /// A region allocated an id for the entity this handle asked for.
-    Spawned { handle: u32, region: RegionId, entity: EntityId },
+    Spawned {
+        /// The handle that asked.
+        handle: EntityHandle,
+        /// Where it ended up.
+        region: RegionId,
+        /// What that region calls it.
+        entity: EntityId,
+    },
     /// Gone, whatever caused it.
-    Removed { handle: u32 },
+    Removed {
+        /// The handle that named it.
+        handle: EntityHandle,
+    },
     /// What one of this client's entities can see. Named by the handle that
     /// asked for it, not by the entity or the region: the edge knows which
     /// avatar a packet was built for and which of this client's handles that
     /// is, and a game has no use for the other two.
     ///
     /// Latest-only, so this rides a datagram.
-    State { handle: u32, packet: &'a [u8] },
+    State {
+        /// Which of this client's entities is looking.
+        handle: EntityHandle,
+        /// The region's packet, untouched except for the four bytes in front.
+        packet: &'a [u8],
+    },
     /// The game's own, which umwelt does not read.
     Message(&'a [u8]),
 }
@@ -238,6 +269,7 @@ impl ToClient<'_> {
         matches!(self, ToClient::State { .. })
     }
 
+    /// Replaces `out` with the encoded message.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         self.encode_onto(out);
@@ -256,17 +288,17 @@ impl ToClient<'_> {
             }
             ToClient::Spawned { handle, region, entity } => {
                 out.push(KIND_SPAWNED);
-                out.extend_from_slice(&handle.to_le_bytes());
+                out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(&region.raw().to_le_bytes());
                 out.extend_from_slice(&entity.raw().to_le_bytes());
             }
             ToClient::Removed { handle } => {
                 out.push(KIND_REMOVED);
-                out.extend_from_slice(&handle.to_le_bytes());
+                out.extend_from_slice(&handle.raw().to_le_bytes());
             }
             ToClient::State { handle, packet } => {
                 out.push(KIND_STATE);
-                out.extend_from_slice(&handle.to_le_bytes());
+                out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(packet);
             }
             ToClient::Message(body) => {
@@ -276,8 +308,10 @@ impl ToClient<'_> {
         }
     }
 
+    /// Reads one back, borrowing the frame rather than copying it.
     pub fn decode(frame: &[u8]) -> Result<ToClient<'_>, NetError> {
-        let (&kind, body) = frame.split_first().ok_or(NetError::Malformed("edge message"))?;
+        let (&kind, body) =
+            frame.split_first().ok_or(NetError::Malformed("edge message"))?;
         match kind {
             KIND_REGION => {
                 let mut c = Cursor::new(body, "region info");
@@ -285,11 +319,15 @@ impl ToClient<'_> {
                 let region_size_m = c.i32()?;
                 let vertical_extent_m = c.i32()?;
                 c.finish()?;
-                Ok(ToClient::Region(EdgeInfo { region, region_size_m, vertical_extent_m }))
+                Ok(ToClient::Region(EdgeInfo {
+                    region,
+                    region_size_m,
+                    vertical_extent_m,
+                }))
             }
             KIND_SPAWNED => {
                 let mut c = Cursor::new(body, "spawned");
-                let handle = c.u32()?;
+                let handle = EntityHandle::from_raw(c.u32()?);
                 let region = RegionId::from_raw(c.u32()?);
                 let entity = EntityId::from_raw(c.u32()?);
                 c.finish()?;
@@ -297,7 +335,7 @@ impl ToClient<'_> {
             }
             KIND_REMOVED => {
                 let mut c = Cursor::new(body, "removed");
-                let handle = c.u32()?;
+                let handle = EntityHandle::from_raw(c.u32()?);
                 c.finish()?;
                 Ok(ToClient::Removed { handle })
             }
@@ -305,7 +343,9 @@ impl ToClient<'_> {
                 if body.len() < 4 {
                     return Err(NetError::Malformed("state"));
                 }
-                let handle = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let handle = EntityHandle::from_raw(u32::from_le_bytes([
+                    body[0], body[1], body[2], body[3],
+                ]));
                 Ok(ToClient::State { handle, packet: &body[4..] })
             }
             KIND_MESSAGE => Ok(ToClient::Message(body)),
@@ -341,6 +381,7 @@ pub struct Framer {
 }
 
 impl Framer {
+    /// Holding no partial frame.
     pub fn new() -> Framer {
         Framer::default()
     }
@@ -367,8 +408,8 @@ impl Framer {
         if self.buf.len() < 4 {
             return Ok(None);
         }
-        let len =
-            u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+        let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+            as usize;
         if len > MAX_MESSAGE_BYTES {
             return Err(NetError::Malformed("client frame length"));
         }
@@ -385,6 +426,11 @@ impl Framer {
 mod tests {
     use super::*;
 
+    /// Shorthand, since every message in here names one.
+    fn h(raw: u32) -> EntityHandle {
+        EntityHandle::from_raw(raw)
+    }
+
     fn pos() -> Pos3 {
         Pos3::from_meters(100, 200, 5)
     }
@@ -392,21 +438,21 @@ mod tests {
     fn up() -> Vec<FromClient> {
         vec![
             FromClient::Spawn {
-                handle: 7,
+                handle: h(7),
                 region: RegionId::from_raw(9),
                 position: pos(),
                 kind: EntityKind::Observer,
             },
             FromClient::Spawn {
-                handle: 0,
+                handle: h(0),
                 region: RegionId::from_raw(4_000_000_000),
                 position: pos(),
                 kind: EntityKind::Unattended,
             },
-            FromClient::Move { handle: 9, position: pos() },
-            FromClient::Moves(vec![(1, pos()), (2, pos()), (3, pos())]),
+            FromClient::Move { handle: h(9), position: pos() },
+            FromClient::Moves(vec![(h(1), pos()), (h(2), pos()), (h(3), pos())]),
             FromClient::Moves(Vec::new()),
-            FromClient::Despawn { handle: 4_000_000_000 },
+            FromClient::Despawn { handle: h(4_000_000_000) },
             FromClient::Message(b"the game's own".to_vec()),
             FromClient::Message(Vec::new()),
         ]
@@ -420,13 +466,13 @@ mod tests {
                 vertical_extent_m: 1024,
             }),
             ToClient::Spawned {
-                handle: 7,
+                handle: h(7),
                 region: RegionId::from_raw(9),
                 entity: EntityId::from_raw(42),
             },
-            ToClient::Removed { handle: 7 },
-            ToClient::State { handle: 7, packet: b"a packet" },
-            ToClient::State { handle: 7, packet: b"" },
+            ToClient::Removed { handle: h(7) },
+            ToClient::State { handle: h(7), packet: b"a packet" },
+            ToClient::State { handle: h(7), packet: b"" },
             ToClient::Message(b"the game's own"),
         ]
     }
@@ -487,8 +533,8 @@ mod tests {
         // 1,093 bytes together against 1,156 apart, but one datagram against
         // sixty-eight, each of which would carry its own UDP and QUIC headers
         // and cost a send.
-        let batch: Vec<(u32, Pos3)> =
-            (0..MAX_MOVES_PER_DATAGRAM as u32).map(|n| (n, pos())).collect();
+        let batch: Vec<(EntityHandle, Pos3)> =
+            (0..MAX_MOVES_PER_DATAGRAM as u32).map(|n| (h(n), pos())).collect();
         let mut framed = Vec::new();
         FromClient::Moves(batch.clone()).encode(&mut framed);
         assert!(
@@ -496,30 +542,36 @@ mod tests {
             "a full batch is {} bytes and must fit the protocol's own cap",
             framed.len()
         );
-        assert_eq!(FromClient::decode(&framed).expect("well formed"), FromClient::Moves(batch));
+        assert_eq!(
+            FromClient::decode(&framed).expect("well formed"),
+            FromClient::Moves(batch)
+        );
     }
 
     #[test]
     fn a_batch_past_the_cap_is_refused() {
         let mut body = vec![KIND_MOVES];
         body.extend_from_slice(&(u32::MAX).to_le_bytes());
-        assert!(FromClient::decode(&body).is_err(), "an absurd count must not be believed");
+        assert!(
+            FromClient::decode(&body).is_err(),
+            "an absurd count must not be believed"
+        );
     }
 
     #[test]
     fn the_wire_sizes_are_what_they_look_like() {
         let mut buf = Vec::new();
-        FromClient::Move { handle: 1, position: pos() }.encode(&mut buf);
+        FromClient::Move { handle: h(1), position: pos() }.encode(&mut buf);
         assert_eq!(buf.len(), 1 + 4 + POS_BYTES, "kind, handle, position");
         FromClient::Spawn {
-            handle: 1,
+            handle: h(1),
             region: RegionId::from_raw(1),
             position: pos(),
             kind: EntityKind::Observer,
         }
         .encode(&mut buf);
         assert_eq!(buf.len(), 1 + 4 + 4 + POS_BYTES + 1, "a region and a kind byte");
-        FromClient::Despawn { handle: 1 }.encode(&mut buf);
+        FromClient::Despawn { handle: h(1) }.encode(&mut buf);
         assert_eq!(buf.len(), 1 + 4);
     }
 
@@ -541,14 +593,14 @@ mod tests {
         // edge does not decode as something an edge acts on.
         let mut buf = Vec::new();
         ToClient::Spawned {
-            handle: 1,
+            handle: h(1),
             region: RegionId::from_raw(1),
             entity: EntityId::from_raw(1),
         }
         .encode(&mut buf);
         assert!(FromClient::decode(&buf).is_err());
 
-        FromClient::Despawn { handle: 1 }.encode(&mut buf);
+        FromClient::Despawn { handle: h(1) }.encode(&mut buf);
         assert!(ToClient::decode(&buf).is_err());
     }
 

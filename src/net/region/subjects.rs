@@ -10,16 +10,16 @@
 //! | `umwelt.{region}.edge.{edge}.command` | edge to region |
 //!
 //! An edge subscribes to `umwelt.*.edge.{edge}.state` and `.presence` once and
-//! never again: a region it has never heard of matches subscriptions it already
-//! holds. That is why migrating an entity between regions costs the edge
-//! nothing. `{edge}` names the edge that *owns* an entity, not whoever is
-//! listening, so presence reaches one edge rather than all of them. See
-//! `docs/adr/0001` and `docs/adr/0004`.
+//! never again: a region it has never heard of matches subscriptions it
+//! already holds. That is why migrating an entity between regions costs the
+//! edge nothing. `{edge}` names the edge that *owns* an entity, not whoever is
+//! listening, so presence reaches one edge rather than all of them.
 
 use crate::id::RegionId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
 
+/// Where a region answers what world it runs.
 pub fn info(region: RegionId) -> String {
     format!("umwelt.{}.info", region.raw())
 }
@@ -34,6 +34,7 @@ pub fn presence(region: RegionId, edge: &EdgeName) -> String {
     format!("umwelt.{}.edge.{edge}.presence", region.raw())
 }
 
+/// Where one edge sends its commands to one region.
 pub fn command(region: RegionId, edge: &EdgeName) -> String {
     format!("umwelt.{}.edge.{edge}.command", region.raw())
 }
@@ -101,7 +102,10 @@ mod tests {
 
     #[test]
     fn a_command_subject_names_its_sender() {
-        assert_eq!(sender("umwelt.7.edge.edge-3.command").expect("parses").as_str(), "edge-3");
+        assert_eq!(
+            sender("umwelt.7.edge.edge-3.command").expect("parses").as_str(),
+            "edge-3"
+        );
         assert!(sender("umwelt.7.edge.edge-3.state").is_err());
         assert!(sender("umwelt.7.info").is_err());
         assert!(sender("nonsense").is_err());
@@ -109,8 +113,14 @@ mod tests {
 
     #[test]
     fn a_payload_subject_names_its_region() {
-        assert_eq!(origin("umwelt.7.edge.e.state").expect("parses"), RegionId::from_raw(7));
-        assert_eq!(origin("umwelt.12.edge.e.presence").expect("parses"), RegionId::from_raw(12));
+        assert_eq!(
+            origin("umwelt.7.edge.e.state").expect("parses"),
+            RegionId::from_raw(7)
+        );
+        assert_eq!(
+            origin("umwelt.12.edge.e.presence").expect("parses"),
+            RegionId::from_raw(12)
+        );
         assert!(origin("umwelt.seven.edge.e.state").is_err());
         assert!(origin("umwelt.7.edge.e.command").is_err());
     }

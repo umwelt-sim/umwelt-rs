@@ -26,15 +26,30 @@ pub enum NetError {
     /// read rather than echoing any of the sender's bytes back.
     Malformed(&'static str),
     /// A well-formed message of a kind that does not belong on that subject.
-    Unexpected { expected: &'static str, got: u8 },
+    Unexpected {
+        /// What that subject carries.
+        expected: &'static str,
+        /// The kind byte that arrived instead.
+        got: u8,
+    },
     /// A message body past what this side will allocate for it.
-    MessageTooLarge { claimed: usize, max: usize },
+    MessageTooLarge {
+        /// The length the sender announced.
+        claimed: usize,
+        /// The most this side will allocate.
+        max: usize,
+    },
     /// A subject carried an edge name this build will not accept.
     BadEdgeName(&'static str),
     /// A subject did not parse into the tokens it should have.
     BadSubject,
     /// The two ends do not speak the same protocol version.
-    ProtocolMismatch { ours: ProtocolVersion, theirs: ProtocolVersion },
+    ProtocolMismatch {
+        /// What this side speaks.
+        ours: ProtocolVersion,
+        /// What the other side speaks.
+        theirs: ProtocolVersion,
+    },
     /// The advertised world parameters do not rebuild into a valid config.
     Config(ConfigError),
     /// The parameters rebuilt, but into a world that decodes packets
@@ -42,7 +57,12 @@ pub enum NetError {
     ///
     /// The digest is [`WorldConfig::protocol_hash`](crate::WorldConfig::protocol_hash),
     /// which covers exactly the fields that affect wire decoding.
-    ConfigMismatch { ours: u64, theirs: u64 },
+    ConfigMismatch {
+        /// The digest of the config rebuilt on this side.
+        ours: u64,
+        /// The digest the region sent.
+        theirs: u64,
+    },
 }
 
 impl fmt::Display for NetError {

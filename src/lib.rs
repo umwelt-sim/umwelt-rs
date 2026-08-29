@@ -1,60 +1,46 @@
-//! # Umwelt
-//! A Rust library for managing online simulations at extreme scale
-//! 
-//! 
-//! ```
-//! use umwelt::WorldConfig;
-//!
-//! let cfg = WorldConfig::builder()
-//!            .region_size_m(4096)
-//!            .vertical_extent_m(1024)
-//!            .horizontal_view_radius_m(256)
-//!            .max_horizontal_speed_m_per_sec(40)
-//!            .tick_hz(20)
-//!            .build()?;
-//! # Ok::<(), umwelt::ConfigError>(())
-//! ```
+#![doc = include_str!("../README.md")]
 
+#![warn(missing_docs)]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/umwelt-sim/umwelt-rs/main/assets/logo/umwelt-tile-small.svg",
     html_favicon_url = "https://raw.githubusercontent.com/umwelt-sim/umwelt-rs/main/assets/logo/favicon.svg"
 )]
 
-pub mod fixed;
-pub mod pos;
 pub mod config;
 pub mod entity;
-pub mod id;
-pub mod gather;
-pub mod snapshot;
-pub mod odometer;
-pub mod ghost;
-pub mod select;
-pub mod budget;
-pub mod codec;
-pub mod packet;
-mod subscription;
+pub mod fixed;
 pub mod game;
-pub mod sim;
+pub mod id;
 pub mod net;
+pub mod packet;
+pub mod pos;
+pub mod sim;
 
-pub use fixed::{Fixed, DistSq, FIXED_ONE, FIXED_SHIFT};
-pub use pos::{Pos3, Pos2, CellCoord, CellId};
+mod budget;
+mod codec;
+mod gather;
+mod ghost;
+mod odometer;
+mod select;
+mod snapshot;
+mod subscription;
+
+#[doc(hidden)]
+pub mod internals;
+
 pub use config::{ConfigError, WorldConfig, WorldConfigBuilder};
-pub use entity::{EntityId, LiveSet};
-pub use id::{ClientId, EntityKey, RegionId};
-pub use gather::{DiscoveredEntities, DiscoveredEntity};
-pub use snapshot::{CellOccupants, CellSnapshot, SubCells};
-pub use odometer::Odometer;
-pub use ghost::GhostTable;
-pub use select::{Policy, Ranked, Selection, Weights, select};
-pub use codec::RecordCodec;
-pub use packet::{PacketHeader, PacketReader, PacketWriter};
-pub use budget::PacketBudget;
+pub use entity::{EntityId, EntityKind, LiveSet};
+pub use fixed::{DistSq, Fixed};
 pub use game::{ClientGame, EdgeGame, Game};
+pub use id::{ClientId, EntityHandle, EntityKey, RegionId};
+pub use net::{ClientHandle, EdgeClient, EdgeHandle, EdgeServer, NetError, RegionServer};
+pub use packet::{PacketHeader, PacketReader};
+pub use pos::{CellCoord, CellId, Pos2, Pos3};
+// From modules the crate keeps to itself. A consumer names these — `Policy` and
+// `Weights` to tune replication, the rest to read what a region reports — and
+// nothing else in those modules.
+pub use select::{Policy, Weights};
 pub use sim::{
     ClientLimits, Flow, Handoff, NullSink, Overrun, Pacing, PayloadSink, RecordingSink,
     RunSummary, Step, TickReport, TickStats, ViewerId, Wait, WorldSimulation,
 };
-pub use subscription::{CellList, Subscription};
-pub use net::{EdgeClient, EdgeHandle, EdgeServer, RegionClient, RegionServer};

@@ -3,9 +3,9 @@
 //! The types in this module are abstractions around optimizations made to
 //! perform calculations within the simulation as fast as possible. This includes
 //! things like performing shifts instead of divide and multiply.
-//! 
+//!
 //! "Raw units" are referred to in multiple places in different modules. No matter
-//! what the runtime configuration contains, a single raw unit will _always_ be 
+//! what the runtime configuration contains, a single raw unit will _always_ be
 //! equal to `1/1024` meters or `0.9766` millimeters. The net result of this
 //! is that the slowest possible entity moving 1 unit per tick at 20 Hz moves around 2cm/s.
 //!
@@ -30,7 +30,7 @@
 //! # Storage
 //!
 //! [`Pos3`] is a **value type**: functions take and return this directly from the stack without ever performing
-//! a pointer de-reference. This is important for hot-path calculations on a ~50ms budget tick. 
+//! a pointer de-reference. This is important for hot-path calculations on a ~50ms budget tick.
 
 use core::{
     fmt,
@@ -46,18 +46,19 @@ use crate::fixed::{DistSq, Fixed};
 /// and interpolation.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Pos3 {
+    /// East.
     pub x: Fixed,
+    /// North.
     pub y: Fixed,
+    /// Up.
     pub z: Fixed,
 }
 
 impl Pos3 {
-    pub const ZERO: Pos3 = Pos3 {
-        x: Fixed::ZERO,
-        y: Fixed::ZERO,
-        z: Fixed::ZERO,
-    };
+    /// The origin.
+    pub const ZERO: Pos3 = Pos3 { x: Fixed::ZERO, y: Fixed::ZERO, z: Fixed::ZERO };
 
+    /// From whole meters.
     #[inline]
     pub const fn from_meters(x: i32, y: i32, z: i32) -> Pos3 {
         Pos3 {
@@ -67,17 +68,16 @@ impl Pos3 {
         }
     }
 
+    /// From three axes.
     #[inline]
     pub const fn new(x: Fixed, y: Fixed, z: Fixed) -> Pos3 {
         Pos3 { x, y, z }
     }
 
+    /// The `x` and `y` of it, which is what distance is measured on.
     #[inline]
     pub const fn horizontal(self) -> Pos2 {
-        Pos2 {
-            x: self.x,
-            y: self.y,
-        }
+        Pos2 { x: self.x, y: self.y }
     }
 
     /// Full 3D squared separation (Pythagorean distance). Use for priority scoring.
@@ -120,11 +120,7 @@ impl Add for Pos3 {
 
     #[inline]
     fn add(self, rhs: Pos3) -> Pos3 {
-        Pos3 {
-            x: self.x + rhs.x,
-            y: self.y + rhs.y,
-            z: self.z + rhs.z,
-        }
+        Pos3 { x: self.x + rhs.x, y: self.y + rhs.y, z: self.z + rhs.z }
     }
 }
 
@@ -133,11 +129,7 @@ impl Sub for Pos3 {
 
     #[inline]
     fn sub(self, rhs: Pos3) -> Pos3 {
-        Pos3 {
-            x: self.x - rhs.x,
-            y: self.y - rhs.y,
-            z: self.z - rhs.z,
-        }
+        Pos3 { x: self.x - rhs.x, y: self.y - rhs.y, z: self.z - rhs.z }
     }
 }
 
@@ -169,29 +161,29 @@ impl fmt::Debug for Pos3 {
 /// A horizontal position. What the cell grid actually operates on.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Pos2 {
+    /// East.
     pub x: Fixed,
+    /// North.
     pub y: Fixed,
 }
 
 impl Pos2 {
-    pub const ZERO: Pos2 = Pos2 {
-        x: Fixed::ZERO,
-        y: Fixed::ZERO,
-    };
+    /// The origin.
+    pub const ZERO: Pos2 = Pos2 { x: Fixed::ZERO, y: Fixed::ZERO };
 
+    /// From two axes.
     #[inline]
     pub const fn new(x: Fixed, y: Fixed) -> Pos2 {
         Pos2 { x, y }
     }
 
+    /// From whole meters.
     #[inline]
     pub const fn from_meters(x: i32, y: i32) -> Pos2 {
-        Pos2 {
-            x: Fixed::from_meters(x),
-            y: Fixed::from_meters(y),
-        }
+        Pos2 { x: Fixed::from_meters(x), y: Fixed::from_meters(y) }
     }
 
+    /// Squared distance between the two, which is what ranking compares.
     #[inline]
     pub const fn dist_sq(self, other: Pos2) -> DistSq {
         let dx = self.x.raw() as i64 - other.x.raw() as i64;
@@ -202,11 +194,7 @@ impl Pos2 {
     /// Lift to 3D at the given height.
     #[inline]
     pub const fn at_height(self, z: Fixed) -> Pos3 {
-        Pos3 {
-            x: self.x,
-            y: self.y,
-            z,
-        }
+        Pos3 { x: self.x, y: self.y, z }
     }
 }
 
@@ -223,11 +211,14 @@ impl fmt::Debug for Pos2 {
 /// which owns the cell size. This type on its own knows nothing of world sizes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct CellCoord {
+    /// Column, counting east.
     pub x: u16,
+    /// Row, counting north.
     pub y: u16,
 }
 
 impl CellCoord {
+    /// From a cell's column and row.
     #[inline]
     pub const fn new(x: u16, y: u16) -> CellCoord {
         CellCoord { x, y }
@@ -270,16 +261,19 @@ impl fmt::Debug for CellCoord {
 pub struct CellId(u32);
 
 impl CellId {
+    /// From the raw value.
     #[inline]
     pub const fn from_raw(raw: u32) -> CellId {
         CellId(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }
 
+    /// The id as an index into a per-cell array.
     #[inline]
     pub const fn index(self) -> usize {
         self.0 as usize

@@ -149,6 +149,7 @@ pub struct Handoff<S: PayloadSink + Send + Sync + 'static> {
 }
 
 impl<S: PayloadSink + Send + Sync + 'static> Handoff<S> {
+    /// Wraps a sink, starting the thread that drains into it.
     pub fn new(inner: S) -> Handoff<S> {
         let shared = Arc::new(Shared {
             inner,
@@ -352,7 +353,11 @@ mod tests {
             h.send(v(0), &[k; 8]);
         }
         assert!(h.flush(Duration::from_secs(5)));
-        assert!(h.delivered() < 50, "supersedes must collapse, not queue: {}", h.delivered());
+        assert!(
+            h.delivered() < 50,
+            "supersedes must collapse, not queue: {}",
+            h.delivered()
+        );
 
         // With nothing in flight the next stash cannot lose a race, so what a
         // client ends up holding is the freshest frame produced.
@@ -377,7 +382,11 @@ mod tests {
         }
         drop(h);
         for k in 0..16u32 {
-            assert_eq!(seen.latest(v(k)).as_deref(), Some(&b"bye"[..]), "viewer {k} lost");
+            assert_eq!(
+                seen.latest(v(k)).as_deref(),
+                Some(&b"bye"[..]),
+                "viewer {k} lost"
+            );
         }
     }
 

@@ -10,8 +10,8 @@
 //!
 //! Each served viewer's [`Selection`] is then assembled into a payload and
 //! handed to the [`PayloadSink`] the consumer attached, after
-//! [`tick_with`](WorldSimulation::tick_with) shows both to its observer. Viewers
-//! are partitioned across worker threads.
+//! [`tick_with`](WorldSimulation::tick_with) shows both to its observer.
+//! Viewers are partitioned across worker threads.
 //!
 //! Not here: the clock that drives the tick, events, and any transport past the
 //! sink.
@@ -79,11 +79,13 @@ pub struct Step<'a> {
 }
 
 impl Step<'_> {
+    /// Which tick is running.
     #[inline]
     pub fn tick(&self) -> u32 {
         self.tick
     }
 
+    /// The world this runs in.
     #[inline]
     pub fn config(&self) -> &WorldConfig {
         self.cfg
@@ -95,6 +97,7 @@ impl Step<'_> {
         self.xs.len()
     }
 
+    /// Which slots hold an entity.
     #[inline]
     pub fn live(&self) -> &LiveSet {
         self.live
@@ -307,10 +310,13 @@ fn serve<S: PayloadSink>(
 
 /// One viewer's finished work for a tick.
 pub struct Outbound<'a> {
+    /// Whose work this was.
     pub viewer: ViewerId,
     /// The assembled payload. Scratch that the next viewer overwrites.
     pub bytes: &'a [u8],
+    /// What was chosen, ranked. The payload was assembled from it.
     pub selection: &'a Selection,
+    /// Everything the gather found, chosen or not.
     pub candidates: &'a DiscoveredEntities,
 }
 
@@ -319,7 +325,6 @@ pub struct Outbound<'a> {
 /// Only the pacing loop knows how late a tick was and whether a deadline was
 /// skipped, and only the simulation knows how many viewers it served. So the
 /// simulation accumulates both, and whatever publishes a heartbeat drains it.
-/// See `docs/adr/0007`.
 ///
 /// Not public: the only thing that can fill one is the pacing loop, and the
 /// only thing that drains one is the heartbeat. A consumer handed the type
@@ -358,6 +363,54 @@ impl TickSpan {
 }
 
 /// One region's simulation.
+///
+/// Holds the entities, runs the tick, and does every viewer's replication work
+/// against the snapshot each tick rebuilds. A consumer supplies a [`Game`] and
+/// calls [`tick`](Self::tick), or hands the whole loop over to
+/// [`run`](Self::run).
+///
+/// ```
+/// use umwelt::{ClientLimits, EntityId, Fixed, Game, Pos3, Step};
+/// use umwelt::{WorldConfig, WorldSimulation};
+///
+/// /// Fills the region on its first tick, then drifts everything north.
+/// #[derive(Default)]
+/// struct Crowd {
+///     arrived: bool,
+///     watcher: Option<EntityId>,
+/// }
+///
+/// impl Game for Crowd {
+///     fn step(&mut self, world: &mut Step<'_>) {
+///         if !self.arrived {
+///             self.arrived = true;
+///             self.watcher = Some(world.spawn(Pos3::from_meters(2048, 2048, 0)));
+///             for n in 0..64 {
+///                 world.spawn(Pos3::from_meters(2048 + n, 2048, 0));
+///             }
+///             return;
+///         }
+///         // A tenth of a meter a tick, in place, with no marshaling pass.
+///         let step = Fixed::from_raw(102);
+///         let (_, ys, _) = world.positions_mut();
+///         for y in ys {
+///             *y = y.saturating_add(step);
+///         }
+///     }
+/// }
+///
+/// let mut sim = WorldSimulation::new(WorldConfig::default(), Crowd::default());
+/// sim.tick();
+///
+/// // A viewer is an entity somebody is looking out of. Entities exist whether
+/// // or not anyone watches them; only a viewer costs replication work.
+/// let watcher = sim.game().watcher.expect("spawned on the first tick");
+/// sim.register_viewer(watcher, ClientLimits::default());
+///
+/// let stats = sim.tick();
+/// assert_eq!(stats.viewers, 1);
+/// assert!(stats.records > 0, "the crowd is inside the view radius");
+/// ```
 pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     cfg: WorldConfig,
     game: G,
@@ -450,7 +503,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// other constructor has to name it:
     ///
     /// ```ignore
-    /// let sim = WorldSimulation::new(cfg, game).with_sink(EdgeSink::connect(addr)?);
+    /// let sim = WorldSimulation::new(cfg,
+    /// game).with_sink(EdgeSink::connect(addr)?);
     /// ```
     pub fn with_sink<T: PayloadSink>(self, sink: T) -> WorldSimulation<G, T> {
         WorldSimulation {
@@ -514,26 +568,33 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         });
     }
 
+    /// The world this simulation runs in.
     #[inline]
     pub fn config(&self) -> &WorldConfig {
         &self.cfg
     }
 
+    /// Ticks run so far.
     #[inline]
     pub fn tick_count(&self) -> u32 {
         self.tick
     }
 
+    /// The consumer's game.
     #[inline]
     pub fn game(&self) -> &G {
         &self.game
     }
 
+    /// The cell-ordered view the last tick was served from.
+    #[doc(hidden)]
     #[inline]
     pub fn snapshot(&self) -> &CellSnapshot {
         &self.snap
     }
 
+    /// How far each entity has moved since it was last sent.
+    #[doc(hidden)]
     #[inline]
     pub fn odometer(&self) -> &Odometer {
         &self.odo
@@ -567,7 +628,13 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     }
 
     /// Records one tick against the span. Called by the pacing loop.
-    pub(crate) fn record_tick(&mut self, took: Duration, late: bool, dropped: u32, viewers: u64) {
+    pub(crate) fn record_tick(
+        &mut self,
+        took: Duration,
+        late: bool,
+        dropped: u32,
+        viewers: u64,
+    ) {
         self.span.ticks += 1;
         self.span.viewers += viewers;
         self.span.spent += took;
@@ -623,7 +690,11 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     ///
     /// Nothing here opens a connection. The edge maps the returned id to a
     /// socket; the simulation never sees one.
-    pub fn register_viewer(&mut self, avatar: EntityId, limits: ClientLimits) -> ViewerId {
+    pub fn register_viewer(
+        &mut self,
+        avatar: EntityId,
+        limits: ClientLimits,
+    ) -> ViewerId {
         let budget = PacketBudget::new(&self.codec, limits.payload_bytes);
         if let Some(id) = self.free.pop() {
             self.viewers[id.index()].reset(avatar, budget, limits.send_period);
@@ -673,10 +744,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// Viewers are partitioned across [`thread_count`](Self::thread_count)
     /// workers, so `on_viewer` is called from several threads at once and must
     /// be `Sync`.
-    pub fn tick_with(
-        &mut self,
-        on_viewer: &(impl Fn(Outbound<'_>) + Sync),
-    ) -> TickStats {
+    #[doc(hidden)]
+    pub fn tick_with(&mut self, on_viewer: &(impl Fn(Outbound<'_>) + Sync)) -> TickStats {
         self.tick = self.tick.wrapping_add(1);
 
         {
@@ -732,12 +801,20 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
 
         let chunk = viewers.len().div_ceil(threads);
         std::thread::scope(|scope| {
-            for (c, (vs, w)) in viewers.chunks_mut(chunk).zip(workers.iter_mut()).enumerate() {
+            for (c, (vs, w)) in
+                viewers.chunks_mut(chunk).zip(workers.iter_mut()).enumerate()
+            {
                 let frame = &frame;
                 let base = c * chunk;
                 scope.spawn(move || {
                     for (k, v) in vs.iter_mut().enumerate() {
-                        serve(frame, ViewerId::from_raw((base + k) as u32), v, w, on_viewer);
+                        serve(
+                            frame,
+                            ViewerId::from_raw((base + k) as u32),
+                            v,
+                            w,
+                            on_viewer,
+                        );
                     }
                 });
             }
@@ -916,7 +993,10 @@ mod tests {
         let still = ids[1];
         let hit = AtomicBool::new(false);
         let watch = |o: Outbound<'_>| {
-            if o.selection.records().iter().any(|r| o.candidates.as_slice()[r.index()].id == still)
+            if o.selection
+                .records()
+                .iter()
+                .any(|r| o.candidates.as_slice()[r.index()].id == still)
             {
                 hit.store(true, Ordering::Relaxed);
             }
@@ -1228,8 +1308,15 @@ mod tests {
             // Everything but the timing, which is wall clock and reproduces
             // for nobody.
             let counts = |t: TickStats| {
-                [t.viewers, t.candidates, t.records, t.new_ghosts, t.departed,
-                 t.despawns_sent, t.bytes]
+                [
+                    t.viewers,
+                    t.candidates,
+                    t.records,
+                    t.new_ghosts,
+                    t.departed,
+                    t.despawns_sent,
+                    t.bytes,
+                ]
             };
             let stats: Vec<[u64; 7]> = (0..12).map(|_| counts(s.tick())).collect();
             let ghosts: Vec<usize> =
@@ -1287,13 +1374,16 @@ mod tests {
         }
         let found = s.workers[0].found.capacity();
         let snap = s.snapshot().len();
-        let ghosts: Vec<usize> =
-            (0..20).map(|i| s.viewers[i].ghosts.slots()).collect();
+        let ghosts: Vec<usize> = (0..20).map(|i| s.viewers[i].ghosts.slots()).collect();
 
         for _ in 0..50 {
             s.tick();
         }
-        assert_eq!(s.workers[0].found.capacity(), found, "the gather buffer must not grow");
+        assert_eq!(
+            s.workers[0].found.capacity(),
+            found,
+            "the gather buffer must not grow"
+        );
         assert_eq!(s.snapshot().len(), snap);
         let after: Vec<usize> = (0..20).map(|i| s.viewers[i].ghosts.slots()).collect();
         assert_eq!(after, ghosts, "ghost tables must reach a steady size");

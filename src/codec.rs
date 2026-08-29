@@ -49,20 +49,13 @@ impl RecordCodec {
         Ok(RecordCodec::new(&cfg))
     }
 
+    /// The layout this world implies.
     pub fn new(cfg: &WorldConfig) -> RecordCodec {
         let h_bits = cfg.horizontal_bits();
         let v_bits = cfg.vertical_bits();
         let total = 2 * h_bits + v_bits;
-        assert!(
-            total <= 128,
-            "position needs {total} bits, more than a u128 holds"
-        );
-        RecordCodec {
-            cfg: *cfg,
-            h_bits,
-            v_bits,
-            pos_bytes: total.div_ceil(8) as usize,
-        }
+        assert!(total <= 128, "position needs {total} bits, more than a u128 holds");
+        RecordCodec { cfg: *cfg, h_bits, v_bits, pos_bytes: total.div_ceil(8) as usize }
     }
 
     /// The number of bytes a record occupies
@@ -82,14 +75,15 @@ impl RecordCodec {
     pub fn encode(&self, id: EntityId, pos: Pos3, out: &mut Vec<u8>) {
         out.extend_from_slice(&id.raw().to_le_bytes());
         let (x, y, z) = self.cfg.quantize_pos(pos);
-        let packed =
-            (x as u128) | ((y as u128) << self.h_bits) | ((z as u128) << (2 * self.h_bits));
+        let packed = (x as u128)
+            | ((y as u128) << self.h_bits)
+            | ((z as u128) << (2 * self.h_bits));
         out.extend_from_slice(&packed.to_le_bytes()[..self.pos_bytes]);
     }
 
     /// Reads one record from the front of `buf`.
     ///
-    /// Returns `None` if `buf` is shorter than one record. 
+    /// Returns `None` if `buf` is shorter than one record.
     #[inline]
     pub fn decode(&self, buf: &[u8]) -> Option<(EntityId, Pos3)> {
         if buf.len() < self.record_bytes() {
@@ -133,7 +127,8 @@ mod extent_tests {
                     .build()
                     .expect("a valid world");
                 let full = RecordCodec::new(&cfg);
-                let thin = RecordCodec::for_extents(size, vertical).expect("valid extents");
+                let thin =
+                    RecordCodec::for_extents(size, vertical).expect("valid extents");
                 assert_eq!(full.record_bytes(), thin.record_bytes(), "{size}/{vertical}");
 
                 let at = Pos3::from_meters(size / 3, vertical / 3, vertical / 5);
@@ -174,8 +169,6 @@ mod tests {
         assert_eq!(c.record_bytes(), 12);
     }
 
-
-
     #[test]
     fn lossless_round_trips_exactly() {
         let cfg = world(4096, 1024);
@@ -204,7 +197,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn record_size_follows_region_and_precision() {
         // Bigger region needs more bits at the same precision.
@@ -227,7 +219,8 @@ mod tests {
         let cfg = world(4096, 1024);
         let c = RecordCodec::new(&cfg);
         let mut buf = Vec::new();
-        let pts: Vec<Pos3> = (0..50).map(|i| Pos3::from_meters(i * 3, i * 7, i)).collect();
+        let pts: Vec<Pos3> =
+            (0..50).map(|i| Pos3::from_meters(i * 3, i * 7, i)).collect();
         for (i, p) in pts.iter().enumerate() {
             c.encode(EntityId::from_raw(i as u32), *p, &mut buf);
         }

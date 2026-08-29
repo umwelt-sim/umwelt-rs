@@ -23,16 +23,19 @@ use crate::subscription::Subscription;
 pub struct ViewerId(u32);
 
 impl ViewerId {
+    /// From the raw value.
     #[inline]
     pub const fn from_raw(raw: u32) -> ViewerId {
         ViewerId(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }
 
+    /// The id as an index into the viewer table.
     #[inline]
     pub const fn index(self) -> usize {
         self.0 as usize
@@ -42,6 +45,12 @@ impl ViewerId {
 impl fmt::Debug for ViewerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "V{}", self.0)
+    }
+}
+
+impl fmt::Display for ViewerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "viewer {}", self.0)
     }
 }
 
@@ -63,7 +72,10 @@ pub struct ClientLimits {
 
 impl Default for ClientLimits {
     fn default() -> ClientLimits {
-        ClientLimits { payload_bytes: crate::budget::DEFAULT_PAYLOAD_BYTES, send_period: 1 }
+        ClientLimits {
+            payload_bytes: crate::budget::DEFAULT_PAYLOAD_BYTES,
+            send_period: 1,
+        }
     }
 }
 
@@ -74,20 +86,30 @@ impl Default for ClientLimits {
 /// keeps two threads off one line.
 #[derive(Debug)]
 pub(crate) struct Viewer {
+    /// The entity this viewer watches from.
     pub avatar: EntityId,
+    /// Which cells it draws from. `None` until the first tick that serves it.
     pub sub: Option<Subscription>,
+    /// What its client is believed to hold.
     pub ghosts: GhostTable,
+    /// How much fits in one of its packets.
     pub budget: PacketBudget,
     /// Ghosts this client has not yet been told to drop. Departures are found
     /// after the tick's records are chosen, so they go out in the next packet.
     pub pending_despawns: Vec<EntityId>,
     pub sequence: u16,
     pub send_period: u8,
+    /// Whether it is being served. A slot that is not is free for reuse.
     pub registered: bool,
 }
 
 impl Viewer {
-    pub(crate) fn reset(&mut self, avatar: EntityId, budget: PacketBudget, send_period: u8) {
+    pub(crate) fn reset(
+        &mut self,
+        avatar: EntityId,
+        budget: PacketBudget,
+        send_period: u8,
+    ) {
         self.avatar = avatar;
         self.sub = None;
         self.ghosts.clear();

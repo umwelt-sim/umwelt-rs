@@ -4,7 +4,7 @@
 //! Through it an edge talks to any number of regions, and reaching one it has
 //! never heard of costs nothing: its two subscriptions are wildcards taken at
 //! construction, so a payload from a region that did not exist then matches a
-//! subscription it already holds. See `docs/adr/0001`.
+//! subscription it already holds.
 //!
 //! It connects to nothing itself. The caller supplies a connected
 //! [`async_nats::Client`] and a Tokio [`Handle`], so where and how the edge
@@ -22,12 +22,16 @@ use futures::StreamExt;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::id::RegionId;
 use crate::config::WorldConfig;
 use crate::entity::EntityId;
+use crate::id::RegionId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
-use crate::net::region::protocol::{DespawnEntities, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, Presence, ServerInfo, ServerVersion, Spawn, SpawnEntities};
+use crate::net::region::protocol::{
+    DespawnEntities, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE,
+    MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, Presence, ServerInfo,
+    ServerVersion, Spawn, SpawnEntities,
+};
 use crate::net::region::subjects;
 use crate::pos::Pos3;
 
@@ -38,9 +42,11 @@ use crate::pos::Pos3;
 /// decode packets against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Offer {
+    /// Which region answered.
     pub region: RegionId,
     /// The crate version the region is running. Informational.
     pub server: ServerVersion,
+    /// The world it runs, rebuilt and checked against its digest.
     pub config: WorldConfig,
 }
 
@@ -49,9 +55,21 @@ pub struct Offer {
 pub enum Incoming {
     /// One observer's packet, named by the entity it belongs to. Decode it with
     /// [`PacketReader`](crate::PacketReader).
-    State { region: RegionId, entity: EntityId, packet: bytes::Bytes },
+    State {
+        /// Which region built it.
+        region: RegionId,
+        /// The observer it was built for.
+        entity: EntityId,
+        /// The packet, exactly as the region assembled it.
+        packet: bytes::Bytes,
+    },
     /// An entity this edge owns appeared or left, whatever caused it.
-    Presence { region: RegionId, what: Presence },
+    Presence {
+        /// Which region is reporting.
+        region: RegionId,
+        /// What arrived or went.
+        what: Presence,
+    },
 }
 
 /// One edge's connection to the region tier.
@@ -84,6 +102,7 @@ impl RegionClient {
         Ok(RegionClient { edge, client, runtime, inbox: Mutex::new(inbox), tasks })
     }
 
+    /// This edge's name, which every region it talks to sees.
     #[inline]
     pub fn name(&self) -> &EdgeName {
         &self.edge
@@ -121,23 +140,30 @@ impl RegionClient {
                 theirs: info.protocol,
             });
         }
-        Ok(Offer { region: info.region, server: info.server, config: info.params.to_config()? })
+        Ok(Offer {
+            region: info.region,
+            server: info.server,
+            config: info.params.to_config()?,
+        })
     }
 
     // -- commands ---------------------------------------------------------
 
     /// Asks a region to create entities and record this edge as managing them.
     ///
-    /// Each carries an [`EntityKind`](crate::net::EntityKind), because whether a
-    /// viewer is registered
-    /// for it is the difference between an entity that costs 12 bytes of snapshot
-    /// and one that costs the whole per-viewer pipeline every tick.
+    /// Each carries an [`EntityKind`](crate::EntityKind), because whether a
+    /// viewer is registered for it is the difference between an entity that
+    /// costs 12 bytes of snapshot and one that costs the whole per-viewer
+    /// pipeline every tick.
     pub fn spawn(&self, region: RegionId, spawns: &[Spawn]) -> Result<(), NetError> {
-        self.send_all(region, spawns.chunks(MAX_SPAWN_PER_MESSAGE).map(|chunk| {
-            let mut body = Vec::new();
-            SpawnEntities { spawns: chunk.to_vec() }.encode(&mut body);
-            body
-        }))
+        self.send_all(
+            region,
+            spawns.chunks(MAX_SPAWN_PER_MESSAGE).map(|chunk| {
+                let mut body = Vec::new();
+                SpawnEntities { spawns: chunk.to_vec() }.encode(&mut body);
+                body
+            }),
+        )
     }
 
     /// [`spawn`](Self::spawn) where every entity has a client behind it.
@@ -155,20 +181,26 @@ impl RegionClient {
         region: RegionId,
         moves: &[(EntityId, Pos3)],
     ) -> Result<(), NetError> {
-        self.send_all(region, moves.chunks(MAX_MOVES_PER_MESSAGE).map(|chunk| {
-            let mut body = Vec::new();
-            MoveEntities { moves: chunk.to_vec() }.encode(&mut body);
-            body
-        }))
+        self.send_all(
+            region,
+            moves.chunks(MAX_MOVES_PER_MESSAGE).map(|chunk| {
+                let mut body = Vec::new();
+                MoveEntities { moves: chunk.to_vec() }.encode(&mut body);
+                body
+            }),
+        )
     }
 
     /// Gives entities back, because the game clients behind them have gone.
     pub fn despawn(&self, region: RegionId, ids: &[EntityId]) -> Result<(), NetError> {
-        self.send_all(region, ids.chunks(MAX_DESPAWN_PER_MESSAGE).map(|chunk| {
-            let mut body = Vec::new();
-            DespawnEntities { ids: chunk.to_vec() }.encode(&mut body);
-            body
-        }))
+        self.send_all(
+            region,
+            ids.chunks(MAX_DESPAWN_PER_MESSAGE).map(|chunk| {
+                let mut body = Vec::new();
+                DespawnEntities { ids: chunk.to_vec() }.encode(&mut body);
+                body
+            }),
+        )
     }
 
     /// Says nothing except that this edge is still here.

@@ -22,7 +22,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use umwelt::{DiscoveredEntity, DistSq, EntityId, Fixed, GhostTable};
+use umwelt::internals::{DiscoveredEntity, GhostTable};
+use umwelt::{DistSq, EntityId, Fixed};
 
 /// Entities in the region, which sets the odometer's footprint.
 const ENTITIES: usize = 50_000;
@@ -186,7 +187,7 @@ fn bench_select(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("full_sort", n), &n, |b, _| {
             b.iter(|| {
                 buf.copy_from_slice(&scored);
-                buf.sort_unstable_by(|a, b| b.score.cmp(&a.score));
+                buf.sort_unstable_by_key(|e| core::cmp::Reverse(e.score));
                 black_box((buf[0].at, buf[0].score));
             })
         });

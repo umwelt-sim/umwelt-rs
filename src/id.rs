@@ -1,9 +1,10 @@
 //! Who and what, named.
 //!
-//! Nothing here is about networking. These name a region, a connection and an
-//! entity an edge is holding, and they would name the same things in a program
-//! that never opened a socket. They live outside `net` so that the traits a
-//! consumer implements can be written without reaching into it.
+//! Nothing here is about networking. These name a region, a connection, an
+//! entity an edge is holding and an entity a game is holding, and they would
+//! name the same things in a program that never opened a socket. They live
+//! outside `net` so that the traits a consumer implements can be written
+//! without reaching into it.
 //!
 //! [`EntityId`](crate::EntityId) is the exception that stays where it is: it is
 //! an identifier *and* the index of a slot in the simulation's position arrays,
@@ -22,11 +23,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub struct RegionId(u32);
 
 impl RegionId {
+    /// From the raw value, which is how one crosses a wire.
     #[inline]
     pub const fn from_raw(raw: u32) -> RegionId {
         RegionId(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u32 {
         self.0
@@ -61,11 +64,13 @@ impl fmt::Display for RegionId {
 pub struct ClientId(u64);
 
 impl ClientId {
+    /// From the raw value. Minting one is the edge's; this is for decoding.
     #[inline]
     pub const fn from_raw(raw: u64) -> ClientId {
         ClientId(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u64 {
         self.0
@@ -87,9 +92,9 @@ impl fmt::Display for ClientId {
 /// One entity this edge manages, wherever it is.
 ///
 /// The edge's own name for an entity, minted when it asks a region for one and
-/// valid before the region has answered. It doubles as the correlation token on
-/// [`SpawnEntities`](crate::net::SpawnEntities), which a region echoes without
-/// looking inside, so an edge needs no separate token space.
+/// valid before the region has answered. It doubles as the token an edge sends
+/// with a spawn, which the region echoes back without looking inside, so an
+/// edge needs no separate token space.
 ///
 /// **Never reused**, for the same reason an [`EntityId`](crate::EntityId) is
 /// not: a stale key must resolve to nothing rather than to a different entity.
@@ -98,11 +103,13 @@ impl fmt::Display for ClientId {
 pub struct EntityKey(u64);
 
 impl EntityKey {
+    /// From the raw value, which is what a region echoes back as a token.
     #[inline]
     pub const fn from_raw(raw: u64) -> EntityKey {
         EntityKey(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u64 {
         self.0
@@ -118,6 +125,46 @@ impl fmt::Debug for EntityKey {
 impl fmt::Display for EntityKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "entity key {}", self.0)
+    }
+}
+
+/// A game client's own name for one of its entities.
+///
+/// Minted by [`ClientHandle`](crate::net::ClientHandle) when a game asks for an
+/// entity, and usable before any region has answered: a move sent under one is
+/// held at the edge until the id arrives.
+///
+/// One connection's own numbering. **Never reused**, so a stale one names
+/// nothing rather than a different entity, and it means nothing to any other
+/// connection. A game holding entities in two regions at once tells them apart
+/// by this, since [`EntityId`](crate::EntityId) is only unique within a region.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntityHandle(u32);
+
+impl EntityHandle {
+    /// From the raw value.
+    #[inline]
+    pub const fn from_raw(raw: u32) -> EntityHandle {
+        EntityHandle(raw)
+    }
+
+    /// The raw value.
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Debug for EntityHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "H{}", self.0)
+    }
+}
+
+impl fmt::Display for EntityHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "handle {}", self.0)
     }
 }
 
@@ -146,6 +193,8 @@ mod tests {
     fn ids_are_transparent() {
         assert_eq!(size_of::<ClientId>(), size_of::<u64>());
         assert_eq!(size_of::<EntityKey>(), size_of::<u64>());
+        assert_eq!(size_of::<EntityHandle>(), size_of::<u32>());
+        assert_eq!(size_of::<RegionId>(), size_of::<u32>());
     }
 
     #[test]

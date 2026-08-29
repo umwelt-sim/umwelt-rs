@@ -10,7 +10,8 @@
 //! are available at different moments.
 //!
 //! - [`Inbound::accept`] runs on the reader task and only queues. It never
-//!   touches the simulation, because the simulation is mid-tick as often as not.
+//!   touches the simulation, because the simulation is mid-tick as often as
+//!   not.
 //! - [`Inbound::apply`] runs inside [`Game::step`], which is the only place a
 //!   [`Step`] exists, so it is the only place an entity can be spawned,
 //!   despawned or moved.
@@ -38,15 +39,18 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::runtime::Handle;
 
+use crate::entity::{EntityId, EntityKind};
+use crate::game::Game;
 use crate::id::RegionId;
-use crate::entity::EntityId;
+use crate::net::control::RegionLoad;
 use crate::net::error::NetError;
 use crate::net::region::edges::{EdgeId, EdgeStats, Edges};
-use crate::net::region::protocol::{DespawnEntities, EntityKind, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE, KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MoveEntities, Presence, Spawn, SpawnEntities};
+use crate::net::region::protocol::{
+    DespawnEntities, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE, KIND_MOVE_ENTITIES,
+    KIND_SPAWN_ENTITIES, MoveEntities, Presence, Spawn, SpawnEntities,
+};
 use crate::net::region::subjects;
 use crate::pos::Pos3;
-use crate::game::Game;
-use crate::net::control::RegionLoad;
 use crate::sim::{ClientLimits, PayloadSink, Step, TickSpan, ViewerId, WorldSimulation};
 
 /// No viewer watches this entity. Reserved in the entity-to-viewer map.
@@ -68,8 +72,11 @@ enum Command {
 /// What one [`Inbound::apply`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Applied {
+    /// Entities created.
     pub spawned: u32,
+    /// Positions written.
     pub moved: u32,
+    /// Entities removed at an edge's asking.
     pub despawned: u32,
     /// Despawned because the edge managing them detached.
     pub orphaned: u32,
@@ -81,7 +88,9 @@ pub struct Applied {
 /// What one [`Inbound::settle`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settled {
+    /// Viewers added.
     pub registered: u32,
+    /// Viewers dropped.
     pub unregistered: u32,
     /// Presence messages published, additions and removals together.
     pub reported: u32,
@@ -92,8 +101,7 @@ pub struct Settled {
 /// `Inbound` holds it because `Inbound` is the one thing both ends touch: the
 /// tick calls [`apply`](Inbound::apply) and [`settle`](Inbound::settle), and
 /// [`RegionServer`](crate::net::RegionServer) holds an `Arc` of it. Neither
-/// call is optional, so nothing has to be wired up for this to fill in. See
-/// `docs/adr/0007`.
+/// call is optional, so nothing has to be wired up for this to fill in.
 #[derive(Debug, Default)]
 struct Load {
     /// Overwritten every tick: what the region holds right now.
@@ -125,6 +133,7 @@ pub struct Inbound {
 }
 
 impl Inbound {
+    /// Holding nothing, for the region these edges attach to.
     pub fn new(edges: Arc<Edges>) -> Inbound {
         Inbound {
             edges,
@@ -149,10 +158,8 @@ impl Inbound {
             tick_count: load.tick_count,
             entities: load.entities,
             slots: load.slots,
-            viewers: span
-                .viewers
-                .checked_div(u64::from(span.ticks))
-                .unwrap_or_default() as u32,
+            viewers: span.viewers.checked_div(u64::from(span.ticks)).unwrap_or_default()
+                as u32,
             mean_tick: span.mean(),
             worst_tick: span.worst,
             late: span.late,
@@ -179,24 +186,23 @@ impl Inbound {
     /// Queues one command that arrived from `edge`.
     ///
     /// Called from the NATS reader, which is not the tick thread, so nothing
-    /// here touches the simulation. A command is queued and applied on the next
-    /// tick. A message that does not decode is counted and dropped: there is no
-    /// connection to tear down, and one bad message says nothing about the next.
+    /// here touches the simulation. A command is queued and applied on the
+    /// next tick. A message that does not decode is counted and dropped: there
+    /// is no connection to tear down, and one bad message says nothing about
+    /// the next.
     pub fn accept(&self, edge: EdgeId, message: &[u8]) {
         let Some((&kind, body)) = message.split_first() else {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let decoded = match kind {
-            KIND_SPAWN_ENTITIES => {
-                SpawnEntities::decode(body).map(|m| Command::Spawn { edge, spawns: m.spawns })
-            }
+            KIND_SPAWN_ENTITIES => SpawnEntities::decode(body)
+                .map(|m| Command::Spawn { edge, spawns: m.spawns }),
             KIND_MOVE_ENTITIES => {
                 MoveEntities::decode(body).map(|m| Command::Move { edge, moves: m.moves })
             }
-            KIND_DESPAWN_ENTITIES => {
-                DespawnEntities::decode(body).map(|m| Command::Despawn { edge, ids: m.ids })
-            }
+            KIND_DESPAWN_ENTITIES => DespawnEntities::decode(body)
+                .map(|m| Command::Despawn { edge, ids: m.ids }),
             // Says only that the edge is still there, which admitting it
             // already recorded.
             KIND_KEEPALIVE => return,
@@ -222,11 +228,11 @@ impl Inbound {
     /// Applies what edges sent. Call from inside [`Game::step`].
     ///
     /// Every command naming an entity is checked against who manages it, and a
-    /// command for an entity the sender does not manage is counted and dropped.
-    /// That is a consistency check rather than an authorization one: it keeps an
-    /// edge's own stale ids, left over from a despawn or a migration, from
-    /// moving somebody else's entity. Who may publish what is the broker's,
-    /// and nothing here knows or asks.
+    /// command for an entity the sender does not manage is counted and
+    /// dropped. That is a consistency check rather than an authorization one:
+    /// it keeps an edge's own stale ids, left over from a despawn or a
+    /// migration, from moving somebody else's entity. Who may publish what is
+    /// the broker's, and nothing here knows or asks.
     pub fn apply(&self, step: &mut Step<'_>) -> Applied {
         let cfg = *step.config();
         let commands = std::mem::take(&mut *self.queue.lock().expect("not poisoned"));
@@ -475,6 +481,11 @@ struct Cached {
 }
 
 impl EdgeSink {
+    /// A sink that publishes each payload to the edge managing its viewer.
+    ///
+    /// Attaches to a [`WorldSimulation`] through
+    /// [`with_sink`](crate::WorldSimulation::with_sink), usually wrapped in a
+    /// [`Handoff`](crate::Handoff) so the tick never waits on a publish.
     pub fn new(
         region: RegionId,
         client: async_nats::Client,
@@ -488,7 +499,10 @@ impl EdgeSink {
                 runtime,
                 edges,
                 avatars: RwLock::new(Vec::new()),
-                subjects: RwLock::new(Cached { generation: u64::MAX, ..Cached::default() }),
+                subjects: RwLock::new(Cached {
+                    generation: u64::MAX,
+                    ..Cached::default()
+                }),
                 sent: AtomicU64::new(0),
                 undeliverable: AtomicU64::new(0),
                 failed: AtomicU64::new(0),
@@ -532,7 +546,9 @@ impl EdgeSink {
     /// Reports one entity appearing or leaving, on the owning edge's presence
     /// subject.
     pub(crate) fn presence(&self, edge: EdgeId, what: Presence) -> Result<(), NetError> {
-        let Some(subject) = self.subject(edge, false) else { return Err(NetError::BadSubject) };
+        let Some(subject) = self.subject(edge, false) else {
+            return Err(NetError::BadSubject);
+        };
         let mut body = Vec::with_capacity(Presence::BYTES);
         what.encode(&mut body);
         self.shared.runtime.block_on(self.shared.client.publish(subject, body.into()))?;
@@ -567,7 +583,8 @@ impl EdgeSink {
                 cached.state.resize(at + 1, None);
                 cached.presence.resize(at + 1, None);
             }
-            cached.state[at] = Some(subjects::state(self.shared.region, &view.name).into());
+            cached.state[at] =
+                Some(subjects::state(self.shared.region, &view.name).into());
             cached.presence[at] =
                 Some(subjects::presence(self.shared.region, &view.name).into());
         }
@@ -601,7 +618,7 @@ impl PayloadSink for EdgeSink {
             return;
         };
         // Addressed by the avatar, so an edge holds one map rather than two.
-        // ViewerId stays inside the region; see `docs/adr/0004`.
+        // ViewerId stays inside the region.
         let mut body = Vec::with_capacity(4 + payload.len());
         body.extend_from_slice(&avatar.raw().to_le_bytes());
         body.extend_from_slice(payload);
@@ -687,7 +704,8 @@ mod tests {
         let inbound = Inbound::new(Arc::clone(&edges));
 
         let mut body = Vec::new();
-        MoveEntities { moves: vec![(ent(1), Pos3::from_meters(1, 2, 3))] }.encode(&mut body);
+        MoveEntities { moves: vec![(ent(1), Pos3::from_meters(1, 2, 3))] }
+            .encode(&mut body);
         inbound.accept(edge, &body);
         assert_eq!(inbound.received(), 1);
         assert_eq!(inbound.refused(), 0);

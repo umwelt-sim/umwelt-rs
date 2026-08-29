@@ -1,5 +1,5 @@
 //! Entities are opaque objects tracked by the simulator. All identities
-//! are guaranteed to be unique within a region, where a region is owned 
+//! are guaranteed to be unique within a region, where a region is owned
 //! by a simulator process.
 
 use core::fmt;
@@ -10,11 +10,13 @@ use core::fmt;
 pub struct EntityId(u32);
 
 impl EntityId {
+    /// From the raw value a region allocated.
     #[inline]
     pub const fn from_raw(raw: u32) -> EntityId {
         EntityId(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u32 {
         self.0
@@ -30,6 +32,56 @@ impl EntityId {
 impl fmt::Debug for EntityId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "E{}", self.0)
+    }
+}
+
+impl fmt::Display for EntityId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "entity {}", self.0)
+    }
+}
+
+/// What is behind an entity, which decides whether it observes.
+///
+/// An entity has a position and can be seen by whoever is near it. A viewer
+/// receives: only an observer is sent what it can see, and only an observer
+/// costs a subscription, a gather, a score, a selection and a packet every tick
+/// it is served, plus a table of what its client already holds. Measured
+/// at a constant 8,192 entities, a viewer costs about 1.6 µs a tick against
+/// 0.4 ms of work paid per entity regardless of who observes.
+///
+/// Static scenery has no kind here, because it is never spawned. A rock that
+/// never moves is already in the client's content package, and holding it in a
+/// region would cost snapshot bytes and a gather-walk visit every tick to
+/// replicate a position the client has. A region holds state that is
+/// authoritative and changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EntityKind {
+    /// Nothing is behind it. Simulated and replicated to whoever can see it,
+    /// observes nothing itself, and no viewer is registered. Projectiles,
+    /// wildlife, NPCs, a vehicle with no driver.
+    #[default]
+    Unattended = 0,
+    /// A game client is behind it. The region registers a viewer watching it,
+    /// so it is sent a budgeted approximation of what it can see.
+    Observer = 1,
+}
+
+impl EntityKind {
+    /// Whether a viewer is registered for it.
+    #[inline]
+    pub const fn observes(self) -> bool {
+        matches!(self, EntityKind::Observer)
+    }
+}
+
+impl fmt::Display for EntityKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EntityKind::Unattended => write!(f, "unattended"),
+            EntityKind::Observer => write!(f, "observer"),
+        }
     }
 }
 
@@ -72,16 +124,14 @@ pub struct LiveSet {
 }
 
 impl LiveSet {
+    /// Empty.
     pub fn new() -> LiveSet {
         LiveSet::default()
     }
 
+    /// Empty, with room for `slots` before it grows.
     pub fn with_capacity(slots: usize) -> LiveSet {
-        LiveSet {
-            words: Vec::with_capacity(slots.div_ceil(64)),
-            slots: 0,
-            live: 0,
-        }
+        LiveSet { words: Vec::with_capacity(slots.div_ceil(64)), slots: 0, live: 0 }
     }
 
     /// Highest slot count seen, live or not. Matches the length of the position
@@ -97,6 +147,7 @@ impl LiveSet {
         self.live
     }
 
+    /// Whether nothing is alive.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.live == 0
@@ -110,9 +161,14 @@ impl LiveSet {
     /// comparison rather than 64. See §Slot growth under churn.
     #[inline]
     pub fn iter(&self) -> LiveIter<'_> {
-        LiveIter { words: &self.words, at: 0, current: self.words.first().copied().unwrap_or(0) }
+        LiveIter {
+            words: &self.words,
+            at: 0,
+            current: self.words.first().copied().unwrap_or(0),
+        }
     }
 
+    /// Whether that slot holds a live entity.
     #[inline]
     pub fn contains(&self, id: EntityId) -> bool {
         let i = id.index();
@@ -154,6 +210,7 @@ impl LiveSet {
         }
     }
 
+    /// Marks every slot dead, keeping the allocation.
     pub fn clear(&mut self) {
         self.words.clear();
         self.slots = 0;
@@ -256,8 +313,9 @@ mod live_tests {
                 live.remove(EntityId::from_raw(n));
             }
         }
-        let by_contains: Vec<u32> =
-            (0..live.slots() as u32).filter(|&n| live.contains(EntityId::from_raw(n))).collect();
+        let by_contains: Vec<u32> = (0..live.slots() as u32)
+            .filter(|&n| live.contains(EntityId::from_raw(n)))
+            .collect();
         assert_eq!(walked(&live), by_contains);
         assert_eq!(walked(&live).len(), live.live());
     }

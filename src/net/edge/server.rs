@@ -8,33 +8,31 @@
 //!
 //! A state packet never enters consumer code. It arrives from a region already
 //! assembled, the edge looks up which connection owns the avatar it is
-//! addressed to, and the bytes go out on that connection's datagram. See
-//! `docs/adr/0006`.
+//! addressed to, and the bytes go out on that connection's datagram.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::id::{ClientId, EntityKey, RegionId};
 use crate::game::EdgeGame;
+use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
 use crate::net::control::{self, EdgeHeartbeat};
 use crate::net::edge::handle::{
     Client, Counters, EdgeHandle, EdgeStats, Entities, Outgoing, Shared, finish_leaving,
     on_presence, span,
 };
-use crate::id::Mint;
 use crate::net::edge::protocol::{EdgeInfo, Framer, FromClient, ToClient};
 use crate::net::error::NetError;
-use crate::pos::Pos3;
-use crate::net::region::{Incoming, RegionClient};
+use crate::net::region::client::{Incoming, RegionClient};
 use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{PROTOCOL_VERSION, ServerVersion, Spawn};
+use crate::pos::Pos3;
 
 /// How long a region is given to say what world it runs.
 ///
@@ -63,6 +61,31 @@ const HEARTBEAT_GRANULARITY: Duration = Duration::from_millis(250);
 ///
 /// Held for the whole run: dropping it closes the endpoint, stops the tasks and
 /// gives back every entity its clients held.
+///
+/// ```no_run
+/// use umwelt::{ClientId, EdgeGame, EdgeServer};
+///
+/// /// An edge that only says who is here. Relaying needs no code.
+/// struct Doorman;
+///
+/// impl EdgeGame for Doorman {
+///     fn connected(&mut self, client: ClientId, from: std::net::SocketAddr) {
+///         println!("{client} from {from}");
+///     }
+/// }
+///
+/// // The caller connects and binds. Where the broker is, what certificate
+/// // this edge presents and which crypto provider is installed are all
+/// // decisions that stay with the deployment.
+/// let runtime = tokio::runtime::Runtime::new()?;
+/// let nats = runtime.block_on(async_nats::connect("nats://127.0.0.1:4222"))?;
+/// let quic: quinn::Endpoint = // built from whatever the operator trusts
+/// # unimplemented!();
+///
+/// let edge = EdgeServer::new(nats, runtime.handle().clone(), quic, |_| Doorman)?;
+/// println!("{} is up", edge.name());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub struct EdgeServer {
     shared: Arc<Shared>,
     name: EdgeName,
@@ -75,8 +98,8 @@ pub struct EdgeServer {
 impl EdgeServer {
     /// Starts relaying, on a connection and an endpoint the caller made.
     ///
-    /// **The edge names itself.** `docs/adr/0004` makes a fresh name per
-    /// incarnation a correctness requirement: reuse one and the edge inherits
+    /// **The edge names itself.** A fresh name per incarnation is a correctness
+    /// requirement: reuse one and the edge inherits
     /// entities a region still thinks it owns and cannot enumerate. A
     /// correctness requirement is not the consumer's to remember, so there is
     /// no way to supply one.
@@ -117,7 +140,11 @@ impl EdgeServer {
 
         let tasks = vec![
             runtime.spawn(accept(quic, Arc::clone(&shared))),
-            runtime.spawn(beat(Arc::clone(&shared), name.clone(), Arc::clone(&heartbeat))),
+            runtime.spawn(beat(
+                Arc::clone(&shared),
+                name.clone(),
+                Arc::clone(&heartbeat),
+            )),
         ];
 
         // Both of these are threads rather than tasks, and for the same
@@ -172,9 +199,8 @@ impl EdgeServer {
 
     /// How often this edge says what it is carrying.
     ///
-    /// [`DEFAULT_HEARTBEAT`] until told otherwise, and zero switches heartbeats
-    /// off. The library holds the timer; the cadence is the deployment's. See
-    /// `docs/adr/0007`.
+    /// Thirty seconds until told otherwise, and zero switches heartbeats off.
+    /// The library holds the timer; the cadence is the deployment's.
     pub fn set_heartbeat_interval(&self, every: Duration) {
         self.heartbeat.store(every.as_nanos() as u64, Ordering::Relaxed);
     }
@@ -194,8 +220,7 @@ impl Drop for EdgeServer {
 
 impl core::fmt::Debug for EdgeServer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("EdgeServer")
-            .field("name", &self.name).finish_non_exhaustive()
+        f.debug_struct("EdgeServer").field("name", &self.name).finish_non_exhaustive()
     }
 }
 
@@ -253,7 +278,8 @@ async fn serve_client(conn: quinn::Connection, shared: Arc<Shared>) {
     // the first bytes arrive — so a client whose first message is a move would
     // otherwise be waiting on a stream it has not written to yet. Anything the
     // edge says back queues on the channel until the writer starts.
-    let datagrams = tokio::spawn(read_datagrams(conn.clone(), Arc::clone(&shared), client));
+    let datagrams =
+        tokio::spawn(read_datagrams(conn.clone(), Arc::clone(&shared), client));
 
     // One bidirectional stream carries everything reliable, both ways. The
     // client opens it; a client that never does can still move what it never
@@ -286,7 +312,11 @@ async fn write_stream(
     }
 }
 
-async fn read_stream(mut recv: quinn::RecvStream, shared: &Arc<Shared>, client: ClientId) {
+async fn read_stream(
+    mut recv: quinn::RecvStream,
+    shared: &Arc<Shared>,
+    client: ClientId,
+) {
     let mut framer = Framer::new();
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -375,7 +405,9 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
                 let Some(held) = clients.get(&client) else { return };
                 moves
                     .iter()
-                    .filter_map(|&(handle, to)| Some((held.handles.get(&handle).copied()?, to)))
+                    .filter_map(|&(handle, to)| {
+                        Some((held.handles.get(&handle).copied()?, to))
+                    })
                     .collect()
             };
             for (key, to) in resolved {
@@ -390,7 +422,11 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
     }
 }
 
-fn key_of(shared: &Arc<Shared>, client: ClientId, handle: u32) -> Option<EntityKey> {
+fn key_of(
+    shared: &Arc<Shared>,
+    client: ClientId,
+    handle: EntityHandle,
+) -> Option<EntityKey> {
     shared.clients().get(&client)?.handles.get(&handle).copied()
 }
 

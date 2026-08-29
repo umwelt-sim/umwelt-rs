@@ -13,8 +13,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::sim::sink::PayloadSink;
 use crate::game::Game;
+use crate::sim::sink::PayloadSink;
 use crate::sim::world::{Outbound, TickStats, WorldSimulation};
 
 /// How long [`Wait::Sleep`] holds the core before a deadline.
@@ -23,12 +23,15 @@ use crate::sim::world::{Outbound, TickStats, WorldSimulation};
 /// targets: no sleep lands exactly on its deadline. It is not a remedy for what
 /// a core costs after idling, which needs a far larger fraction of the period
 /// and is [`Wait::Hold`]; see §Idle costs speed in the design document.
-pub const SPIN_MARGIN: Duration = Duration::from_millis(1);
+///
+/// Not public: there is no consumer decision it informs. Choosing between
+/// sleeping and holding is [`Wait`], and this is what sleeping then means.
+pub(crate) const SPIN_MARGIN: Duration = Duration::from_millis(1);
 
 /// How the loop waits for a deadline.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Wait {
-    /// Sleep to within [`SPIN_MARGIN`] of the deadline, then hold the core.
+    /// Sleep to within a millisecond of the deadline, then hold the core.
     #[default]
     Sleep,
     /// Hold the core for the whole interval.
@@ -63,7 +66,9 @@ pub enum Overrun {
 /// How a run is paced.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pacing {
+    /// How the loop waits for a deadline.
     pub wait: Wait,
+    /// What it does about a tick that ran past one.
     pub overrun: Overrun,
     /// Stop after this many ticks. `None` runs until the observer says stop.
     pub ticks: Option<u32>,
@@ -79,7 +84,9 @@ impl Pacing {
 /// Whether the loop takes another tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flow {
+    /// Take another tick.
     Continue,
+    /// Stop after this one.
     Stop,
 }
 
@@ -90,7 +97,9 @@ pub enum Flow {
 /// cheap and late if something else on the box was not.
 #[derive(Clone, Copy, Debug)]
 pub struct TickReport {
+    /// Which tick this was.
     pub tick: u32,
+    /// What the tick did.
     pub stats: TickStats,
     /// Time inside the tick.
     pub took: Duration,
@@ -105,24 +114,31 @@ pub struct TickReport {
 /// every [`TickReport`], and holding a histogram is a presentation decision.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RunSummary {
+    /// Ticks run.
     pub ticks: u32,
     /// Ticks that started after their deadline.
     pub late: u32,
     /// Deadlines skipped under [`Overrun::Drop`].
     pub dropped: u32,
+    /// The longest tick.
     pub worst_tick: Duration,
+    /// The largest gap between a deadline and the tick that answered it.
     pub worst_late: Duration,
+    /// Wall clock across the run.
     pub elapsed: Duration,
 }
 
 impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// Ticks on a schedule until the observer stops it or the tick count runs
-    /// out, discarding per-viewer selections.
-    /// The observer is handed the world alongside the report, since deciding
-    /// whether to keep going, or what to record, usually means looking at it.
-    /// It is handed over mutably because between ticks is the only safe point
-    /// to add or drop a viewer, and a server driven by connections has to do
-    /// that whenever a client arrives or leaves.
+    /// out.
+    ///
+    /// The observer is handed the world alongside the report, mutably: between
+    /// ticks is the only point at which a viewer can be added or dropped.
+    ///
+    /// A tick that overruns is never made up by running extra ticks. That is
+    /// the spiral of death: the loop falls behind, runs more to catch up, takes
+    /// longer, falls further behind. [`Overrun`] chooses which of the two
+    /// honest answers applies instead.
     pub fn run(
         &mut self,
         pacing: Pacing,
@@ -133,11 +149,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
 
     /// [`run`](Self::run), handing each served viewer's work to `on_viewer`
     /// before the buffers are reused.
-    ///
-    /// A tick that overruns is never made up by running extra ticks. That is
-    /// the spiral of death: the loop falls behind, runs more to catch up, takes
-    /// longer, falls further behind. [`Overrun`] chooses which of the two
-    /// honest answers applies instead.
+    #[doc(hidden)]
     pub fn run_with(
         &mut self,
         pacing: Pacing,
@@ -201,7 +213,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             summary.ticks += 1;
             summary.worst_tick = summary.worst_tick.max(took);
             self.record_tick(took, !late.is_zero(), dropped, stats.viewers);
-            let report = TickReport { tick: self.tick_count(), stats, took, late, dropped };
+            let report =
+                TickReport { tick: self.tick_count(), stats, took, late, dropped };
             if on_tick(report, self) == Flow::Stop {
                 break;
             }
@@ -250,13 +263,10 @@ mod tests {
     fn runs_the_ticks_it_was_asked_for() {
         let mut w = sim(Duration::ZERO);
         let mut seen = 0;
-        let s = w.run(
-            Pacing { wait: Wait::None, ..Pacing::for_ticks(10) },
-            |_, _| {
-                seen += 1;
-                Flow::Continue
-            },
-        );
+        let s = w.run(Pacing { wait: Wait::None, ..Pacing::for_ticks(10) }, |_, _| {
+            seen += 1;
+            Flow::Continue
+        });
         assert_eq!(s.ticks, 10);
         assert_eq!(seen, 10);
         assert_eq!(w.tick_count(), 10);
@@ -265,10 +275,17 @@ mod tests {
     #[test]
     fn an_observer_can_stop_the_run() {
         let mut w = sim(Duration::ZERO);
-        let s = w.run(Pacing { wait: Wait::None, ticks: None, ..Pacing::default() }, |r, w| {
-            assert_eq!(w.tick_count(), r.tick, "the observer sees the world it is told about");
-            if r.tick == 3 { Flow::Stop } else { Flow::Continue }
-        });
+        let s = w.run(
+            Pacing { wait: Wait::None, ticks: None, ..Pacing::default() },
+            |r, w| {
+                assert_eq!(
+                    w.tick_count(),
+                    r.tick,
+                    "the observer sees the world it is told about"
+                );
+                if r.tick == 3 { Flow::Stop } else { Flow::Continue }
+            },
+        );
         assert_eq!(s.ticks, 3, "a run with no tick limit ends when told to");
     }
 
@@ -289,7 +306,8 @@ mod tests {
         // Five milliseconds of game step against a one millisecond period.
         for overrun in [Overrun::Dilate, Overrun::Drop] {
             let mut w = sim(Duration::from_millis(5));
-            let s = w.run(Pacing { overrun, ..Pacing::for_ticks(5) }, |_, _| Flow::Continue);
+            let s =
+                w.run(Pacing { overrun, ..Pacing::for_ticks(5) }, |_, _| Flow::Continue);
             assert_eq!(s.ticks, 5, "{overrun:?} ran a tick it was not asked for");
             assert!(s.late > 0, "{overrun:?} should have noticed it was late");
         }
@@ -298,17 +316,17 @@ mod tests {
     #[test]
     fn dropping_skips_deadlines_and_dilating_does_not() {
         let mut dropping = sim(Duration::from_millis(5));
-        let s = dropping.run(
-            Pacing { overrun: Overrun::Drop, ..Pacing::for_ticks(5) },
-            |_, _| Flow::Continue,
-        );
+        let s = dropping
+            .run(Pacing { overrun: Overrun::Drop, ..Pacing::for_ticks(5) }, |_, _| {
+                Flow::Continue
+            });
         assert!(s.dropped > 0, "a 5 ms tick on a 1 ms period leaves deadlines behind");
 
         let mut dilating = sim(Duration::from_millis(5));
-        let s = dilating.run(
-            Pacing { overrun: Overrun::Dilate, ..Pacing::for_ticks(5) },
-            |_, _| Flow::Continue,
-        );
+        let s = dilating
+            .run(Pacing { overrun: Overrun::Dilate, ..Pacing::for_ticks(5) }, |_, _| {
+                Flow::Continue
+            });
         assert_eq!(s.dropped, 0, "dilating keeps every tick");
     }
 }

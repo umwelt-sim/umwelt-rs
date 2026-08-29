@@ -7,8 +7,8 @@
 
 use crate::entity::EntityId;
 use crate::fixed::DistSq;
-use crate::snapshot::{CellOccupants, CellSnapshot};
 use crate::pos::{CellCoord, Pos2, Pos3};
+use crate::snapshot::{CellOccupants, CellSnapshot};
 use crate::subscription::Subscription;
 
 /// One entity within a viewer's range, and its distance from that viewer.
@@ -17,17 +17,24 @@ use crate::subscription::Subscription;
 /// sorting need no square root.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DiscoveredEntity {
+    /// Which entity.
     pub id: EntityId,
     /// Index into the entity arrays of the snapshot this was gathered from.
     /// Reading the position needs no id lookup. Invalidated by the next
     /// [`CellSnapshot::update`].
     pub snapshot_index: u32,
+    /// Squared distance from the viewer.
     pub dist_sq: DistSq,
 }
 
 impl DiscoveredEntity {
+    /// From the three parts a cell walk already has in hand.
     #[inline]
-    pub const fn new(id: EntityId, snapshot_index: u32, dist_sq: DistSq) -> DiscoveredEntity {
+    pub const fn new(
+        id: EntityId,
+        snapshot_index: u32,
+        dist_sq: DistSq,
+    ) -> DiscoveredEntity {
         DiscoveredEntity { id, snapshot_index, dist_sq }
     }
 }
@@ -49,14 +56,17 @@ pub struct DiscoveredEntities {
 }
 
 impl DiscoveredEntities {
+    /// Empty, allocating nothing until something is pushed.
     pub fn new() -> DiscoveredEntities {
         DiscoveredEntities { items: Vec::new() }
     }
 
+    /// Empty, with room for `n` before it grows. What a worker reuses.
     pub fn with_capacity(n: usize) -> DiscoveredEntities {
         DiscoveredEntities { items: Vec::with_capacity(n) }
     }
 
+    /// Appends one, keeping cell-walk order.
     #[inline]
     pub fn push(&mut self, found: DiscoveredEntity) {
         self.items.push(found);
@@ -68,11 +78,13 @@ impl DiscoveredEntities {
         self.items.clear();
     }
 
+    /// How many were gathered.
     #[inline]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
+    /// Whether the walk found nothing.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
@@ -84,16 +96,19 @@ impl DiscoveredEntities {
         self.items.capacity()
     }
 
+    /// What was gathered, in cell-walk order.
     #[inline]
     pub fn as_slice(&self) -> &[DiscoveredEntity] {
         &self.items
     }
 
+    /// The same, for a caller that sorts in place.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [DiscoveredEntity] {
         &mut self.items
     }
 
+    /// Over what was gathered, in cell-walk order.
     #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, DiscoveredEntity> {
         self.items.iter()
@@ -120,7 +135,12 @@ impl CellSnapshot {
     /// vertical cylinder. Height affects the recorded distance, not membership.
     ///
     /// Does not clear `out`. Does not exclude the viewer's own entity.
-    pub fn gather_into(&self, viewer: Pos3, sub: Subscription, out: &mut DiscoveredEntities) {
+    pub fn gather_into(
+        &self,
+        viewer: Pos3,
+        sub: Subscription,
+        out: &mut DiscoveredEntities,
+    ) {
         self.gather_into_capped(viewer, sub, usize::MAX, out);
     }
 
@@ -166,7 +186,13 @@ impl CellSnapshot {
             match self.sub_cells(cid) {
                 Some(grid) => {
                     for &b in self.sub_cell_order(coord, viewer_h) {
-                        take(viewer, viewer_h, radius_sq, grid.occupants_at(b as usize), out);
+                        take(
+                            viewer,
+                            viewer_h,
+                            radius_sq,
+                            grid.occupants_at(b as usize),
+                            out,
+                        );
                         if out.len() >= cap {
                             return;
                         }
@@ -228,7 +254,8 @@ mod tests {
 
     #[test]
     fn buffers_do_not_share_a_cache_line() {
-        let v: Vec<DiscoveredEntities> = (0..4).map(|_| DiscoveredEntities::new()).collect();
+        let v: Vec<DiscoveredEntities> =
+            (0..4).map(|_| DiscoveredEntities::new()).collect();
         for w in v.windows(2) {
             let a = &w[0] as *const _ as usize;
             let b = &w[1] as *const _ as usize;
@@ -256,7 +283,11 @@ mod tests {
         d.push(found(5, 100));
 
         let ids: Vec<u32> = d.iter().map(|e| e.id.raw()).collect();
-        assert_eq!(ids, vec![7, 2, 5], "gather order is cell-walk order, not distance order");
+        assert_eq!(
+            ids,
+            vec![7, 2, 5],
+            "gather order is cell-walk order, not distance order"
+        );
     }
 
     #[test]
@@ -282,8 +313,8 @@ mod tests {
 
     use crate::config::WorldConfig;
     use crate::entity::LiveSet;
-    use crate::snapshot::CellSnapshot;
     use crate::pos::Pos3;
+    use crate::snapshot::CellSnapshot;
     use crate::subscription::Subscription;
 
     fn all_live(n: usize) -> LiveSet {
@@ -363,7 +394,11 @@ mod tests {
         for &cap in &[7usize, 333, 1_001, 9_999] {
             let mut out = DiscoveredEntities::new();
             snap.gather_into_capped(viewer, sub, cap, &mut out);
-            assert!(out.len() >= cap.min(expected), "cap {cap} under-filled at {}", out.len());
+            assert!(
+                out.len() >= cap.min(expected),
+                "cap {cap} under-filled at {}",
+                out.len()
+            );
             assert!(out.len() <= expected, "cap {cap} over-filled at {}", out.len());
         }
     }
@@ -397,7 +432,11 @@ mod tests {
         let mut out = DiscoveredEntities::new();
         snap.gather_into_capped(viewer, sub, 100, &mut out);
         assert!(out.len() >= 100, "cap should be reached, got {}", out.len());
-        assert!(out.len() < 600, "overshoot is bounded by one sub-cell, got {}", out.len());
+        assert!(
+            out.len() < 600,
+            "overshoot is bounded by one sub-cell, got {}",
+            out.len()
+        );
     }
 
     #[test]
@@ -458,7 +497,11 @@ mod tests {
         assert!(!out.is_empty());
         for e in out.iter() {
             let i = e.snapshot_index as usize;
-            assert_eq!(snap.id_at(i), e.id, "index must name the entity it was found with");
+            assert_eq!(
+                snap.id_at(i),
+                e.id,
+                "index must name the entity it was found with"
+            );
             assert_eq!(
                 snap.pos_at(i),
                 pts[e.id.index()],
@@ -485,7 +528,11 @@ mod tests {
         assert!(!out.is_empty());
         for e in out.iter() {
             let i = e.snapshot_index as usize;
-            assert_eq!(snap.id_at(i), e.id, "index must name the entity it was found with");
+            assert_eq!(
+                snap.id_at(i),
+                e.id,
+                "index must name the entity it was found with"
+            );
             assert_eq!(
                 snap.pos_at(i),
                 pts[e.id.index()],
@@ -498,10 +545,7 @@ mod tests {
     fn cells_are_visited_nearest_first() {
         let cfg = WorldConfig::default();
         // One entity in the viewer's own cell, one two cells away but in range.
-        let pts = [
-            Pos3::from_meters(2100, 2050, 0),
-            Pos3::from_meters(2300, 2050, 0),
-        ];
+        let pts = [Pos3::from_meters(2100, 2050, 0), Pos3::from_meters(2300, 2050, 0)];
         let viewer = Pos3::from_meters(2060, 2050, 0);
         let out = run(&cfg, &pts, viewer);
         assert_eq!(out.len(), 2);

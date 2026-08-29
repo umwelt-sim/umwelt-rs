@@ -15,12 +15,11 @@ use crate::pos::Pos3;
 
 /// Bytes a despawn occupies: an [`EntityId`] and nothing else. A client already
 /// holds the position it is being told to forget.
-pub const DESPAWN_BYTES: usize = 4;
+pub(crate) const DESPAWN_BYTES: usize = 4;
 
 /// Fixed-size preamble.
 ///
-/// Sixteen bytes, matching
-/// [`DEFAULT_HEADER_BYTES`](crate::budget::DEFAULT_HEADER_BYTES). The
+/// Sixteen bytes, which is what a packet's budget reserves for it. The
 /// acknowledgment fields are carried but never populated, since nothing
 /// acknowledges anything yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,13 +33,17 @@ pub struct PacketHeader {
     /// The thirty-two sequences before `ack`, one bit each. Zero until acks
     /// exist.
     pub ack_bits: u32,
+    /// Despawn records in this packet.
     pub despawns: u16,
+    /// Entity records in this packet.
     pub updates: u16,
 }
 
 impl PacketHeader {
+    /// The header's width on the wire.
     pub const BYTES: usize = 16;
 
+    /// Appends the header. Little-endian, like everything else on this wire.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.tick.to_le_bytes());
         out.extend_from_slice(&self.sequence.to_le_bytes());
@@ -56,7 +59,8 @@ impl PacketHeader {
             return None;
         }
         let u16_at = |i: usize| u16::from_le_bytes([buf[i], buf[i + 1]]);
-        let u32_at = |i: usize| u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+        let u32_at =
+            |i: usize| u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
         Some(PacketHeader {
             tick: u32_at(0),
             sequence: u16_at(4),
@@ -72,19 +76,16 @@ impl PacketHeader {
 ///
 /// Held per worker thread and reused across viewers, so it allocates once.
 #[derive(Debug, Clone)]
+#[doc(hidden)]
 pub struct PacketWriter {
     codec: RecordCodec,
     buf: Vec<u8>,
 }
 
 impl PacketWriter {
+    /// A writer for packets of this width, in this world's layout.
     pub fn new(codec: RecordCodec, payload_bytes: usize) -> PacketWriter {
         PacketWriter { codec, buf: Vec::with_capacity(payload_bytes) }
-    }
-
-    #[inline]
-    pub fn codec(&self) -> &RecordCodec {
-        &self.codec
     }
 
     /// Assembles one payload and returns it.
@@ -143,7 +144,6 @@ impl PacketWriter {
     pub fn payload(&self) -> &[u8] {
         &self.buf
     }
-
 }
 
 /// Reads a payload back, which is what a client does.
@@ -170,6 +170,7 @@ impl<'a> PacketReader<'a> {
         Some(PacketReader { codec, header, body: &buf[PacketHeader::BYTES..want] })
     }
 
+    /// What the finished packet's header says.
     #[inline]
     pub fn header(&self) -> PacketHeader {
         self.header
@@ -193,8 +194,9 @@ impl<'a> PacketReader<'a> {
     pub fn updates(&self) -> impl Iterator<Item = (EntityId, Pos3)> + '_ {
         let base = self.header.despawns as usize * DESPAWN_BYTES;
         let stride = self.codec.record_bytes();
-        (0..self.header.updates as usize)
-            .map(move |k| self.codec.decode(&self.body[base + k * stride..]).expect("sized"))
+        (0..self.header.updates as usize).map(move |k| {
+            self.codec.decode(&self.body[base + k * stride..]).expect("sized")
+        })
     }
 }
 
@@ -247,7 +249,10 @@ mod tests {
         let gone = [id(4), id(9)];
         let moved = vec![
             (id(1), Pos3::from_meters(100, 200, 5)),
-            (id(2), Pos3::new(Fixed::from_millis(7, 500), Fixed::ZERO, Fixed::from_meters(3))),
+            (
+                id(2),
+                Pos3::new(Fixed::from_millis(7, 500), Fixed::ZERO, Fixed::from_meters(3)),
+            ),
             (id(3), Pos3::from_meters(4095, 4095, 1023)),
         ];
 

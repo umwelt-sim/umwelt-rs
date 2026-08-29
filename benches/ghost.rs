@@ -30,7 +30,8 @@ use std::collections::HashSet;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use umwelt::{EntityId, GhostTable};
+use umwelt::EntityId;
+use umwelt::internals::GhostTable;
 
 /// Candidate counts to measure: the uniform case's measured mean, and the
 /// default walk cap.

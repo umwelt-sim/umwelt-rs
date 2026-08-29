@@ -9,7 +9,7 @@ repository = "https://github.com/umwelt-sim/umwelt-rs"
 readme = "README.md"
 keywords = ["gamedev", "networking", "replication", "multiplayer", "simulation"]
 categories = ["game-development", "network-programming", "simulation"]
-include = ["src/**/*", "README.md", "LICENSE"]
+include = ["src/**/*", "docs/**/*", "DESIGN.md", "README.md", "LICENSE"]
 
 [profile.dev]
 opt-level = 1

@@ -3,24 +3,25 @@
 //! [`EdgeHandle`] is cheap to clone and callable from anywhere: a timer, a
 //! task, another client's callback. It is deliberately not a capability object
 //! handed to a callback, because nothing an edge does is valid only at one
-//! moment, and an edge that could only speak from inside a callback would force
-//! a consumer to queue its own work until some unrelated event fired. See
-//! `docs/adr/0006`.
+//! moment, and an edge that could only speak from inside a callback would
+//! force a consumer to queue its own work until some unrelated event fired.
+//!
+//! Relaying needs none of it. A client's own spawns, moves and despawns are
+//! carried without this file being asked.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use crate::id::{ClientId, EntityKey, RegionId};
-use crate::entity::EntityId;
+use crate::entity::{EntityId, EntityKind};
 use crate::game::EdgeGame;
+use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
 use crate::net::control::EdgeLoad;
-use crate::id::Mint;
 use crate::net::edge::protocol::{EdgeInfo, ToClient};
 use crate::net::error::NetError;
-use crate::net::region::RegionClient;
-use crate::net::region::protocol::{EntityKind, Presence, Spawn};
+use crate::net::region::client::RegionClient;
+use crate::net::region::protocol::{Presence, Spawn};
 use crate::pos::Pos3;
 
 /// What this edge has done since it started.
@@ -35,10 +36,12 @@ pub struct EdgeStats {
     pub entities: u32,
     /// How many of those have a client behind them.
     pub observers: u32,
+    /// State packets handed to a client's connection.
     pub relayed: u64,
     /// State packets that reached no client: it had gone, or the datagram was
     /// refused.
     pub undeliverable: u64,
+    /// Spawns, moves, despawns and messages read from clients.
     pub commands: u64,
     /// Commands this edge declined, for an unknown handle or one belonging to
     /// another connection.
@@ -70,7 +73,7 @@ pub(crate) struct Client {
     /// path — every move a client sends names a handle — and one map keyed by
     /// [`EntityKey`] would make that a scan. The two are maintained together in
     /// `ask` and `forget`, and a test pins that they agree.
-    pub(crate) handles: HashMap<u32, EntityKey>,
+    pub(crate) handles: HashMap<EntityHandle, EntityKey>,
     /// Everything bound to this client, including entities the consumer asked
     /// for on its behalf, which have no handle of the client's own.
     pub(crate) keys: HashSet<EntityKey>,
@@ -83,7 +86,7 @@ pub(crate) struct Client {
 pub(crate) struct Entity {
     pub(crate) client: Option<ClientId>,
     /// The asking client's own name for it, if a client asked.
-    pub(crate) handle: Option<u32>,
+    pub(crate) handle: Option<EntityHandle>,
     pub(crate) region: RegionId,
     pub(crate) kind: EntityKind,
     /// `None` until the region reports the id it allocated.
@@ -188,7 +191,11 @@ impl Shared {
     /// Puts one message on a client's connection, on the transport its kind
     /// calls for: latest-only messages ride a datagram, everything else the
     /// reliable stream.
-    pub(crate) fn post(&self, client: ClientId, message: ToClient<'_>) -> Result<(), NetError> {
+    pub(crate) fn post(
+        &self,
+        client: ClientId,
+        message: ToClient<'_>,
+    ) -> Result<(), NetError> {
         let by = if message.is_latest_only() {
             Transport::Datagram
         } else {
@@ -248,7 +255,10 @@ impl Shared {
     /// Takes each lock once for the whole batch. A client with any real number
     /// of entities moves them all at once, so taking them per entity made the
     /// number of acquisitions the number of entities.
-    pub(crate) fn set_positions(&self, moves: impl IntoIterator<Item = (EntityKey, Pos3)>) {
+    pub(crate) fn set_positions(
+        &self,
+        moves: impl IntoIterator<Item = (EntityKey, Pos3)>,
+    ) {
         let mut queued: Vec<((RegionId, EntityId), Pos3)> = Vec::new();
         {
             let mut entities = self.entities();
@@ -302,7 +312,7 @@ impl Shared {
     pub(crate) fn ask(
         &self,
         client: Option<ClientId>,
-        handle: Option<u32>,
+        handle: Option<EntityHandle>,
         region: RegionId,
         at: Pos3,
         kind: EntityKind,
@@ -338,7 +348,10 @@ impl Shared {
         }
         // The key is the correlation token: unique to this edge, never reused,
         // and echoed back by the region without being looked inside.
-        self.tell_region(Outgoing::Spawn(region, Spawn { position: at, kind, token: key.raw() }));
+        self.tell_region(Outgoing::Spawn(
+            region,
+            Spawn { position: at, kind, token: key.raw() },
+        ));
         Ok(key)
     }
 
@@ -447,9 +460,7 @@ impl EdgeHandle {
     fn live(&self) -> Result<Arc<Shared>, NetError> {
         self.shared.upgrade().ok_or(NetError::Unknown("edge"))
     }
-}
 
-impl EdgeHandle {
     // -- entities ---------------------------------------------------------
 
     /// Asks a region for an entity on this client's behalf.
@@ -467,24 +478,6 @@ impl EdgeHandle {
         kind: EntityKind,
     ) -> Result<EntityKey, NetError> {
         self.live()?.ask(Some(client), None, region, at, kind)
-    }
-
-    /// Several at once.
-    ///
-    /// Each is queued for the region thread, which groups a batch by region
-    /// and hands it to `RegionClient`; the message cap is applied there, not
-    /// by the caller and not here.
-    pub fn spawn_many(
-        &self,
-        client: ClientId,
-        region: RegionId,
-        wanted: &[(Pos3, EntityKind)],
-    ) -> Result<Vec<EntityKey>, NetError> {
-        let shared = self.live()?;
-        wanted
-            .iter()
-            .map(|&(at, kind)| shared.ask(Some(client), None, region, at, kind))
-            .collect()
     }
 
     /// An entity with no client behind it, which lives until this edge does.
@@ -517,16 +510,14 @@ impl EdgeHandle {
         Ok(())
     }
 
+    /// Gives an entity back, wherever it is.
+    ///
+    /// Stops moving it now rather than when the region reports it gone. The
+    /// client that held it is told through
+    /// [`EdgeGame::removed`](crate::EdgeGame::removed), whether it asked for
+    /// this or not.
     pub fn despawn(&self, entity: EntityKey) -> Result<(), NetError> {
         self.live()?.release(entity);
-        Ok(())
-    }
-
-    pub fn despawn_many(&self, entities: &[EntityKey]) -> Result<(), NetError> {
-        let shared = self.live()?;
-        for &entity in entities {
-            shared.release(entity);
-        }
         Ok(())
     }
 
@@ -564,10 +555,14 @@ impl EdgeHandle {
 
     // -- the mapping, maintained for you ----------------------------------
 
+    /// Who owns an entity, if anyone does. `None` for a detached one, and for
+    /// a key this edge is not holding.
     pub fn client_of(&self, entity: EntityKey) -> Option<ClientId> {
         self.live().ok()?.entities().by_key.get(&entity).and_then(|e| e.client)
     }
 
+    /// Everything a client holds, in no particular order. Empty for a client
+    /// that has gone.
     pub fn entities_of(&self, client: ClientId) -> Vec<EntityKey> {
         let Ok(shared) = self.live() else { return Vec::new() };
         shared
@@ -577,10 +572,17 @@ impl EdgeHandle {
             .unwrap_or_default()
     }
 
+    /// This edge's name for what a region calls `id`.
+    ///
+    /// Ids are unique within a region and no further, so both halves are
+    /// needed. `None` before the region has answered, and after it has said the
+    /// entity is gone.
     pub fn key_of(&self, region: RegionId, id: EntityId) -> Option<EntityKey> {
         self.live().ok()?.entities().by_id.get(&(region, id)).copied()
     }
 
+    /// Where an entity is and what that region calls it. `None` until the
+    /// region has answered.
     pub fn entity_id(&self, entity: EntityKey) -> Option<(RegionId, EntityId)> {
         let shared = self.live().ok()?;
         let entities = shared.entities();
@@ -592,7 +594,6 @@ impl EdgeHandle {
     pub fn stats(&self) -> EdgeStats {
         self.live().map(|shared| shared.stats()).unwrap_or_default()
     }
-
 }
 
 impl core::fmt::Debug for EdgeHandle {
@@ -619,7 +620,8 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
                 return;
             };
             held.id = Some(entity);
-            let (client, handle, pending) = (held.client, held.handle, held.pending.take());
+            let (client, handle, pending) =
+                (held.client, held.handle, held.pending.take());
             entities.by_id.insert((region, entity), key);
             drop(entities);
 
@@ -632,7 +634,8 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
             shared.with_game(|game| game.spawned(key, client, region, entity));
         }
         Presence::Removed { entity } => {
-            let Some(key) = shared.entities().by_id.get(&(region, entity)).copied() else {
+            let Some(key) = shared.entities().by_id.get(&(region, entity)).copied()
+            else {
                 return;
             };
             let Some(held) = shared.forget(key) else { return };

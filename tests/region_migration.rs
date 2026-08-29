@@ -22,9 +22,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EdgeId, EdgeName, EdgeSink, Edges, EntityKind, Incoming, Inbound, Presence, RegionClient, RegionServer, Spawn};
-use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, RegionId, WorldConfig, WorldSimulation};
+use umwelt::internals::RecordCodec;
+use umwelt::internals::region::{Incoming, Presence, RegionClient, Spawn};
+use umwelt::net::{EdgeId, EdgeName, EdgeSink, Edges, Inbound};
+use umwelt::{ClientLimits, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
+use umwelt::{Pacing, PacketReader, Pos3, RegionId, RegionServer, Step, Wait};
+use umwelt::{WorldConfig, WorldSimulation};
 
 /// Unattended entities the origin holds and the destination does not, so the
 /// ids the two regions hand out cannot coincide. The traveler's origin id ends
@@ -123,13 +126,18 @@ impl Region {
 
     /// Ticks until told to stop.
     fn run(&self, stop: &AtomicBool) {
-        let mut sim =
-            WorldSimulation::new(self.cfg, Applier { inbound: Arc::clone(&self.inbound) })
-                .with_sink(Handoff::new(self.sink.clone()));
-        sim.run(Pacing { wait: Wait::Sleep, overrun: Overrun::Dilate, ticks: None }, |_, sim| {
-            self.inbound.settle(sim, &self.sink, ClientLimits::default());
-            if stop.load(Ordering::Relaxed) { Flow::Stop } else { Flow::Continue }
-        });
+        let mut sim = WorldSimulation::new(
+            self.cfg,
+            Applier { inbound: Arc::clone(&self.inbound) },
+        )
+        .with_sink(Handoff::new(self.sink.clone()));
+        sim.run(
+            Pacing { wait: Wait::Sleep, overrun: Overrun::Dilate, ticks: None },
+            |_, sim| {
+                self.inbound.settle(sim, &self.sink, ClientLimits::default());
+                if stop.load(Ordering::Relaxed) { Flow::Stop } else { Flow::Continue }
+            },
+        );
     }
 
     /// This test's only edge, which is the first one either region admitted.
@@ -229,7 +237,9 @@ impl Edge {
                 self.first_packet.entry((region, entity)).or_insert_with(Instant::now);
                 // Read out before either set is touched: the reader borrows the
                 // codec, which lives on the same struct.
-                let Some(reader) = PacketReader::new(&self.codec, &packet) else { return };
+                let Some(reader) = PacketReader::new(&self.codec, &packet) else {
+                    return;
+                };
                 let forgot: Vec<EntityId> = reader.despawns().collect();
                 let seen: Vec<EntityId> = reader.updates().map(|(id, _)| id).collect();
                 for id in forgot {
@@ -254,7 +264,14 @@ impl Edge {
                 .iter()
                 .filter(|&&(r, _, _)| r == region)
                 .map(|&(_, id, at)| {
-                    (id, Pos3::from_meters(at.x.floor_meters() + self.walk, at.y.floor_meters(), 0))
+                    (
+                        id,
+                        Pos3::from_meters(
+                            at.x.floor_meters() + self.walk,
+                            at.y.floor_meters(),
+                            0,
+                        ),
+                    )
                 })
                 .collect();
             if !moves.is_empty() {
@@ -301,9 +318,11 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         // One client, two regions. The second costs nothing to reach.
         let link = RegionClient::new(edge_client, edge_runtime.handle().clone(), name)
             .expect("subscribes");
-        let offer = link.info(origin_id, Duration::from_secs(5)).expect("the origin answers");
-        let away =
-            link.info(destination_id, Duration::from_secs(5)).expect("the destination answers");
+        let offer =
+            link.info(origin_id, Duration::from_secs(5)).expect("the origin answers");
+        let away = link
+            .info(destination_id, Duration::from_secs(5))
+            .expect("the destination answers");
         assert_eq!(offer.config, away.config, "both regions run the same world");
         let mut edge =
             Edge::new(link, RecordCodec::new(&offer.config), [origin_id, destination_id]);
@@ -320,12 +339,24 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
                 origin_home(1 + k),
             );
         }
-        edge.ask(origin_id, ORIGIN_TRAVELER, EntityKind::Observer, origin_home(1 + FILLER));
+        edge.ask(
+            origin_id,
+            ORIGIN_TRAVELER,
+            EntityKind::Observer,
+            origin_home(1 + FILLER),
+        );
         // And one bystander waiting in the destination.
-        edge.ask(destination_id, DESTINATION_BYSTANDER, EntityKind::Observer, destination_home(0));
+        edge.ask(
+            destination_id,
+            DESTINATION_BYSTANDER,
+            EntityKind::Observer,
+            destination_home(0),
+        );
 
         let population = FILLER as usize + 3;
-        edge.until("both regions to report the population", |e| e.held.len() == population);
+        edge.until("both regions to report the population", |e| {
+            e.held.len() == population
+        });
 
         let bystander = edge.id(origin_id, ORIGIN_BYSTANDER);
         let traveler = edge.id(origin_id, ORIGIN_TRAVELER);

@@ -14,9 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{ClientHandle, EdgeClient, EdgeSink, EdgeServer, Edges, EntityKind, FromClient, Inbound, RegionServer};
-use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{ClientGame, EntityId, Game, PacketReader, Pos3, RegionId, WorldConfig, WorldSimulation};
+use umwelt::internals::edge::FromClient;
+use umwelt::net::{EdgeSink, Edges, Inbound};
+use umwelt::{ClientGame, ClientHandle, ClientLimits, EdgeClient, EdgeServer};
+use umwelt::{EntityHandle, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
+use umwelt::{Pacing, PacketReader, Pos3, RegionId, RegionServer, Step, Wait};
+use umwelt::{WorldConfig, WorldSimulation};
 
 /// Entities the client asks for. Small: this is a wiring test, not a load one.
 const WANTED: usize = 16;
@@ -74,23 +77,28 @@ impl Game for Applier {
 struct Watcher {
     region: RegionId,
     /// Handle to entity id, in the order the handles were spent.
-    ids: Arc<Mutex<Vec<(u32, EntityId)>>>,
-    gone: Arc<Mutex<Vec<u32>>>,
+    ids: Arc<Mutex<Vec<(EntityHandle, EntityId)>>>,
+    gone: Arc<Mutex<Vec<EntityHandle>>>,
     /// Positions that made the whole round trip.
     confirmed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClientGame for Watcher {
-    fn spawned(&mut self, handle: u32, region: RegionId, entity: EntityId) {
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
         assert_eq!(region, self.region, "an id from a region nobody asked about");
         self.ids.lock().expect("not poisoned").push((handle, entity));
     }
 
-    fn removed(&mut self, handle: u32) {
+    fn removed(&mut self, handle: EntityHandle) {
         self.gone.lock().expect("not poisoned").push(handle);
     }
 
-    fn state(&mut self, _handle: u32, region: RegionId, state: &PacketReader<'_>) {
+    fn state(
+        &mut self,
+        _handle: EntityHandle,
+        region: RegionId,
+        state: &PacketReader<'_>,
+    ) {
         assert_eq!(region, self.region, "a packet from a region nobody asked about");
         // Already decoded: no codec here, and no world the region was built
         // with. A packet reaching this client is one built for an avatar it
@@ -142,10 +150,12 @@ fn provider() {
 /// touches it.
 fn edge_endpoint(runtime: &tokio::runtime::Handle) -> quinn::Endpoint {
     provider();
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("a cert");
-    let key =
-        quinn::rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
-            .expect("a key");
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("a cert");
+    let key = quinn::rustls::pki_types::PrivateKeyDer::try_from(
+        cert.signing_key.serialize_der(),
+    )
+    .expect("a key");
     let mut tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert.cert.der().clone()], key)
@@ -172,7 +182,8 @@ impl quinn::rustls::client::danger::ServerCertVerifier for TrustAnything {
         _: &quinn::rustls::pki_types::ServerName<'_>,
         _: &[u8],
         _: quinn::rustls::pki_types::UnixTime,
-    ) -> Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error> {
+    ) -> Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error>
+    {
         Ok(quinn::rustls::client::danger::ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -180,8 +191,10 @@ impl quinn::rustls::client::danger::ServerCertVerifier for TrustAnything {
         _: &[u8],
         _: &quinn::rustls::pki_types::CertificateDer<'_>,
         _: &quinn::rustls::DigitallySignedStruct,
-    ) -> Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error>
-    {
+    ) -> Result<
+        quinn::rustls::client::danger::HandshakeSignatureValid,
+        quinn::rustls::Error,
+    > {
         Ok(quinn::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn verify_tls13_signature(
@@ -189,8 +202,10 @@ impl quinn::rustls::client::danger::ServerCertVerifier for TrustAnything {
         _: &[u8],
         _: &quinn::rustls::pki_types::CertificateDer<'_>,
         _: &quinn::rustls::DigitallySignedStruct,
-    ) -> Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error>
-    {
+    ) -> Result<
+        quinn::rustls::client::danger::HandshakeSignatureValid,
+        quinn::rustls::Error,
+    > {
         Ok(quinn::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<quinn::rustls::SignatureScheme> {
@@ -208,8 +223,8 @@ fn game_endpoint(runtime: &tokio::runtime::Handle) -> quinn::Endpoint {
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let _guard = runtime.enter();
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("valid"))
-        .expect("binds");
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("valid")).expect("binds");
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("TLS 1.3"),
     )));
@@ -237,7 +252,8 @@ fn a_game_client_populates_a_region_through_an_edge() {
         Duration::from_secs(5),
     )
     .expect("serves");
-    let sink = EdgeSink::new(region, nats.clone(), runtime.handle().clone(), Arc::clone(&edges));
+    let sink =
+        EdgeSink::new(region, nats.clone(), runtime.handle().clone(), Arc::clone(&edges));
 
     let culled: Arc<Mutex<Option<EntityId>>> = Arc::new(Mutex::new(None));
     let mut sim = WorldSimulation::new(
@@ -259,22 +275,32 @@ fn a_game_client_populates_a_region_through_an_edge() {
         let inbound_for_loop = Arc::clone(&inbound);
         let stop_for_loop = &stop;
         scope.spawn(move || {
-            sim.run(Pacing { wait: Wait::Sleep, overrun: Overrun::Dilate, ticks: None }, |_, sim| {
-                inbound_for_loop.settle(sim, &sink_for_loop, ClientLimits::default());
-                if stop_for_loop.load(Ordering::Relaxed) { Flow::Stop } else { Flow::Continue }
-            })
+            sim.run(
+                Pacing { wait: Wait::Sleep, overrun: Overrun::Dilate, ticks: None },
+                |_, sim| {
+                    inbound_for_loop.settle(sim, &sink_for_loop, ClientLimits::default());
+                    if stop_for_loop.load(Ordering::Relaxed) {
+                        Flow::Stop
+                    } else {
+                        Flow::Continue
+                    }
+                },
+            )
         });
 
         let endpoint = game_endpoint(runtime.handle());
         let conn = runtime
-            .block_on(async { endpoint.connect(at, "localhost").expect("configured").await })
+            .block_on(async {
+                endpoint.connect(at, "localhost").expect("configured").await
+            })
             .expect("connects to the edge");
         // Everything below goes through the library. A game developer never
         // frames a message, picks a datagram, or polls: which of the four
         // commands rides which is a property of the command, and what comes
         // back arrives as calls.
-        let ids: Arc<Mutex<Vec<(u32, EntityId)>>> = Arc::new(Mutex::new(Vec::new()));
-        let gone: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let ids: Arc<Mutex<Vec<(EntityHandle, EntityId)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let gone: Arc<Mutex<Vec<EntityHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let confirmed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watcher = Watcher {
             region,
@@ -288,26 +314,31 @@ fn a_game_client_populates_a_region_through_an_edge() {
 
         // Giving back something this client is not holding is a mistake in the
         // game, and is reported to it rather than put on the wire.
-        assert!(sending.despawn(9_999).is_err(), "a handle nobody spent must be refused here");
+        assert!(
+            sending.despawn(EntityHandle::from_raw(9_999)).is_err(),
+            "a handle nobody spent must be refused here"
+        );
 
         // A move for a handle it is not holding is dropped without a word: it
         // may have been despawned a moment ago, and the game has not caught up.
         let quiet = edge.stats().refused;
-        sending.move_entity(9_998, home(0)).expect("dropped, not an error");
+        sending
+            .move_entity(EntityHandle::from_raw(9_998), home(0))
+            .expect("dropped, not an error");
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(edge.stats().refused, quiet, "a stray move must not reach the edge");
 
         // The edge still counts one from a client that is not this one. Built
         // by hand and sent raw, which is what a client in another language is.
         let mut body = Vec::new();
-        FromClient::Despawn { handle: 9_997 }.encode(&mut body);
+        FromClient::Despawn { handle: EntityHandle::from_raw(9_997) }.encode(&mut body);
         client.connection().send_datagram(body.into()).expect("fits");
         wait_until("the edge to refuse a despawn nobody spent", &stop, || {
             edge.stats().refused > quiet
         });
 
         // The client mints its own handles, spent once and never reused.
-        let handles: Vec<u32> = (0..WANTED)
+        let handles: Vec<EntityHandle> = (0..WANTED)
             .map(|n| {
                 sending
                     .spawn(region, home(n), EntityKind::Observer)
@@ -337,7 +368,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
                 let mut at = 0i32;
                 while !stop.load(Ordering::Relaxed) {
                     at = (at + 1) % 64;
-                    let moves: Vec<(u32, Pos3)> = handles
+                    let moves: Vec<(EntityHandle, Pos3)> = handles
                         .iter()
                         .enumerate()
                         .map(|(n, handle)| {

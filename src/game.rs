@@ -6,18 +6,17 @@
 //!
 //! They live here rather than beside the tier that calls each one because they
 //! are the consumer's extension points and a consumer looks for them together,
-//! not one per module. See `docs/adr/0006`.
+//! not one per module.
 //!
-//! Two of the three are written in networking vocabulary, and this module
-//! depends on `net` to say so. That is the cost of keeping them together: the
-//! alternative is a consumer hunting three modules for the three things it has
-//! to write.
+//! Two of the three are written in networking vocabulary, but this module
+//! reaches into no protocol to say so: the names it needs — [`ClientId`],
+//! [`EntityKey`], [`EntityHandle`] — are in [`id`](crate::id), which is about
+//! who and what rather than about wires.
 
 use std::net::SocketAddr;
 
 use crate::entity::EntityId;
-use crate::id::{ClientId, EntityKey, RegionId};
-
+use crate::id::{ClientId, EntityHandle, EntityKey, RegionId};
 use crate::packet::PacketReader;
 use crate::sim::Step;
 
@@ -39,10 +38,10 @@ pub trait Game {
 /// not block**, on the same terms as [`PayloadSink`](crate::PayloadSink).
 ///
 /// Sending is deliberately not here. It is on
-/// [`EdgeHandle`](crate::net::EdgeHandle), which is cheap to clone and callable
-/// from anywhere, because an edge that could only speak from inside a callback
-/// would force a consumer to queue its own work until some unrelated event
-/// fired. See `docs/adr/0006`.
+/// [`EdgeHandle`](crate::net::EdgeHandle), which is cheap to clone and
+/// callable from anywhere, because an edge that could only speak from inside a
+/// callback would force a consumer to queue its own work until some unrelated
+/// event fired.
 // The parameter names are the documentation, so they are spelled out rather
 // than underscored away.
 #[allow(unused_variables)]
@@ -85,8 +84,8 @@ pub trait EdgeGame: Send + 'static {
 /// not block**, on the same terms as [`EdgeGame`].
 ///
 /// Sending is on [`ClientHandle`](crate::net::ClientHandle), which the
-/// constructor hands over, for the same reason [`EdgeHandle`](crate::net::EdgeHandle)
-/// is not a callback argument. See `docs/adr/0006`.
+/// constructor hands over, for the same reason
+/// [`EdgeHandle`](crate::net::EdgeHandle) is not a callback argument.
 #[allow(unused_variables)]
 pub trait ClientGame: Send + 'static {
     /// The entity this handle asked for exists, in this region, under this id.
@@ -94,11 +93,11 @@ pub trait ClientGame: Send + 'static {
     /// A game is the only tier that sees more than one region at a time, so
     /// keeping that map is its job — the region a handle ended up in is the
     /// game's own knowledge, unlike how that region happens to be configured.
-    fn spawned(&mut self, handle: u32, region: RegionId, entity: EntityId) {}
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {}
 
     /// Gone, whatever caused it — including a despawn this client never asked
     /// for, because a region's own game can despawn anything.
-    fn removed(&mut self, handle: u32) {}
+    fn removed(&mut self, handle: EntityHandle) {}
 
     /// What one of this client's entities can see: which to forget, and where
     /// the rest are.
@@ -113,7 +112,13 @@ pub trait ClientGame: Send + 'static {
     ///
     /// Borrowed from the datagram it arrived in, so a consumer that keeps
     /// anything copies it.
-    fn state(&mut self, handle: u32, region: RegionId, state: &PacketReader<'_>) {}
+    fn state(
+        &mut self,
+        handle: EntityHandle,
+        region: RegionId,
+        state: &PacketReader<'_>,
+    ) {
+    }
 
     /// The game's own bytes, which umwelt did not read.
     fn message(&mut self, body: &[u8]) {}

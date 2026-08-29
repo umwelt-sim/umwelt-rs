@@ -2,16 +2,21 @@
 //!
 //! A separate protocol from `net::region`, and deliberately not sharing types
 //! with it. That one is how a region and its edges do their work; this one is
-//! how an operator sees that the work is happening. See `docs/adr/0002`.
+//! how an operator sees that the work is happening.
 //!
 //! The library publishes and does not subscribe. Deciding anything from a
 //! heartbeat — rebalancing, draining, placing regions — belongs to a control
 //! plane tier that is a separate program and is not built.
 //!
-//! **No cadence is defined here.** A region publishes when its consumer asks it
-//! to. How often that is worth doing, and how long silence has to last before
-//! anyone believes a region has stopped, are deployment judgments rather than
-//! protocol ones.
+//! **No cadence is defined here**, and no consumer writes one. A server
+//! publishes its own heartbeat on a timer it owns — see
+//! [`RegionServer::set_heartbeat_interval`](crate::net::RegionServer::set_heartbeat_interval)
+//! and its edge counterpart — because a heartbeat reports state only the
+//! server holds, and asking a consumer to carry that state out and hand it
+//! back would make the library's own bookkeeping the consumer's problem.
+//!
+//! How long silence has to last before anyone believes a server has stopped is
+//! a deployment judgment, and belongs to whatever is listening.
 
 use core::fmt;
 use std::time::Duration;
@@ -50,13 +55,18 @@ pub fn all_edge_subjects() -> &'static str {
 /// would.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RegionLoad {
+    /// Ticks in the span.
     pub tick_count: u32,
+    /// Entities alive at the end of it.
     pub entities: u32,
     /// Slots ever allocated. Despawn does not reclaim, so this climbs with
     /// churn while `entities` does not. See §Slot growth under churn.
     pub slots: u32,
+    /// Viewers registered at the end of it.
     pub viewers: u32,
+    /// Time inside a tick, averaged over the span.
     pub mean_tick: Duration,
+    /// The longest tick in the span.
     pub worst_tick: Duration,
     /// Ticks that started after their deadline.
     pub late: u32,
@@ -67,23 +77,29 @@ pub struct RegionLoad {
 /// A region saying what it is and how it is doing.
 ///
 /// No address, no port, no neighbors. Nothing needs to reach a region: an edge
-/// finds it by subject. See `docs/adr/0001`.
+/// finds it by subject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Heartbeat {
+    /// Which region is speaking.
     pub region: RegionId,
+    /// What it speaks to its edges.
     pub protocol: ProtocolVersion,
+    /// The crate version it runs.
     pub server: ServerVersion,
     /// The world's wire layout. Two regions whose digests differ decode each
     /// other's packets into nonsense, and nothing else here would show it.
     pub protocol_hash: u64,
     /// Edges this region has heard from and not yet expired.
     pub edges: u32,
+    /// How it is doing.
     pub load: RegionLoad,
 }
 
 impl Heartbeat {
+    /// A heartbeat's width on the wire.
     pub const BYTES: usize = 56;
 
+    /// Replaces `out` with the encoded heartbeat.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         out.extend_from_slice(&self.region.raw().to_le_bytes());
@@ -103,6 +119,7 @@ impl Heartbeat {
         out.extend_from_slice(&self.load.dropped.to_le_bytes());
     }
 
+    /// Reads one back.
     pub fn decode(body: &[u8]) -> Result<Heartbeat, NetError> {
         let mut c = Cursor::new(body, "heartbeat");
         let region = RegionId::from_raw(c.u32()?);
@@ -172,23 +189,27 @@ pub struct EdgeLoad {
     ///
     /// Not commands a *region* declined. A region counts those per edge and
     /// never tells the edge, so an edge cannot report a number it does not
-    /// have. See `docs/adr/0007`.
+    /// have.
     pub refused: u64,
 }
 
 /// An edge saying what it is and how it is doing.
 ///
-/// No address. An edge's listening address is unlikely to be usable by whatever
-/// reads the control plane, which may be on another host, another VM or in
-/// another VPC, and a game client is told where to connect by the game's
-/// matchmaking rather than by umwelt. See `docs/adr/0007`.
+/// No address. An edge's listening address is unlikely to be usable by
+/// whatever reads the control plane, which may be on another host, another VM
+/// or in another VPC, and a game client is told where to connect by the game's
+/// matchmaking rather than by umwelt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EdgeHeartbeat {
+    /// Which edge is speaking.
     pub edge: EdgeName,
+    /// What it speaks to regions.
     pub protocol: ProtocolVersion,
+    /// The crate version it runs.
     pub server: ServerVersion,
     /// Regions this edge currently holds entities in.
     pub regions: Vec<RegionId>,
+    /// How it is doing.
     pub load: EdgeLoad,
 }
 
@@ -196,6 +217,7 @@ impl EdgeHeartbeat {
     /// Everything but the name and the region list, both of which vary.
     pub const FIXED_BYTES: usize = 55;
 
+    /// Replaces `out` with the encoded heartbeat.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         let name = self.edge.as_str().as_bytes();
@@ -219,6 +241,7 @@ impl EdgeHeartbeat {
         out.extend_from_slice(&self.load.refused.to_le_bytes());
     }
 
+    /// Reads one back.
     pub fn decode(body: &[u8]) -> Result<EdgeHeartbeat, NetError> {
         let mut c = Cursor::new(body, "edge heartbeat");
         let len = c.u8()? as usize;
@@ -315,7 +338,10 @@ mod tests {
         let mut buf = Vec::new();
         sample().encode(&mut buf);
         for cut in 0..buf.len() {
-            assert!(Heartbeat::decode(&buf[..cut]).is_err(), "{cut} bytes must not parse");
+            assert!(
+                Heartbeat::decode(&buf[..cut]).is_err(),
+                "{cut} bytes must not parse"
+            );
         }
     }
 

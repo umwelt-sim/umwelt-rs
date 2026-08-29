@@ -6,22 +6,23 @@
 //!
 //! What they do share is the vocabulary underneath both —
 //! [`RegionId`](crate::RegionId), [`EntityId`](crate::EntityId) and
-//! [`EntityKind`] — because those name things in the world rather than things
-//! on a wire. They live in [`id`](crate::id) and [`entity`](crate::entity),
-//! outside this module entirely, so that the traits a consumer implements can
-//! be written without reaching in here. The two links also share one decoder,
-//! `wire::Cursor`, which belongs to neither.
+//! [`EntityKind`](crate::EntityKind) — because those name things in the world
+//! rather than things on a wire. They live in [`id`](crate::id) and
+//! [`entity`](crate::entity), outside this module entirely, so that the traits
+//! a consumer implements can be written without reaching in here. The two links
+//! also share one decoder, `wire::Cursor`, which belongs to neither.
 //!
-//! **Region to edge** — [`region`], built, over NATS. A region simulation and
-//! the edges relaying for it: few peers, deployed together and updated
-//! together. See `docs/adr/0001`.
+//! **Region to edge** — over NATS. A region simulation and the edges relaying
+//! for it: few peers, deployed together and updated together.
 //!
-//! **Edge to game client** — [`edge`], built, over QUIC. Many peers, none of
-//! them trusted, running on someone else's machine and updated on someone
-//! else's schedule. Game clients do not speak NATS. The payloads
-//! [`PacketWriter`](crate::PacketWriter) assembles belong to that link:
-//! latest-only, lossy, unordered, MTU-sized, and they reach a client on a
-//! datagram. See `docs/adr/0006`.
+//! **Edge to game client** — over QUIC. Many peers, none of them trusted,
+//! running on someone else's machine and updated on someone else's schedule.
+//! Game clients do not speak NATS. The payloads a region assembles belong to
+//! that link: latest-only, lossy, unordered, MTU-sized, and they reach a
+//! client on a datagram.
+//!
+//! Neither format is public. Subjects, message kinds, versions and caps are
+//! umwelt's on both ends.
 //!
 //! # The pieces, and which side holds them
 //!
@@ -31,13 +32,11 @@
 //! [`Edges`], since a region deals with the set of edges relaying for it rather
 //! than with connections one at a time.
 //!
-//! [`RegionClient`] is an edge's side: the edge's name plus a connection the
-//! caller made, through which it talks to any number of regions.
-//!
-//! [`EdgeServer`] holds one of those and a QUIC endpoint, and relays between
-//! them. It is a different type from `RegionClient` and does what that one
-//! deliberately does not: game client connections, the client-facing protocol,
-//! and the mapping from an entity to whoever owns it.
+//! [`EdgeServer`] is the other side of that link and the whole of an edge: it
+//! holds a connection to every region it reaches and a QUIC endpoint facing
+//! game clients, and relays between them. Game client connections, the
+//! client-facing protocol, and the mapping from an entity to whoever owns it
+//! are all its.
 //!
 //! No type here connects to anything or binds anything. Each takes a connected
 //! [`async_nats::Client`] and a Tokio handle, and `EdgeServer` also takes a
@@ -50,50 +49,45 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use std::time::Duration;
+//! use umwelt::net::{Edges, Inbound, RegionServer};
 //! use umwelt::{RegionId, WorldConfig};
-//! use umwelt::net::{EdgeName, Edges, Inbound, RegionClient, RegionServer};
 //!
 //! // The caller connects. Where the broker is, what credentials it wants and
 //! // whether it is a cluster are not the library's to decide.
 //! let runtime = tokio::runtime::Runtime::new()?;
 //! let client = runtime.block_on(async_nats::connect("nats://127.0.0.1:4222"))?;
 //!
-//! // The region's simulation server binary.
+//! // The region's simulation server binary. `Inbound` is what the tick reads
+//! // its edges' commands out of; `Edges` is the set it has heard from.
 //! let region = RegionId::from_raw(7);
 //! let edges = Arc::new(Edges::new());
 //! let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
 //! let server = RegionServer::new(
-//!     client.clone(),
+//!     client,
 //!     runtime.handle().clone(),
 //!     region,
 //!     WorldConfig::default(),
 //!     Arc::clone(&inbound),
 //!     Duration::from_secs(5),
 //! )?;
-//!
-//! // Whatever relays for it. An edge server will hold one of these.
-//! let edge = RegionClient::new(client, runtime.handle().clone(), EdgeName::new("edge-1")?)?;
-//! let offer = edge.info(region, Duration::from_secs(5))?; // rebuilt and digest-checked
-//! assert_eq!(offer.region, region);
+//! assert_eq!(server.region(), region);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! An edge is the other binary, and is [`EdgeServer`] rather than anything
+//! assembled out of parts.
 
 pub mod control;
-pub mod edge;
 mod error;
-pub mod region;
 pub(crate) mod wire;
 
+pub(crate) mod edge;
+pub(crate) mod region;
+
 pub use control::{EdgeHeartbeat, EdgeLoad, Heartbeat, RegionLoad};
-pub use edge::{
-    ClientHandle, EdgeClient, EdgeHandle, EdgeServer, EdgeStats, Framer, FromClient,
-    MAX_MOVES_PER_DATAGRAM, ToClient,
-};
+pub use edge::{ClientHandle, EdgeClient, EdgeHandle, EdgeServer, EdgeStats};
 pub use error::NetError;
 pub use region::{
-    Applied, ClaimError, DespawnEntities, EdgeId, EdgeName, EdgeSink, EdgeView,
-    Edges, EntityKind, Incoming, Inbound, MAX_DESPAWN_PER_MESSAGE,
-    MAX_MESSAGE_BYTES, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, Offer,
-    PROTOCOL_VERSION, Presence, ProtocolVersion, RegionClient, RegionServer, Spawn,
-    ServerInfo, ServerVersion, Settled, SpawnEntities, WorldParams, subjects,
+    Applied, ClaimError, EdgeId, EdgeName, EdgeSink, EdgeView, Edges, Inbound,
+    RegionServer, Settled,
 };

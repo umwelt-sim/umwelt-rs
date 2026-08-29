@@ -5,15 +5,14 @@
 //!
 //! NATS delivers whole messages, so there is no framing here: a message is a
 //! one-byte kind followed by its body. Which subject it arrived on says which
-//! direction it traveled and, for a command, which edge sent it. See
-//! `docs/adr/0001`.
+//! direction it traveled and, for a command, which edge sent it.
 
 use core::fmt;
 
 use crate::config::WorldConfig;
-use crate::entity::EntityId;
-use crate::net::error::NetError;
+use crate::entity::{EntityId, EntityKind};
 use crate::id::RegionId;
+use crate::net::error::NetError;
 use crate::net::wire::Cursor;
 use crate::pos::Pos3;
 
@@ -52,11 +51,13 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
 pub struct ProtocolVersion(u16);
 
 impl ProtocolVersion {
+    /// From the raw value.
     #[inline]
     pub const fn from_raw(raw: u16) -> ProtocolVersion {
         ProtocolVersion(raw)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn raw(self) -> u16 {
         self.0
@@ -92,8 +93,11 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
 /// [`PROTOCOL_VERSION`] is what has to match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServerVersion {
+    /// Breaking changes.
     pub major: u16,
+    /// Additions.
     pub minor: u16,
+    /// Fixes.
     pub patch: u16,
 }
 
@@ -146,18 +150,25 @@ const fn parse_u16(s: &str) -> u16 {
 /// approximated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldParams {
+    /// The region's horizontal extent, in meters.
     pub region_size_m: i32,
+    /// Its vertical extent, in meters.
     pub vertical_extent_m: i32,
+    /// How far an observer sees, in meters.
     pub horizontal_view_radius_m: i32,
+    /// The horizontal speed cap, in meters per second.
     pub max_horizontal_speed_m_per_sec: i32,
+    /// Ticks per second.
     pub tick_hz: u32,
     /// [`WorldConfig::protocol_hash`] of the config these came from.
     pub protocol_hash: u64,
 }
 
 impl WorldParams {
+    /// Their width on the wire.
     pub const BYTES: usize = 28;
 
+    /// The five authored numbers, plus the digest of everything they imply.
     pub fn from_config(cfg: &WorldConfig) -> WorldParams {
         WorldParams {
             region_size_m: cfg.region_size().floor_meters(),
@@ -225,12 +236,16 @@ pub struct ServerInfo {
     /// What this region speaks. There is no handshake to check it in, so it
     /// travels here and the edge refuses a region it cannot talk to.
     pub protocol: ProtocolVersion,
+    /// The crate version the region runs. Informational.
     pub server: ServerVersion,
+    /// Which region answered.
     pub region: RegionId,
+    /// The world it runs, for the asker to rebuild and check.
     pub params: WorldParams,
 }
 
 impl ServerInfo {
+    /// Its width on the wire.
     pub const BYTES: usize = 2 + 6 + 4 + WorldParams::BYTES;
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
@@ -292,39 +307,14 @@ pub const MAX_MOVES_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / MOVE_BYTES;
 /// Most entities one [`DespawnEntities`] may give up. Same bargain.
 pub const MAX_DESPAWN_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / 4;
 
-/// What is behind an entity, which decides whether it observes.
-///
-/// An entity has a position and can be seen by whoever is near it. A viewer
-/// receives: only an observer is sent what it can see, and only an observer
-/// costs a subscription, a gather, a score, a selection and a packet every tick
-/// it is served, plus a [`GhostTable`](crate::GhostTable) of its own. Measured
-/// at a constant 8,192 entities, a viewer costs about 1.6 µs a tick against
-/// 0.4 ms of work paid per entity regardless of who observes.
-///
-/// Static scenery has no kind here, because it is never spawned. A rock that
-/// never moves is already in the client's content package, and holding it in a
-/// region would cost snapshot bytes and a gather-walk visit every tick to
-/// replicate a position the client has. A region holds state that is
-/// authoritative and changes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum EntityKind {
-    /// Nothing is behind it. Simulated and replicated to whoever can see it,
-    /// observes nothing itself, and no viewer is registered. Projectiles,
-    /// wildlife, NPCs, a vehicle with no driver.
-    #[default]
-    Unattended = 0,
-    /// A game client is behind it. The region registers a viewer watching it,
-    /// so it is sent a budgeted approximation of what it can see.
-    Observer = 1,
-}
-
 impl EntityKind {
+    /// The byte that carries it.
     #[inline]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
+    /// From the byte, or `None` for one this version does not know.
     pub const fn from_u8(raw: u8) -> Option<EntityKind> {
         match raw {
             0 => Some(EntityKind::Unattended),
@@ -332,33 +322,21 @@ impl EntityKind {
             _ => None,
         }
     }
-
-    #[inline]
-    pub const fn observes(self) -> bool {
-        matches!(self, EntityKind::Observer)
-    }
-}
-
-impl fmt::Display for EntityKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EntityKind::Unattended => write!(f, "unattended"),
-            EntityKind::Observer => write!(f, "observer"),
-        }
-    }
 }
 
 /// One entity an edge is asking for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spawn {
+    /// Where to put it.
     pub position: Pos3,
+    /// What is behind it, which decides whether it observes.
     pub kind: EntityKind,
     /// Opaque to the region, echoed back on the presence message that reports
-    /// the entity. It exists because a presence subject says which edge owns an
-    /// entity and nothing more: an edge that asked for three avatars in one
+    /// the entity. It exists because a presence subject says which edge owns
+    /// an entity and nothing more: an edge that asked for three avatars in one
     /// message has no other way to tell which arrival belongs to which of its
     /// game clients. In practice it is the handle the edge already holds for
-    /// that client. See `docs/adr/0004`.
+    /// that client.
     pub token: u64,
 }
 
@@ -375,6 +353,7 @@ pub struct Spawn {
 /// [`max_horizontal_speed`](crate::WorldConfig::max_horizontal_speed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnEntities {
+    /// What to create. At most [`MAX_SPAWN_PER_MESSAGE`].
     pub spawns: Vec<Spawn>,
 }
 
@@ -438,8 +417,8 @@ impl SpawnEntities {
                 crate::Fixed::from_raw(c.i32()?),
                 crate::Fixed::from_raw(c.i32()?),
             );
-            let kind =
-                EntityKind::from_u8(c.u8()?).ok_or(NetError::Malformed("spawn entity kind"))?;
+            let kind = EntityKind::from_u8(c.u8()?)
+                .ok_or(NetError::Malformed("spawn entity kind"))?;
             spawns.push(Spawn { position, kind, token: c.u64()? });
         }
         c.finish()?;
@@ -450,19 +429,29 @@ impl SpawnEntities {
 /// An entity appearing in or leaving a region.
 ///
 /// Published on the presence subject of the edge that owns it, whatever caused
-/// the change: an edge asking, the consumer's game despawning, or an edge being
-/// expired and its entities orphaned. An edge that only ever hears about what it
-/// asked for cannot know when something it owns has gone. See `docs/adr/0004`.
+/// the change: an edge asking, the consumer's game despawning, or an edge
+/// being expired and its entities orphaned. An edge that only ever hears about
+/// what it asked for cannot know when something it owns has gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Presence {
     /// Now exists and is managed by the edge this was published for. `token`
     /// is what that edge sent on the [`Spawn`] that asked for it.
-    Added { entity: EntityId, token: u64 },
+    Added {
+        /// The id this region allocated.
+        entity: EntityId,
+        /// Echoed from the spawn that asked, so an edge can tell which of its
+        /// requests this answers.
+        token: u64,
+    },
     /// No longer exists.
-    Removed { entity: EntityId },
+    Removed {
+        /// The id that is gone.
+        entity: EntityId,
+    },
 }
 
 impl Presence {
+    /// One presence report's width on the wire.
     pub const BYTES: usize = 13;
 
     const ADDED: u8 = 1;
@@ -483,6 +472,7 @@ impl Presence {
         }
     }
 
+    /// Reads one back.
     pub fn decode(body: &[u8]) -> Result<Presence, NetError> {
         let mut c = Cursor::new(body, "presence");
         let what = c.u8()?;
@@ -504,6 +494,7 @@ impl Presence {
 /// idempotent for the same reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MoveEntities {
+    /// Where to put each. At most [`MAX_MOVES_PER_MESSAGE`].
     pub moves: Vec<(EntityId, Pos3)>,
 }
 
@@ -552,6 +543,7 @@ impl MoveEntities {
 /// this: the region cannot leave entities alive with no connection behind them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DespawnEntities {
+    /// What to remove. At most [`MAX_DESPAWN_PER_MESSAGE`].
     pub ids: Vec<EntityId>,
 }
 
@@ -761,7 +753,14 @@ mod tests {
         // that moved an entity would walk it every tick.
         let m = MoveEntities {
             moves: vec![
-                (ent(1), Pos3::new(Fixed::from_millis(7, 500), Fixed::ZERO, Fixed::from_raw(1))),
+                (
+                    ent(1),
+                    Pos3::new(
+                        Fixed::from_millis(7, 500),
+                        Fixed::ZERO,
+                        Fixed::from_raw(1),
+                    ),
+                ),
                 (ent(2), Pos3::from_meters(4095, 0, 1023)),
             ],
         };
@@ -794,7 +793,10 @@ mod tests {
         let mut buf = Vec::new();
         m.encode(&mut buf);
         for cut in 1..buf.len() {
-            assert!(MoveEntities::decode(&buf[1..cut]).is_err(), "{cut} bytes must not parse");
+            assert!(
+                MoveEntities::decode(&buf[1..cut]).is_err(),
+                "{cut} bytes must not parse"
+            );
         }
     }
 
@@ -842,7 +844,10 @@ mod tests {
     fn an_unknown_presence_kind_is_refused() {
         let mut buf = vec![9u8];
         buf.extend_from_slice(&1u32.to_le_bytes());
-        assert!(matches!(Presence::decode(&buf), Err(NetError::Malformed("presence kind"))));
+        assert!(matches!(
+            Presence::decode(&buf),
+            Err(NetError::Malformed("presence kind"))
+        ));
     }
 
     #[test]
@@ -867,4 +872,3 @@ mod tests {
         assert_eq!(kind_name(200), "unknown");
     }
 }
-

@@ -25,11 +25,10 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use umwelt::select::{Policy, Weights};
 use umwelt::sim::{DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP};
 use umwelt::{
-    ClientLimits, EntityId, Fixed, Game, Handoff, NullSink, Pos3, RecordingSink, Step,
-    WorldConfig, WorldSimulation,
+    ClientLimits, EntityId, Fixed, Game, Handoff, NullSink, Policy, Pos3, RecordingSink,
+    Step, Weights, WorldConfig, WorldSimulation,
 };
 
 /// Ticks run before timing, so ghost tables reach a steady size and no timed
@@ -123,7 +122,10 @@ impl Travelers {
         Travelers {
             inner: Scenario::new(positions, step_m),
             movers: movers.to_vec(),
-            dir: movers.iter().map(|_| if rng.next_u64() & 1 == 0 { 1 } else { -1 }).collect(),
+            dir: movers
+                .iter()
+                .map(|_| if rng.next_u64() & 1 == 0 { 1 } else { -1 })
+                .collect(),
             per_tick: Fixed::from_meters(speed_m_per_sec).raw() / cfg.tick_hz() as i32,
             lo: margin,
             hi: cfg.region_size().raw() - margin,
@@ -207,10 +209,7 @@ fn clustered(
     // Cluster cells kept off the region edge so oscillation stays inside.
     let centers: Vec<(u32, u32)> = (0..clusters)
         .map(|_| {
-            (
-                (1 + rng.below(per_axis - 2)) * cell,
-                (1 + rng.below(per_axis - 2)) * cell,
-            )
+            ((1 + rng.below(per_axis - 2)) * cell, (1 + rng.below(per_axis - 2)) * cell)
         })
         .collect();
 
@@ -230,7 +229,12 @@ fn clustered(
 }
 
 fn policy(ghost_cap: usize) -> Policy {
-    Policy { ghost_cap, grace: DEFAULT_GRACE, weights: Weights::inverse_distance(), ..Policy::default() }
+    Policy {
+        ghost_cap,
+        grace: DEFAULT_GRACE,
+        weights: Weights::inverse_distance(),
+        ..Policy::default()
+    }
 }
 
 /// Builds a simulation, spawns `positions`, registers `viewers` of them as
@@ -276,7 +280,8 @@ fn build_with<G: Game>(
     ghost_cap: usize,
 ) -> WorldSimulation<G> {
     let cfg = WorldConfig::default();
-    let mut sim = WorldSimulation::with_replication(cfg, game, walk_cap, policy(ghost_cap));
+    let mut sim =
+        WorldSimulation::with_replication(cfg, game, walk_cap, policy(ghost_cap));
 
     // First tick spawns. Ids are assigned in order, so they are 0..n.
     sim.tick();
@@ -460,9 +465,16 @@ fn bench_viewer_speed(c: &mut Criterion) {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     for &threads in &[1usize, default_threads] {
         for &(label, movers, speed) in &rows {
-            let game =
-                Travelers::new(&cfg, uniform(&cfg, ENTITIES, 0xA11CE), 1, movers, speed, 0x5EED);
-            let mut sim = build_with(game, ENTITIES, viewers, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP);
+            let game = Travelers::new(
+                &cfg,
+                uniform(&cfg, ENTITIES, 0xA11CE),
+                1,
+                movers,
+                speed,
+                0x5EED,
+            );
+            let mut sim =
+                build_with(game, ENTITIES, viewers, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP);
             sim.set_thread_count(threads);
             let id = format!("{threads}t/{label}");
             describe(&format!("viewer_speed/{id}"), &mut sim);
@@ -482,14 +494,8 @@ fn bench_ghost_cap(c: &mut Criterion) {
     group.sample_size(20);
 
     for &cap in &[64usize, 128, 256, 512, 1024] {
-        let mut sim = build(
-            hot_cell(&cfg, 8_192, 8_192, 0xC0FFEE),
-            8_192,
-            1,
-            cap,
-            cap,
-            0xD00D,
-        );
+        let mut sim =
+            build(hot_cell(&cfg, 8_192, 8_192, 0xC0FFEE), 8_192, 1, cap, cap, 0xD00D);
         sim.set_thread_count(1);
         describe(&format!("ghost_cap/{cap}"), &mut sim);
         group.throughput(Throughput::Elements(8_192));
@@ -584,13 +590,15 @@ fn bench_sink(c: &mut Criterion) {
 
     let positions = uniform(&cfg, 8_192, 0xA11CE);
 
-    let mut null = build(positions.clone(), 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF);
+    let mut null =
+        build(positions.clone(), 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF);
     group.throughput(Throughput::Elements(8_192));
     group.bench_function("null", |b| b.iter(|| black_box(null.tick())));
     drop(null);
 
-    let mut recording = build(positions, 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF)
-        .with_sink(RecordingSink::new());
+    let mut recording =
+        build(positions, 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF)
+            .with_sink(RecordingSink::new());
     for _ in 0..10 {
         recording.tick();
     }
@@ -599,16 +607,30 @@ fn bench_sink(c: &mut Criterion) {
 
     // The same recording sink, reached through the handoff. If the locks cost
     // anything, this is where it shows.
-    let mut handed = build(uniform(&cfg, 8_192, 0xA11CE), 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF)
-        .with_sink(Handoff::new(RecordingSink::new()));
+    let mut handed = build(
+        uniform(&cfg, 8_192, 0xA11CE),
+        8_192,
+        1,
+        DEFAULT_WALK_CAP,
+        DEFAULT_GHOST_CAP,
+        0xBEEF,
+    )
+    .with_sink(Handoff::new(RecordingSink::new()));
     for _ in 0..10 {
         handed.tick();
     }
     group.bench_function("handoff_recording", |b| b.iter(|| black_box(handed.tick())));
     drop(handed);
 
-    let mut null_handed = build(uniform(&cfg, 8_192, 0xA11CE), 8_192, 1, DEFAULT_WALK_CAP, DEFAULT_GHOST_CAP, 0xBEEF)
-        .with_sink(Handoff::new(NullSink));
+    let mut null_handed = build(
+        uniform(&cfg, 8_192, 0xA11CE),
+        8_192,
+        1,
+        DEFAULT_WALK_CAP,
+        DEFAULT_GHOST_CAP,
+        0xBEEF,
+    )
+    .with_sink(Handoff::new(NullSink));
     for _ in 0..10 {
         null_handed.tick();
     }

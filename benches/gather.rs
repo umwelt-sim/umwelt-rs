@@ -20,10 +20,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use umwelt::{
-    CellSnapshot, DiscoveredEntities, EntityId, Fixed, LiveSet, Pos3, Subscription,
-    WorldConfig,
-};
+use umwelt::internals::{CellSnapshot, DiscoveredEntities, Subscription};
+use umwelt::{EntityId, Fixed, LiveSet, Pos3, WorldConfig};
 
 /// xorshift64. Deterministic across runs so successive benchmarks compare.
 struct Rng(u64);
@@ -89,7 +87,12 @@ fn uniform(cfg: &WorldConfig, n: usize, seed: u64) -> Entities {
 }
 
 /// `crowd` entities inside a single cell, the rest spread evenly.
-fn hot_cell(cfg: &WorldConfig, total: usize, crowd: usize, seed: u64) -> (Entities, Pos3) {
+fn hot_cell(
+    cfg: &WorldConfig,
+    total: usize,
+    crowd: usize,
+    seed: u64,
+) -> (Entities, Pos3) {
     assert!(crowd <= total);
     let mut rng = Rng::new(seed);
     let extent = cfg.region_size().raw() as u32;
@@ -144,9 +147,7 @@ fn viewers(cfg: &WorldConfig, n: usize, seed: u64) -> Vec<Pos3> {
 }
 
 fn subs_of(cfg: &WorldConfig, vs: &[Pos3]) -> Vec<Subscription> {
-    vs.iter()
-        .map(|v| Subscription::at_center(cfg, cfg.cell_of(v.horizontal())))
-        .collect()
+    vs.iter().map(|v| Subscription::at_center(cfg, cfg.cell_of(v.horizontal()))).collect()
 }
 
 /// Mean candidates a viewer gathers. Reported so per-entity cost is derivable
@@ -192,11 +193,8 @@ fn bench_uniform(c: &mut Criterion) {
 /// Total entities the walk touches, before the radius test. Exact, from the
 /// snapshot's own per-cell counts.
 fn examined(cfg: &WorldConfig, snap: &CellSnapshot, subs: &[Subscription]) -> f64 {
-    let total: usize = subs
-        .iter()
-        .flat_map(|s| s.cells())
-        .map(|c| snap.count(cfg.cell_id(c)))
-        .sum();
+    let total: usize =
+        subs.iter().flat_map(|s| s.cells()).map(|c| snap.count(cfg.cell_id(c))).sum();
     total as f64 / subs.len() as f64
 }
 
@@ -250,7 +248,6 @@ fn bench_empty(c: &mut Criterion) {
             })
         });
 }
-
 
 fn bench_hot_cell(c: &mut Criterion) {
     let cfg = WorldConfig::default();
@@ -365,7 +362,10 @@ fn bench_parallel_town_square(c: &mut Criterion) {
             .map(|i| Pos3::new(entities.xs[i], entities.ys[i], entities.zs[i]))
             .collect();
         let subs = subs_of(&cfg, &vs);
-        println!("town square {crowd}: {:.0} examined per viewer", examined(&cfg, &snap, &subs));
+        println!(
+            "town square {crowd}: {:.0} examined per viewer",
+            examined(&cfg, &snap, &subs)
+        );
 
         for &t in &[1usize, 2, 4, 8] {
             let mut per_thread = per_thread_buffers(t, crowd.next_power_of_two());
@@ -388,7 +388,9 @@ fn bench_subdivision(c: &mut Criterion) {
     let (entities, _) = hot_cell(&cfg, 8_192, 8_192, 0xC0FFEE);
 
     let mut group = c.benchmark_group("snapshot/update");
-    for &(label, axis) in &[("subdivision_off", 1u32), ("axis_8", 8u32), ("axis_16", 16u32)] {
+    for &(label, axis) in
+        &[("subdivision_off", 1u32), ("axis_8", 8u32), ("axis_16", 16u32)]
+    {
         let mut snap = CellSnapshot::with_subdivision(&cfg, axis, 512);
         group.bench_function(label, |b| {
             b.iter(|| {
@@ -414,52 +416,52 @@ fn bench_capped_town_square(c: &mut Criterion) {
     // cell shift all are, so a ragged population exercises partial sub-cells,
     // uneven thread chunking, and a cap that does not divide evenly.
     for &crowd in &[8_192usize, 10_000] {
-    let (entities, _) = hot_cell(&cfg, crowd, crowd, 0xC0FFEE);
-    let snap = snapshot_of(&cfg, &entities);
-    let vs: Vec<Pos3> = (0..entities.xs.len())
-        .map(|i| Pos3::new(entities.xs[i], entities.ys[i], entities.zs[i]))
-        .collect();
-    let subs = subs_of(&cfg, &vs);
+        let (entities, _) = hot_cell(&cfg, crowd, crowd, 0xC0FFEE);
+        let snap = snapshot_of(&cfg, &entities);
+        let vs: Vec<Pos3> = (0..entities.xs.len())
+            .map(|i| Pos3::new(entities.xs[i], entities.ys[i], entities.zs[i]))
+            .collect();
+        let subs = subs_of(&cfg, &vs);
 
-    for &threads in &[1usize, 4] {
-    for &(label, cap) in &[
-        ("uncapped", usize::MAX),
-        ("cap_2048", 2_048usize),
-        ("cap_1024", 1_024),
-        ("cap_512", 512),
-        ("cap_256", 256),
-    ] {
-        let mut per_thread = per_thread_buffers(threads, 16_384);
-        group.throughput(Throughput::Elements(vs.len() as u64));
-        group.bench_function(format!("crowd{crowd}/t{threads}/{label}"), |b| {
-            b.iter(|| {
-                let threads = per_thread.len();
-                let chunk = vs.len().div_ceil(threads);
-                std::thread::scope(|s| {
-                    for ((vc, sc), buf) in vs
-                        .chunks(chunk)
-                        .zip(subs.chunks(chunk))
-                        .zip(per_thread.iter_mut())
-                    {
-                        let snap = &snap;
-                        s.spawn(move || {
-                            for (v, sb) in vc.iter().zip(sc) {
-                                buf.clear();
-                                snap.gather_into_capped(
-                                    black_box(*v),
-                                    black_box(*sb),
-                                    black_box(cap),
-                                    buf,
-                                );
-                                black_box(buf.len());
+        for &threads in &[1usize, 4] {
+            for &(label, cap) in &[
+                ("uncapped", usize::MAX),
+                ("cap_2048", 2_048usize),
+                ("cap_1024", 1_024),
+                ("cap_512", 512),
+                ("cap_256", 256),
+            ] {
+                let mut per_thread = per_thread_buffers(threads, 16_384);
+                group.throughput(Throughput::Elements(vs.len() as u64));
+                group.bench_function(format!("crowd{crowd}/t{threads}/{label}"), |b| {
+                    b.iter(|| {
+                        let threads = per_thread.len();
+                        let chunk = vs.len().div_ceil(threads);
+                        std::thread::scope(|s| {
+                            for ((vc, sc), buf) in vs
+                                .chunks(chunk)
+                                .zip(subs.chunks(chunk))
+                                .zip(per_thread.iter_mut())
+                            {
+                                let snap = &snap;
+                                s.spawn(move || {
+                                    for (v, sb) in vc.iter().zip(sc) {
+                                        buf.clear();
+                                        snap.gather_into_capped(
+                                            black_box(*v),
+                                            black_box(*sb),
+                                            black_box(cap),
+                                            buf,
+                                        );
+                                        black_box(buf.len());
+                                    }
+                                });
                             }
                         });
-                    }
+                    })
                 });
-            })
-        });
-    }
-    }
+            }
+        }
     }
     group.finish();
 }

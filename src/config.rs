@@ -1,20 +1,24 @@
 //! Runtime world configuration.
 //!
-//! [`WorldConfig`] is required for any participant exchanging world data
-//! as it contains protocol level configuration. Every simulation, edge, and
-//! client touching a region must hold identical world config or they will decode
-//! each other's packets into garbage. Compare [`WorldConfig::protocol_hash`]
-//! at connect time and reject on mismatch.
+//! [`WorldConfig`] is required of any participant exchanging world data, since
+//! it carries the protocol-level configuration. Every simulation and edge
+//! touching a region must hold an identical one or they decode each other's
+//! packets into nonsense.
+//!
+//! Nothing needs to check that by hand. A region publishes the five authored
+//! numbers along with the digest of everything they imply, and the handshake
+//! rebuilds the config from the numbers and refuses it if the digests disagree.
+//! [`protocol_hash`](WorldConfig::protocol_hash) is what that comparison is on.
 //!
 //! # Units
 //!
 //! Distances are [`Fixed`]; see [`crate::fixed`] for the representation and
 //! why it is an integer rather than `f32`.
 //!
-//! In order to maintain optimized memory and wire layouts, some fields in
-//! the configuration must be powers of two. [`WorldConfigBuilder::build`] 
-//! enforces these and other rules so you should never manually create an 
-//! instance of [`WorldConfig`] unless you're writing tests for this module.
+//! Some fields must be powers of two, which is what keeps the memory and wire
+//! layouts cheap to index. [`WorldConfigBuilder::build`] enforces those rules
+//! and the rest, and the fields are private so that a config that exists is a
+//! config that passed.
 //!
 //! # Axes
 //!
@@ -35,22 +39,13 @@ use core::fmt;
 
 /// Largest supported subscription radius in cells. Bounds the inline capacity
 /// of subscription sets so they never allocate. 4 gives a 9x9 grid.
-pub const MAX_CELL_RADIUS: u32 = 4;
+pub(crate) const MAX_CELL_RADIUS: u32 = 4;
 
 /// Upper bound on cells in one subscription.
-pub const MAX_SUB_GRID_CELLS: usize = {
+pub(crate) const MAX_SUB_GRID_CELLS: usize = {
     let axis = (2 * MAX_CELL_RADIUS + 1) as usize;
     axis * axis
 };
-
-/// Default wire precision: one raw unit, or 1/1024 m, which is lossless.
-///
-/// Lossless by default so nothing is discarded unless a consumer asks for it.
-/// Coarser precision saves bytes but quantizes motion: an entity moving less
-/// than one step per tick appears to stand still and then jump. That threshold
-/// is `precision * tick_hz`, which at 1/16 m and 20 Hz is 1.25 m/s, inside the
-/// range of a walking character.
-pub const DEFAULT_PRECISION: Fixed = Fixed::from_raw(1);
 
 // ---------------------------------------------------------------------------
 // Axis
@@ -59,7 +54,9 @@ pub const DEFAULT_PRECISION: Fixed = Fixed::from_raw(1);
 /// Which axis group an error refers to. `x` and `y` are configured together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
+    /// `x` and `y`, which share an extent, a cell size and a wire precision.
     Horizontal,
+    /// `z`, which has its own of each and is not bound by the speed cap.
     Vertical,
 }
 
@@ -76,25 +73,41 @@ impl fmt::Display for Axis {
 // Errors
 // ---------------------------------------------------------------------------
 
+/// Why a set of world parameters was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// A distance was zero or negative. [`Fixed`] is signed, so this has to be
     /// checked before any unsigned bit operation.
     NonPositive(&'static str),
     /// Extent must be a power of two so wire quantization divides evenly.
-    ExtentNotPowerOfTwo { axis: Axis, extent: Fixed },
+    ExtentNotPowerOfTwo {
+        /// Which axis group.
+        axis: Axis,
+        /// What was asked for.
+        extent: Fixed,
+    },
     /// View radius larger than the region makes subscription meaningless.
-    RadiusExceedsRegion { radius: Fixed, region_size: Fixed },
+    RadiusExceedsRegion {
+        /// The view radius asked for.
+        radius: Fixed,
+        /// The region it would have to fit inside.
+        region_size: Fixed,
+    },
     /// An entity able to cross more than one cell boundary per axis per tick
     /// breaks the strip-delta subscription update, which assumes at most one
     /// row and one column change per move. Horizontal movement only; vertical
     /// speed never crosses a cell boundary.
     SpeedExceedsCellPerTick {
+        /// How far the speed cap allows in one tick.
         move_per_tick: Fixed,
+        /// The cell it would cross.
         cell_size: Fixed,
     },
     /// Tick rate must divide evenly into a second so tick duration is exact.
-    TickRateIndivisible { tick_hz: u32 },
+    TickRateIndivisible {
+        /// What was asked for.
+        tick_hz: u32,
+    },
     /// A required field was never set on the builder.
     Missing(&'static str),
 }
@@ -105,26 +118,22 @@ impl fmt::Display for ConfigError {
         match self {
             NonPositive(field) => {
                 write!(f, "`{field}` must be greater than zero")
-            }            ExtentNotPowerOfTwo { axis, extent } => write!(
+            }
+            ExtentNotPowerOfTwo { axis, extent } => write!(
                 f,
                 "{axis} extent {extent} is not a power of two; \
                  wire quantization would not divide evenly"
-            ),            RadiusExceedsRegion {
-                radius,
-                region_size,
-            } => write!(f, "view radius {radius} exceeds region size {region_size}"),            SpeedExceedsCellPerTick {
-                move_per_tick,
-                cell_size,
-            } => write!(
+            ),
+            RadiusExceedsRegion { radius, region_size } => {
+                write!(f, "view radius {radius} exceeds region size {region_size}")
+            }
+            SpeedExceedsCellPerTick { move_per_tick, cell_size } => write!(
                 f,
                 "an entity moves {move_per_tick} per tick but cells are {cell_size}; \
                  it could skip a cell, invalidating strip-delta subscription updates"
             ),
             TickRateIndivisible { tick_hz } => {
-                write!(
-                    f,
-                    "tick rate {tick_hz} Hz does not divide evenly into 1000 ms"
-                )
+                write!(f, "tick rate {tick_hz} Hz does not divide evenly into 1000 ms")
             }
             Missing(field) => write!(f, "required field `{field}` was not set"),
         }
@@ -167,6 +176,8 @@ pub struct WorldConfig {
 }
 
 impl WorldConfig {
+    /// Starts a world. Every field has a default; [`WorldConfigBuilder::build`]
+    /// validates the result.
     pub fn builder() -> WorldConfigBuilder {
         WorldConfigBuilder::default()
     }
@@ -195,6 +206,7 @@ impl WorldConfig {
     pub const fn max_horizontal_speed(&self) -> Fixed {
         self.max_horizontal_speed
     }
+    /// Ticks per second.
     pub const fn tick_hz(&self) -> u32 {
         self.tick_hz
     }
@@ -219,9 +231,11 @@ impl WorldConfig {
     pub const fn cell_mask(&self) -> i32 {
         self.cell_mask
     }
+    /// Cells along one horizontal axis.
     pub const fn cells_per_axis(&self) -> u32 {
         self.cells_per_axis
     }
+    /// Cells in the whole region, which is the square of the axis count.
     pub const fn cells_per_region(&self) -> u32 {
         self.cells_per_region
     }
@@ -233,10 +247,12 @@ impl WorldConfig {
     pub const fn sub_grid_axis(&self) -> u32 {
         self.sub_grid_axis
     }
-    /// Total cells in one subscription. Never exceeds [`MAX_SUB_GRID_CELLS`].
+    /// Total cells in one subscription. Never exceeds 81, the 9x9 grid a
+    /// four-cell radius implies.
     pub const fn sub_grid_cells(&self) -> u32 {
         self.sub_grid_cells
     }
+    /// Milliseconds between ticks.
     pub const fn tick_ms(&self) -> u32 {
         self.tick_ms
     }
@@ -256,6 +272,7 @@ impl WorldConfig {
     pub const fn horizontal_precision(&self) -> Fixed {
         self.horizontal_precision
     }
+    /// Bits dropped from a `z` value on the way to the wire.
     pub const fn vertical_quant_shift(&self) -> u32 {
         self.vertical_quant_shift
     }
@@ -332,21 +349,25 @@ impl WorldConfig {
 
     // -- wire -------------------------------------------------------------
 
+    /// An `x` or `y` value as it travels.
     #[inline]
     pub const fn quantize_horizontal(&self, v: Fixed) -> u32 {
         (v.raw() as u32) >> self.horizontal_quant_shift
     }
 
+    /// Back from the wire, to within the horizontal precision.
     #[inline]
     pub const fn dequantize_horizontal(&self, wire: u32) -> Fixed {
         Fixed::from_raw((wire << self.horizontal_quant_shift) as i32)
     }
 
+    /// A `z` value as it travels.
     #[inline]
     pub const fn quantize_vertical(&self, v: Fixed) -> u32 {
         (v.raw() as u32) >> self.vertical_quant_shift
     }
 
+    /// Back from the wire, to within the vertical precision.
     #[inline]
     pub const fn dequantize_vertical(&self, wire: u32) -> Fixed {
         Fixed::from_raw((wire << self.vertical_quant_shift) as i32)
@@ -419,16 +440,19 @@ impl WorldConfig {
     /// # Panics
     ///
     /// If the size is not positive, not a power of two in raw units, does not
-    /// divide the region evenly, produces a cell radius above
-    /// [`MAX_CELL_RADIUS`], or is small enough that an entity at
-    /// `max_horizontal_speed` crosses more than one boundary per tick.
+    /// divide the region evenly, produces a cell radius above four, or is small
+    /// enough that an entity at `max_horizontal_speed` crosses more than one
+    /// boundary per tick.
     pub fn with_cell_size_m(&self, m: i32) -> WorldConfig {
         let cell_size = Fixed::from_meters(m);
         let cell_raw = cell_size.raw() as u32;
         let region_raw = self.region_size.raw() as u32;
 
         assert!(cell_size.raw() > 0, "cell size must be positive");
-        assert!(cell_raw.is_power_of_two(), "cell size {cell_size} is not a power of two");
+        assert!(
+            cell_raw.is_power_of_two(),
+            "cell size {cell_size} is not a power of two"
+        );
         assert!(
             region_raw % cell_raw == 0,
             "cell size {cell_size} does not divide region {}",
@@ -528,17 +552,22 @@ impl WorldConfigBuilder {
         self
     }
 
-
+    /// How far an observer sees, in meters. Rounds up to whole cells.
     pub fn horizontal_view_radius_m(mut self, m: i32) -> Self {
         self.horizontal_view_radius = Some(Fixed::from_meters(m));
         self
     }
 
+    /// The fastest anything may travel horizontally, in meters per second.
+    ///
+    /// Bounds how far an entity moves in one tick, which is what lets a
+    /// subscription be rebuilt from a cell rather than from scratch.
     pub fn max_horizontal_speed_m_per_sec(mut self, m: i32) -> Self {
         self.max_horizontal_speed = Some(Fixed::from_meters(m));
         self
     }
 
+    /// Ticks per second. Must be a power of two.
     pub fn tick_hz(mut self, hz: u32) -> Self {
         self.tick_hz = Some(hz);
         self
@@ -550,12 +579,10 @@ impl WorldConfigBuilder {
 
         let region_size = self.region_size.ok_or(Missing("region_size"))?;
         let vertical_extent = self.vertical_extent.ok_or(Missing("vertical_extent"))?;
-        let horizontal_view_radius = self
-            .horizontal_view_radius
-            .ok_or(Missing("horizontal_view_radius"))?;
-        let max_horizontal_speed = self
-            .max_horizontal_speed
-            .ok_or(Missing("max_horizontal_speed"))?;
+        let horizontal_view_radius =
+            self.horizontal_view_radius.ok_or(Missing("horizontal_view_radius"))?;
+        let max_horizontal_speed =
+            self.max_horizontal_speed.ok_or(Missing("max_horizontal_speed"))?;
         let tick_hz = self.tick_hz.ok_or(Missing("tick_hz"))?;
 
         // Fixed is signed, so positivity has to be established before any
@@ -568,7 +595,7 @@ impl WorldConfigBuilder {
         let region_raw = region_size.raw() as u32;
         let vertical_raw = vertical_extent.raw() as u32;
 
-        // Cell size is derived, not supplied.       
+        // Cell size is derived, not supplied.
         let cell_raw = 1u32 << ((horizontal_view_radius.raw() as u32 / 2).max(1).ilog2());
         let cell_size = Fixed::from_raw(cell_raw as i32);
 
@@ -595,9 +622,13 @@ impl WorldConfigBuilder {
         }
 
         let cell_radius = (horizontal_view_radius.raw() as u32).div_ceil(cell_raw);
-        debug_assert!(cell_radius <= MAX_CELL_RADIUS, "derived cell size broke the radius bound");
+        debug_assert!(
+            cell_radius <= MAX_CELL_RADIUS,
+            "derived cell size broke the radius bound"
+        );
 
-        let max_move_per_tick = Fixed::from_raw(max_horizontal_speed.raw() / tick_hz as i32);
+        let max_move_per_tick =
+            Fixed::from_raw(max_horizontal_speed.raw() / tick_hz as i32);
         if max_move_per_tick.raw() as u32 >= cell_raw {
             return Err(SpeedExceedsCellPerTick {
                 move_per_tick: max_move_per_tick,
@@ -605,10 +636,16 @@ impl WorldConfigBuilder {
             });
         }
 
-        // Wire widths. Precision is lossless, so a position keeps every bit the
-        // simulation computed with and the quantization shift is zero. A single
-        // global precision has to serve the nearest entity, and at arm's length
-        // sub-pixel error is sub-millimeter, so there is nothing to trade away.
+        // Wire widths. Precision is one raw unit — 1/1024 m — so a position
+        // keeps every bit the simulation computed with and the quantization
+        // shift is zero. A single global precision has to serve the nearest
+        // entity, and at arm's length sub-pixel error is sub-millimeter, so
+        // there is nothing to trade away.
+        //
+        // Coarser precision would save bytes and quantize motion: anything
+        // moving less than one step per tick would stand still and then jump.
+        // That threshold is `precision * tick_hz`, which at 1/16 m and 20 Hz is
+        // 1.25 m/s — inside the range of a walking character.
         let horizontal_bits = region_raw.trailing_zeros();
         let horizontal_quant_shift = 0;
         let horizontal_precision = Fixed::from_raw(1);
@@ -647,14 +684,8 @@ impl WorldConfigBuilder {
 }
 
 fn positive(v: Fixed, name: &'static str) -> Result<(), ConfigError> {
-    if v.raw() <= 0 {
-        Err(ConfigError::NonPositive(name))
-    } else {
-        Ok(())
-    }
+    if v.raw() <= 0 { Err(ConfigError::NonPositive(name)) } else { Ok(()) }
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -750,14 +781,6 @@ mod tests {
         assert!(!w.contains(Pos3::from_meters(-1, 0, 0)));
     }
 
-
-
-
-
-
-
-
-
     #[test]
     fn rejects_non_positive_extent() {
         let err = base().region_size_m(0).build().unwrap_err();
@@ -825,10 +848,7 @@ mod tests {
     fn rejects_entity_that_can_skip_a_cell() {
         // A 2 m view radius derives a 1 m cell, and 40 m/s at 20 Hz moves 2 m
         // per tick.
-        let err = base()
-            .horizontal_view_radius_m(2)
-            .build()
-            .unwrap_err();
+        let err = base().horizontal_view_radius_m(2).build().unwrap_err();
         assert!(matches!(err, ConfigError::SpeedExceedsCellPerTick { .. }));
     }
 
@@ -855,7 +875,4 @@ mod tests {
         let b = base().vertical_extent_m(512).build().unwrap();
         assert_ne!(a.protocol_hash(), b.protocol_hash());
     }
-
-
-
 }

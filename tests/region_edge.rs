@@ -10,13 +10,16 @@
 //! region allocated, the region applies the positions the edge sends, and the
 //! payload that comes back carries those positions.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EdgeName, EdgeSink, EntityKind, Incoming, Inbound, Presence, RegionClient, RegionServer, Spawn};
-use umwelt::sim::{ClientLimits, Flow, Handoff, Overrun, Pacing, Step, Wait};
-use umwelt::{EntityId, Game, PacketReader, Pos3, RecordCodec, RegionId, WorldConfig, WorldSimulation};
+use umwelt::internals::RecordCodec;
+use umwelt::internals::region::{Incoming, Presence, RegionClient, Spawn};
+use umwelt::net::{EdgeName, EdgeSink, Inbound};
+use umwelt::{ClientLimits, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
+use umwelt::{Pacing, PacketReader, Pos3, RegionId, RegionServer, Step, Wait};
+use umwelt::{WorldConfig, WorldSimulation};
 
 const EDGES: usize = 3;
 /// Entities with a game client behind them. Each gets a viewer.
@@ -114,8 +117,12 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
         Duration::from_secs(5),
     )
     .expect("serves");
-    let sink =
-        EdgeSink::new(region, client.clone(), runtime.handle().clone(), Arc::clone(&edges));
+    let sink = EdgeSink::new(
+        region,
+        client.clone(),
+        runtime.handle().clone(),
+        Arc::clone(&edges),
+    );
 
     let culled: Arc<Mutex<Option<EntityId>>> = Arc::new(Mutex::new(None));
     let mut sim = WorldSimulation::new(
@@ -163,8 +170,9 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                 let link =
                     RegionClient::new(edge_client, edge_runtime.handle().clone(), name)
                         .expect("subscribes");
-                let offer =
-                    link.info(region, Duration::from_secs(5)).expect("the region answers");
+                let offer = link
+                    .info(region, Duration::from_secs(5))
+                    .expect("the region answers");
                 assert_eq!(offer.region, region);
                 let codec = RecordCodec::new(&offer.config);
 
@@ -189,8 +197,12 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                 let mut mine: Vec<Option<EntityId>> = vec![None; PER_EDGE];
                 let deadline = Instant::now() + Duration::from_secs(20);
                 while mine.iter().any(Option::is_none) {
-                    assert!(Instant::now() < deadline, "the region never reported the spawns");
-                    let Some(message) = link.receive_timeout(Duration::from_millis(200)) else {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the region never reported the spawns"
+                    );
+                    let Some(message) = link.receive_timeout(Duration::from_millis(200))
+                    else {
                         continue;
                     };
                     let Incoming::Presence { what, .. } = message else { continue };
@@ -200,7 +212,8 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                         mine[at] = Some(entity);
                     }
                 }
-                let movable: Vec<EntityId> = mine.iter().map(|m| m.expect("filled")).collect();
+                let movable: Vec<EntityId> =
+                    mine.iter().map(|m| m.expect("filled")).collect();
 
                 let mut sorted: Vec<u32> = movable.iter().map(|id| id.raw()).collect();
                 sorted.sort_unstable();
@@ -235,13 +248,15 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                     });
 
                     while !stop.load(Ordering::Relaxed) {
-                        let Some(message) = link.receive_timeout(Duration::from_millis(200))
+                        let Some(message) =
+                            link.receive_timeout(Duration::from_millis(200))
                         else {
                             continue;
                         };
                         match message {
                             Incoming::State { entity, packet, .. } => {
-                                let Some(reader) = PacketReader::new(&codec, &packet) else {
+                                let Some(reader) = PacketReader::new(&codec, &packet)
+                                else {
                                     continue;
                                 };
                                 // A packet is named by the avatar it was built
@@ -255,7 +270,10 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                                     }
                                 }
                             }
-                            Incoming::Presence { what: Presence::Removed { entity }, .. } => {
+                            Incoming::Presence {
+                                what: Presence::Removed { entity },
+                                ..
+                            } => {
                                 removed.lock().expect("not poisoned").push(entity);
                             }
                             Incoming::Presence { .. } => {}

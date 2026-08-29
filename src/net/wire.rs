@@ -61,7 +61,11 @@ impl<'a> Cursor<'a> {
     /// Trailing bytes mean the two ends disagree about the format, so this is a
     /// decode failure rather than something to ignore.
     pub(crate) fn finish(self) -> Result<(), NetError> {
-        if self.at == self.buf.len() { Ok(()) } else { Err(NetError::Malformed(self.what)) }
+        if self.at == self.buf.len() {
+            Ok(())
+        } else {
+            Err(NetError::Malformed(self.what))
+        }
     }
 }
 
@@ -98,6 +102,9 @@ mod cursor_tests {
         assert_eq!(c.u32().unwrap(), 0xDEAD_BEEF);
         assert_eq!(c.i32().unwrap(), -7);
         assert_eq!(c.u64().unwrap(), 0x0123_4567_89AB_CDEF);
-        assert!(matches!(c.finish(), Err(NetError::Malformed("test"))), "tail is left over");
+        assert!(
+            matches!(c.finish(), Err(NetError::Malformed("test"))),
+            "tail is left over"
+        );
     }
 }

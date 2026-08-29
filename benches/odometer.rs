@@ -16,7 +16,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use umwelt::{EntityId, Fixed, LiveSet, Odometer, WorldConfig};
+use umwelt::internals::Odometer;
+use umwelt::{EntityId, Fixed, LiveSet, WorldConfig};
 
 /// xorshift64. Deterministic across runs so successive benchmarks compare.
 struct Rng(u64);

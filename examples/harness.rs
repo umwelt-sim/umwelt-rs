@@ -32,11 +32,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use umwelt::select::{NEAR_BAND, Policy, Weights};
-use umwelt::sim::{
-    ClientLimits, DEFAULT_GHOST_CAP, DEFAULT_GRACE, Outbound, Step, WorldSimulation,
-};
-use umwelt::{EntityId, Fixed, Game, Pos3, WorldConfig};
+use umwelt::internals::{NEAR_BAND, Outbound};
+use umwelt::sim::{DEFAULT_GHOST_CAP, DEFAULT_GRACE};
+use umwelt::{ClientLimits, EntityId, Fixed, Game, Policy, Pos3, Step, Weights};
+use umwelt::{WorldConfig, WorldSimulation};
 
 /// Dense enough that a viewer's candidate set exceeds a packet, or there is no
 /// selection pressure and every curve behaves identically.
@@ -427,7 +426,8 @@ fn run(s: Sweep) -> Run {
                 (e.id, band_of(isqrt(e.dist_sq.raw())))
             }));
             o.departed.extend(out.selection.departed().iter().copied());
-            o.arrivals = out.selection.records().iter().filter(|r| r.is_new()).count() as u64;
+            o.arrivals =
+                out.selection.records().iter().filter(|r| r.is_new()).count() as u64;
             o.bytes = out.bytes.len() as u64;
         };
         sim.tick_with(&capture);
@@ -475,7 +475,9 @@ fn run(s: Sweep) -> Run {
                         // A ghost is a belief the client renders whether or not
                         // the entity is still in the set being refreshed, so
                         // what `grace` holds past the set is counted here.
-                        Some(believed) => m.observe(isqrt(truth.dist_sq(*believed).raw()), sep),
+                        Some(believed) => {
+                            m.observe(isqrt(truth.dist_sq(*believed).raw()), sep)
+                        }
                         None if owed => m.unrepresented += 1,
                         None => {}
                     }
@@ -507,8 +509,8 @@ fn run(s: Sweep) -> Run {
             }
         }
     }
-    let ghosts =
-        viewers.iter().map(|&v| sim.ghost_count(v)).sum::<usize>() as f64 / viewers.len() as f64;
+    let ghosts = viewers.iter().map(|&v| sim.ghost_count(v)).sum::<usize>() as f64
+        / viewers.len() as f64;
     Run { sweep: s, ghosts, metrics: m }
 }
 
@@ -576,7 +578,10 @@ fn report(title: &str, runs: &[Run]) {
                 match value {
                     0 => {
                         let seen = r.metrics.seen_by_band[b].max(1);
-                        print!(" {:>10.3}", r.metrics.sent_by_band[b] as f64 / seen as f64)
+                        print!(
+                            " {:>10.3}",
+                            r.metrics.sent_by_band[b] as f64 / seen as f64
+                        )
                     }
                     1 => print!(" {:>10.2}", r.metrics.mean_mrad(Some(b))),
                     _ => print!(" {:>10.3}", r.metrics.mean_m(Some(b))),
@@ -616,7 +621,12 @@ fn main() {
     let mut runs = Vec::new();
     for cap in [256usize, 512] {
         for (label, k) in curves {
-            runs.push(run(Sweep { label, weights: curve(k), ghost_cap: cap, ..Sweep::base() }));
+            runs.push(run(Sweep {
+                label,
+                weights: curve(k),
+                ghost_cap: cap,
+                ..Sweep::base()
+            }));
         }
     }
     report("curve, at two caps", &runs);
@@ -635,7 +645,10 @@ fn main() {
     // much and a client keeps ghosts nothing is refreshing. Swept against a
     // walking viewer and a driving one, since a viewer that crosses a crowd
     // churns its ghost set and one standing in a crowd does not.
-    for (class, speed) in [(WALKING_VIEWERS, MIX[WALKING_VIEWERS].1), (DRIVING_VIEWERS, MIX[DRIVING_VIEWERS].1)] {
+    for (class, speed) in [
+        (WALKING_VIEWERS, MIX[WALKING_VIEWERS].1),
+        (DRIVING_VIEWERS, MIX[DRIVING_VIEWERS].1),
+    ] {
         let graces: Vec<Run> = [0u32, 1, 2, 3, 5, 10, 20]
             .into_iter()
             .map(|g| run(Sweep { grace: g, viewer_class: class, ..Sweep::base() }))
@@ -654,22 +667,26 @@ fn main() {
     // A viewer's ghosts are stamped only on the ticks it is served, so a send
     // period above the grace makes every ghost depart and arrive again on every
     // turn. This is where that shows up rather than in a note.
-    let periods: Vec<Run> = [("period 1", 1u8), ("period 2", 2), ("period 4", 4), ("period 8", 8)]
-        .into_iter()
-        .map(|(label, send_period)| run(Sweep { label, send_period, ..Sweep::base() }))
-        .collect();
+    let periods: Vec<Run> =
+        [("period 1", 1u8), ("period 2", 2), ("period 4", 4), ("period 8", 8)]
+            .into_iter()
+            .map(|(label, send_period)| {
+                run(Sweep { label, send_period, ..Sweep::base() })
+            })
+            .collect();
     report("send period, at the default grace", &periods);
 
     // Coverage moves around between populations in a way the error columns do
     // not, so the same caps are run against three crowds before anything is
     // concluded from a `never` figure.
-    let seeds: Vec<Run> = [("seed 5EED", 0x5EEDu64), ("seed C0FFEE", 0xC0FFEE), ("seed BEEF", 0xBEEF)]
-        .into_iter()
-        .flat_map(|(label, seed)| {
-            [160usize, 192, 224, 256]
-                .into_iter()
-                .map(move |ghost_cap| run(Sweep { label, ghost_cap, seed, ..Sweep::base() }))
-        })
-        .collect();
+    let seeds: Vec<Run> =
+        [("seed 5EED", 0x5EEDu64), ("seed C0FFEE", 0xC0FFEE), ("seed BEEF", 0xBEEF)]
+            .into_iter()
+            .flat_map(|(label, seed)| {
+                [160usize, 192, 224, 256].into_iter().map(move |ghost_cap| {
+                    run(Sweep { label, ghost_cap, seed, ..Sweep::base() })
+                })
+            })
+            .collect();
     report("population, at four caps", &seeds);
 }

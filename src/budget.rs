@@ -84,21 +84,25 @@ impl PacketBudget {
         }
     }
 
+    /// The whole payload, header included.
     #[inline]
     pub fn payload_bytes(&self) -> usize {
         self.payload_bytes as usize
     }
 
+    /// What the header takes before any record fits.
     #[inline]
     pub fn header_bytes(&self) -> usize {
         self.header_bytes as usize
     }
 
+    /// Held back for despawns, which travel ahead of updates.
     #[inline]
     pub fn event_reserve_bytes(&self) -> usize {
         self.event_reserve_bytes as usize
     }
 
+    /// What is left for entity records.
     #[inline]
     pub fn record_bytes(&self) -> usize {
         self.record_bytes as usize
@@ -218,7 +222,10 @@ mod tests {
     #[test]
     fn a_payload_under_the_header_is_refused() {
         let codec = RecordCodec::new(&world(4096));
-        assert!(std::panic::catch_unwind(|| PacketBudget::with_overhead(&codec, 8, 16, 0)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| PacketBudget::with_overhead(&codec, 8, 16, 0))
+                .is_err()
+        );
     }
 
     #[test]

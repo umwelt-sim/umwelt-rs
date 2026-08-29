@@ -1,6 +1,6 @@
 [package]
 name = "umwelt"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.86"
 description = "Interest management for real-time simulation: spatial subscription, priority accumulation, and per-viewer bandwidth budgeting."

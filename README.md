@@ -65,9 +65,18 @@ As a game developer using this library, you have 3 core jobs:
 ## Defining a Simulation Loop
 Defining the simulation loop is as simple as declaring your world parameters like size and simulation parameters like the loop tick rate (typically **20Hz** or **50ms** per tick). 
 
-```rust
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+
+use umwelt::net::{EdgeSink, Edges, Inbound};
+use umwelt::{
+    ClientLimits, Fixed, Flow, Game, Handoff, Pacing, RegionId, RegionServer, Step, WorldConfig,
+    WorldSimulation,
+};
+
 // Everything the valley simulates: crops, livestock, and the farmers walking
-/// between them.
+// between them.
 struct MildewValley {
     /// What the edges have asked for, applied inside the tick.
     inbound: Arc<Inbound>,
@@ -131,7 +140,11 @@ transferring entities from one region to another.
 If you want to inject your own custom code, just create a new binary with your own implementation
 of the edge callback:
 
-```rust
+```rust,no_run
+use std::net::SocketAddr;
+
+use umwelt::{ClientId, EdgeGame, EdgeServer};
+
 /// Relaying needs no code at all. This only says who came and went.
 struct Gatehouse;
 
@@ -166,7 +179,12 @@ With a simulation and an edge, the only thing left to do is make the game client
 To create a game, just implement the methods in the `ClientGame` trait, connect to an edge
 via QUIC, and create your `ClientHandle`.
 
-```rust
+```rust,no_run
+use umwelt::{
+    ClientGame, ClientHandle, EdgeClient, EntityHandle, EntityId, EntityKind, PacketReader, Pos3,
+    RegionId,
+};
+
 /// The player's side, called when the edge has something to say.
 struct Farm {
     sending: ClientHandle,

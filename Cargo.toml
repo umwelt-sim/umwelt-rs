@@ -32,7 +32,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 
 [dev-dependencies]
 criterion = "0.8.2"
-rcgen = { version = "0.14.7", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 
 [[bench]]
 name = "subscription"

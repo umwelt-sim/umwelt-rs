@@ -7,6 +7,15 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://crates.io/crates/umwelt"><img alt="crates.io"
+     src="https://img.shields.io/crates/v/umwelt.svg?logo=rust"></a>
+  <a href="https://docs.rs/umwelt"><img alt="docs.rs"
+     src="https://img.shields.io/docsrs/umwelt?logo=docsdotrs&amp;label=docs.rs"></a>
+  <a href="https://github.com/umwelt-sim/umwelt-rs/actions/workflows/ci.yml"><img alt="build status"
+     src="https://img.shields.io/github/actions/workflow/status/umwelt-sim/umwelt-rs/ci.yml?branch=main&amp;logo=github&amp;label=build"></a>
+</p>
+
 # Umwelt
 
 **umwelt(n)** - _The specific way in which organisms of a particular species perceive and experience the world, shaped by the capabilities of their sensory organs and perceptual systems_. 

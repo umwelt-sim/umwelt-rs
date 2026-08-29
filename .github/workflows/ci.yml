@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The integration tests under tests/ talk to a real broker. They read
+    # NATS_URL and fall back to this address, which is where the service
+    # container below is published.
+    services:
+      nats:
+        image: nats:2
+        ports:
+          - 4222:4222
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo test --locked

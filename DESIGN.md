@@ -1304,7 +1304,7 @@ and the game's own opaque bytes. Receiving is a `ClientGame`, called with what
 the edge said.
 
 **A game is told nothing about how a region is configured.** It never sees a
-`WorldConfig`, a `RecordCodec`, or a packet: `ClientGame::state` is handed a
+`WorldConfig`, a `RecordCodec`, or a packet: `ClientGame::observed` is handed a
 decoded reader. It has no say in a region's tick rate, view radius or speed cap,
 and being given them would only invite it to act as though it did.
 

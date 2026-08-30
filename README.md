@@ -208,7 +208,12 @@ impl ClientGame for Farm {
     }
 
     // Umwelt will call this whenever state changes, at a fixed interval of your choosing
-    fn state(&mut self, _handle: EntityHandle, _region: RegionId, state: &PacketReader<'_>) {
+    fn observed(
+        &mut self,
+        _handle: EntityHandle,
+        _region: RegionId,
+        state: &PacketReader<'_>,
+    ) {
         for gone in state.despawns() {
             // .. your logic here: the neighbor's goat wandered out of sight
             let _ = gone;

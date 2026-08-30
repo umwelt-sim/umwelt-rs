@@ -419,7 +419,9 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
             Some(key) => shared.release(key),
             None => shared.count_refused(),
         },
-        FromClient::Message(body) => shared.with_game(|game| game.message(client, &body)),
+        FromClient::Message(body) => {
+            shared.with_game(|game| game.message_received(client, &body))
+        }
     }
 }
 

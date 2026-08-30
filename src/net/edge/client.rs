@@ -126,13 +126,15 @@ impl Shared {
 ///     seen: usize,
 /// }
 ///
-/// impl ClientGame for Watcher {     fn spawned(&mut self, handle:
-/// EntityHandle, region: RegionId, entity: EntityId) {
-/// println!("{handle} is {entity} in {region}");     }
+/// impl ClientGame for Watcher {
+///     fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
+///         println!("{handle} is {entity} in {region}");
+///     }
 ///
-///     fn state(&mut self, _: EntityHandle, _: RegionId, state:
-/// &PacketReader<'_>) {         self.seen += state.header().updates as usize;
-/// } }
+///     fn observed(&mut self, _: EntityHandle, _: RegionId, state: &PacketReader<'_>) {
+///         self.seen += state.header().updates as usize;
+///     }
+/// }
 ///
 /// // The caller connects. Where the edge is, and what it has to present to
 /// // be trusted, is the game's own business.
@@ -140,8 +142,9 @@ impl Shared {
 /// let conn: quinn::Connection = // dialed by the caller
 /// # unimplemented!();
 ///
-/// let client = EdgeClient::new(conn, runtime.handle().clone(), |_|
-/// Watcher::default())?; let sending = client.handle();
+/// let client =
+///     EdgeClient::new(conn, runtime.handle().clone(), |_| Watcher::default())?;
+/// let sending = client.handle();
 ///
 /// // Valid at once: a move under this handle is held at the edge until the
 /// // region answers.
@@ -470,7 +473,7 @@ fn deliver(shared: &Shared, body: &[u8]) {
         // spent.
         let Some(codec) = codecs.get(&region) else { return };
         let Some(state) = PacketReader::new(codec, packet) else { return };
-        shared.with_game(|game| game.state(handle, region, &state));
+        shared.with_game(|game| game.observed(handle, region, &state));
         return;
     }
     // Kept here so a state packet can be decoded without the wire having to
@@ -496,7 +499,7 @@ fn deliver(shared: &Shared, body: &[u8]) {
             shared.live.lock().expect("not poisoned").remove(&handle);
             game.removed(handle)
         }
-        ToClient::Message(body) => game.message(body),
+        ToClient::Message(body) => game.message_received(body),
         ToClient::Region(_) | ToClient::State { .. } => unreachable!("handled above"),
     });
 }

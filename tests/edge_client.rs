@@ -18,7 +18,7 @@ use umwelt::internals::edge::FromClient;
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{ClientGame, ClientHandle, ClientLimits, EdgeClient, EdgeServer};
 use umwelt::{EntityHandle, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
-use umwelt::{Pacing, PacketReader, Pos3, RegionId, RegionServer, Step, Wait};
+use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, PacketReader, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
 /// Entities the client asks for. Small: this is a wiring test, not a load one.
@@ -93,7 +93,7 @@ impl ClientGame for Watcher {
         self.gone.lock().expect("not poisoned").push(handle);
     }
 
-    fn state(
+    fn observed(
         &mut self,
         _handle: EntityHandle,
         region: RegionId,

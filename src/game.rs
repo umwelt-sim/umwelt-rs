@@ -62,13 +62,13 @@ pub trait Game {
     /// start its own async runtime.
     /// The `world` parameter is a no-allocation output buffer. The
     /// [`Step`] struct provides appropriate access to this buffer.
-    /// 
+    ///
     fn step(&mut self, world: &mut Step<'_>);
 }
 
-/// Trait that must be implemented by edges. By default, game developers do 
+/// Trait that must be implemented by edges. By default, game developers do
 /// not have to provide any code as there is a valid default implementation.
-/// If you want to provide logic against your own metadata (e.g. a ban list, 
+/// If you want to provide logic against your own metadata (e.g. a ban list,
 /// emitting to a data logger, etc) then provide your own implementation.
 ///
 /// Calls are serialized and made on the I/O path, so **an implementation must
@@ -81,7 +81,7 @@ pub trait Game {
 /// # Example
 ///
 /// The ban list, the headcount and the chat are the responsibility
-/// of the edge. Umwelt relays the valley position updates 
+/// of the edge. Umwelt relays the valley position updates
 /// without reading a byte of any of it.
 ///
 /// ```
@@ -155,7 +155,7 @@ pub trait EdgeGame: Send + 'static {
 
 /// The consumer's game client, called when its edge says something.
 ///
-/// Nothing here polls, waits or retries: the library owns the reading, 
+/// Nothing here polls, waits or retries: the library owns the reading,
 /// and a connection that goes away reports itself
 /// through [`disconnected`](Self::disconnected) rather than as a timeout the
 /// consumer has to interpret.

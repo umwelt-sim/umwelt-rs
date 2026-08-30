@@ -1,10 +1,12 @@
 #![doc = include_str!("../README.md")]
-
 #![warn(missing_docs)]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/umwelt-sim/umwelt-rs/main/assets/logo/umwelt-tile-small.svg",
     html_favicon_url = "https://raw.githubusercontent.com/umwelt-sim/umwelt-rs/main/assets/logo/favicon.svg"
 )]
+
+//! If you want to get started building a game on top of Umwelt, then check out the
+//! [`crate::game`] module.
 
 pub mod config;
 pub mod entity;

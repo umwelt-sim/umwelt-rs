@@ -226,7 +226,7 @@ impl CellCoord {
 
     /// Chebyshev distance: the number of steps between two cell coordinates
     /// on the grid. The optimization is that Chebyshev distance treats the
-    /// adjacent diagonal cells as a distance of 1.    
+    /// adjacent diagonal cells as a distance of 1.
     ///
     /// This is the metric the square subscription grid uses. A cell is subscribed
     /// when its Chebyshev distance from the viewer is within some threshold.

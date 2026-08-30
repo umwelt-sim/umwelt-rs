@@ -417,7 +417,7 @@ impl WorldConfig {
     /// connect time and reject on mismatch. This digest only covers the
     /// configuration values that are required for protocol setup and
     /// exchange over the wire. All other configuration values can change
-    /// without invalidating communications.    
+    /// without invalidating communications.
     pub const fn protocol_hash(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         h = fnv(h, FIXED_SHIFT);

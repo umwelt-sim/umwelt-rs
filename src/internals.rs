@@ -20,8 +20,7 @@ pub mod region {
     pub use crate::net::region::protocol::{
         DespawnEntities, MAX_DESPAWN_PER_MESSAGE, MAX_MESSAGE_BYTES,
         MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION,
-        Presence, ProtocolVersion, ServerInfo, ServerVersion, Spawn, SpawnEntities,
-        WorldParams,
+        Presence, ServerInfo, Spawn, SpawnEntities, WorldParams,
     };
 }
 

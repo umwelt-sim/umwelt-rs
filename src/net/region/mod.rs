@@ -1,9 +1,10 @@
 //! The region-to-edge protocol, over NATS.
 //!
-//! One region simulation, and the edges relaying for it. for why this is NATS
-//! rather than a connection this crate implements.
+//! One region simulation, and the edges relaying for it. The transport is a
+//! NATS broker rather than a connection this crate implements, so running the
+//! broker is the caller's and nothing here opens a socket.
 //!
-//! - `protocol` is the messages and the versions.
+//! - `protocol` is the messages, and the version number this link is on.
 //! - [`subjects`] is which subject carries what, and how to read one back.
 //! - [`edges`] is the set of edges one region has heard from.
 //! - [`session`] is what a running region and its edges say to each other.

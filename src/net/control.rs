@@ -1,8 +1,10 @@
 //! What a region says about itself, for whoever is watching the tier.
 //!
-//! A separate protocol from `net::region`, and deliberately not sharing types
-//! with it. That one is how a region and its edges do their work; this one is
-//! how an operator sees that the work is happening.
+//! A separate protocol from `net::region`, and deliberately not sharing a
+//! message with it. That one is how a region and its edges do their work; this
+//! one is how an operator sees that the work is happening. The two version
+//! types a heartbeat reports are the exception, and they come from
+//! [`version`](crate::net::version), which belongs to neither protocol.
 //!
 //! The library publishes and does not subscribe. Deciding anything from a
 //! heartbeat — rebalancing, draining, placing regions — belongs to a control
@@ -37,7 +39,7 @@ use std::time::Duration;
 use crate::id::RegionId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
-use crate::net::region::protocol::{ProtocolVersion, ServerVersion};
+use crate::net::version::{ProtocolVersion, ServerVersion};
 use crate::net::wire::Cursor;
 
 /// One region's heartbeat subject.

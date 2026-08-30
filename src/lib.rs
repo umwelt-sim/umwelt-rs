@@ -33,7 +33,10 @@ pub use entity::{EntityId, EntityKind, LiveIter, LiveSet};
 pub use fixed::{DistSq, Fixed};
 pub use game::{ClientGame, EdgeGame, Game};
 pub use id::{ClientId, EntityHandle, EntityKey, RegionId};
-pub use net::{ClientHandle, EdgeClient, EdgeHandle, EdgeServer, NetError, RegionServer};
+pub use net::{
+    ClientHandle, EdgeClient, EdgeHandle, EdgeServer, NetError, ProtocolVersion,
+    RegionServer, ServerVersion,
+};
 pub use packet::{PacketHeader, PacketReader};
 pub use pos::{CellCoord, CellId, Pos2, Pos3};
 // From modules the crate keeps to itself. A consumer names these — `Policy` and

@@ -31,7 +31,8 @@ use crate::net::edge::protocol::{EdgeInfo, Framer, FromClient, ToClient};
 use crate::net::error::NetError;
 use crate::net::region::client::{Incoming, RegionClient};
 use crate::net::region::edges::EdgeName;
-use crate::net::region::protocol::{PROTOCOL_VERSION, ServerVersion, Spawn};
+use crate::net::region::protocol::{PROTOCOL_VERSION, Spawn};
+use crate::net::version::ServerVersion;
 use crate::pos::Pos3;
 
 /// How long a region is given to say what world it runs.

@@ -24,11 +24,10 @@ use crate::id::RegionId;
 use crate::net::control::{self, Heartbeat};
 use crate::net::error::NetError;
 use crate::net::region::edges::Edges;
-use crate::net::region::protocol::{
-    PROTOCOL_VERSION, ServerInfo, ServerVersion, WorldParams,
-};
+use crate::net::region::protocol::{PROTOCOL_VERSION, ServerInfo, WorldParams};
 use crate::net::region::session::Inbound;
 use crate::net::region::subjects;
+use crate::net::version::ServerVersion;
 
 /// How often silence is checked against the caller's timeout.
 const SWEEP: Duration = Duration::from_secs(1);

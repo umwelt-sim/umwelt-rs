@@ -3,7 +3,8 @@
 use core::fmt;
 
 use crate::config::ConfigError;
-use crate::net::region::protocol::{ProtocolVersion, kind_name};
+use crate::net::region::protocol::kind_name;
+use crate::net::version::ProtocolVersion;
 
 /// A failure on either link.
 #[derive(Debug)]

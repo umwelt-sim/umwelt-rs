@@ -7,12 +7,11 @@
 //! one-byte kind followed by its body. Which subject it arrived on says which
 //! direction it traveled and, for a command, which edge sent it.
 
-use core::fmt;
-
 use crate::config::WorldConfig;
 use crate::entity::{EntityId, EntityKind};
 use crate::id::RegionId;
 use crate::net::error::NetError;
+use crate::net::version::{ProtocolVersion, ServerVersion};
 use crate::net::wire::Cursor;
 use crate::pos::Pos3;
 
@@ -37,44 +36,8 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Identity and versions
+// Protocol version
 // ---------------------------------------------------------------------------
-
-/// The version of this protocol itself.
-///
-/// Bumped when the messages below change shape. Distinct from
-/// [`ServerVersion`], which is the crate build, and from
-/// [`WorldConfig::protocol_hash`], which is the world's wire layout. All three
-/// can move independently and all three are checked.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProtocolVersion(u16);
-
-impl ProtocolVersion {
-    /// From the raw value.
-    #[inline]
-    pub const fn from_raw(raw: u16) -> ProtocolVersion {
-        ProtocolVersion(raw)
-    }
-
-    /// The raw value.
-    #[inline]
-    pub const fn raw(self) -> u16 {
-        self.0
-    }
-}
-
-impl fmt::Debug for ProtocolVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
-    }
-}
-
-impl fmt::Display for ProtocolVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
-    }
-}
 
 /// What this build speaks. Exact match required, in both directions.
 ///
@@ -84,53 +47,7 @@ impl fmt::Display for ProtocolVersion {
 ///
 /// This versions the region-to-edge protocol only. The edge-to-game-client
 /// protocol will carry its own, and the two are not required to move together.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
-
-/// The crate version a region server is running.
-///
-/// Informational: it is reported so an operator can see what a region is
-/// running without asking it, and nothing rejects on it.
-/// [`PROTOCOL_VERSION`] is what has to match.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ServerVersion {
-    /// Breaking changes.
-    pub major: u16,
-    /// Additions.
-    pub minor: u16,
-    /// Fixes.
-    pub patch: u16,
-}
-
-impl ServerVersion {
-    /// Taken from `Cargo.toml` at compile time, so it cannot drift from it.
-    pub const CURRENT: ServerVersion = ServerVersion {
-        major: parse_u16(env!("CARGO_PKG_VERSION_MAJOR")),
-        minor: parse_u16(env!("CARGO_PKG_VERSION_MINOR")),
-        patch: parse_u16(env!("CARGO_PKG_VERSION_PATCH")),
-    };
-}
-
-impl fmt::Display for ServerVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
-/// # Panics
-///
-/// At compile time, if a cargo version component is not decimal digits. Cargo
-/// will not produce one that is not.
-const fn parse_u16(s: &str) -> u16 {
-    let b = s.as_bytes();
-    let mut n: u16 = 0;
-    let mut i = 0;
-    while i < b.len() {
-        assert!(b[i] >= b'0' && b[i] <= b'9', "version component is not decimal");
-        n = n * 10 + (b[i] - b'0') as u16;
-        i += 1;
-    }
-    n
-}
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::from_raw(1);
 
 // ---------------------------------------------------------------------------
 // World parameters

@@ -10,7 +10,9 @@
 //! rather than things on a wire. They live in [`id`](crate::id) and
 //! [`entity`](crate::entity), outside this module entirely, so that the traits
 //! a consumer implements can be written without reaching in here. The two links
-//! also share one decoder, `wire::Cursor`, which belongs to neither.
+//! also share one decoder, `wire::Cursor`, and the two types in [`version`],
+//! all of which belong to neither link: each carries its own protocol version,
+//! and both report the same build.
 //!
 //! **Region to edge** — over NATS. A region simulation and the edges relaying
 //! for it: few peers, deployed together and updated together.
@@ -21,8 +23,11 @@
 //! that link: latest-only, lossy, unordered, MTU-sized, and they reach a
 //! client on a datagram.
 //!
-//! Neither format is public. Subjects, message kinds, versions and caps are
-//! umwelt's on both ends.
+//! Neither format is public: subjects, message kinds, version numbers and caps
+//! are umwelt's on both ends, and the code that builds any of them is
+//! crate-private. [`ProtocolVersion`] and [`ServerVersion`] are the one
+//! exception, and only as types — a consumer reads a version off a heartbeat
+//! or a [`NetError`] and never chooses one.
 //!
 //! # The pieces, and which side holds them
 //!
@@ -79,6 +84,7 @@
 
 pub mod control;
 mod error;
+pub mod version;
 pub(crate) mod wire;
 
 pub(crate) mod edge;
@@ -91,3 +97,4 @@ pub use region::{
     Applied, ClaimError, EdgeId, EdgeName, EdgeSink, EdgeView, Edges, Inbound,
     RegionServer, Settled,
 };
+pub use version::{ProtocolVersion, ServerVersion};

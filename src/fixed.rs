@@ -1,9 +1,9 @@
 //! Fixed-point scalar arithmetic.
 //!
-//! A [`Fixed`] is an `i32` with 10 fractional bits: one meter is 1024, and the
-//! smallest representable step is 1/1024 m (~0.98 mm). Range is roughly
-//! ±2,097,152 m. This is like a distance version of managing money in terms of
-//! cents rather than fractional dollars.
+//! A [`Fixed`] is an `i32` with 10 fractional bits. 
+//! One meter is 1024 units, so the smallest representable step is 1/1024 m (~0.98 mm). 
+//! Range is roughly ±2,097,152 m. This is like a distance version of managing money 
+//! in terms of cents rather than fractional dollars.
 //!
 //! Integer rather than `f32` because the simulation must replay bit-identically
 //! after a crash, and float results vary across CPUs and compilers.
@@ -88,23 +88,23 @@ impl Fixed {
         Fixed(self.0.abs())
     }
 
-    /// The smaller of the two.
+    /// The smaller of two fixed point numbers.
     #[inline]
     pub const fn min(self, other: Fixed) -> Fixed {
         if self.0 < other.0 { self } else { other }
     }
 
-    /// The larger of the two.
+    /// The larger of two fixed point numbers
     #[inline]
     pub const fn max(self, other: Fixed) -> Fixed {
         if self.0 > other.0 { self } else { other }
     }
 
-    /// Clamp into `[lo, hi]`. Panics in debug if `lo > hi`.
+    /// Clamp into `[low, high]`. Panics in debug if `low > high`.
     #[inline]
-    pub const fn clamp(self, lo: Fixed, hi: Fixed) -> Fixed {
-        debug_assert!(lo.0 <= hi.0);
-        self.max(lo).min(hi)
+    pub const fn clamp(self, low: Fixed, high: Fixed) -> Fixed {
+        debug_assert!(low.0 <= high.0);
+        self.max(low).min(high)
     }
 
     // -- checked / saturating ---------------------------------------------
@@ -262,14 +262,10 @@ impl fmt::Debug for Fixed {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Squared distance
-// ---------------------------------------------------------------------------
-
 /// A squared distance, in raw-units-squared.
 ///
 /// Deliberately not a [`Fixed`]. Squaring doubles the fractional bits and the
-/// magnitude overflows `i32`: across a 4 km region the largest squared
+/// magnitude overflows `i32`. Across a 4 km region the largest squared
 /// separation is around 5.3e13, which needs 64 bits.
 ///
 /// Ordering is preserved by squaring, so comparisons work directly and

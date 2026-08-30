@@ -4,12 +4,13 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.86"
 description = "Interest management for real-time simulation: spatial subscription, priority accumulation, and per-viewer bandwidth budgeting."
+authors = ["Kevin Hoffman <kevin.hoffman@lightbend.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/umwelt-sim/umwelt-rs"
 readme = "README.md"
 keywords = ["gamedev", "networking", "replication", "multiplayer", "simulation"]
 categories = ["game-development", "network-programming", "simulation"]
-include = ["src/**/*", "docs/**/*", "DESIGN.md", "README.md", "LICENSE"]
+include = ["src/**/*", "DESIGN.md", "README.md", "LICENSE", "CHANGELOG.md"]
 
 [profile.dev]
 opt-level = 1
@@ -18,14 +19,14 @@ opt-level = 1
 opt-level = 3
 
 [dependencies]
-# ADR 0001: the region-to-edge transport is NATS. These are the crate's first
-# dependencies, and tokio arrives through async-nats rather than by choice.
+# The region-to-edge transport is NATS. tokio arrives through async-nats
+# rather than by choice.
 async-nats = "0.50"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 # Named so a payload can reach an edge without a copy; async-nats already uses it.
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
-# ADR 0006: the edge-to-client transport. The caller supplies a bound endpoint,
+# The edge-to-client transport. The caller supplies a bound endpoint,
 # so certificates and the crypto provider stay with the deployment and this
 # crate never installs a process-global default.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

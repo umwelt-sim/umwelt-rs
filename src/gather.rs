@@ -28,7 +28,8 @@ pub struct DiscoveredEntity {
 }
 
 impl DiscoveredEntity {
-    /// From the three parts a cell walk already has in hand.
+    /// Create a discovered entity from the three parts a cell 
+    /// traversal already has in hand.
     #[inline]
     pub const fn new(
         id: EntityId,
@@ -108,7 +109,7 @@ impl DiscoveredEntities {
         &mut self.items
     }
 
-    /// Over what was gathered, in cell-walk order.
+    /// Iterator over what was gathered, in cell-walk order.
     #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, DiscoveredEntity> {
         self.items.iter()
@@ -151,7 +152,7 @@ impl CellSnapshot {
     /// caller that stops early keeps the nearer entities.
     ///
     /// `cap` counts everything in `out`, including entries present before the
-    /// call. It is checked at cell and sub-cell boundaries rather than per
+    /// call. It gets checked at cell and sub-cell boundaries rather than per
     /// entity, so `out` may exceed it by up to the population of the last cell
     /// or sub-cell walked.
     ///
@@ -209,8 +210,10 @@ impl CellSnapshot {
     }
 }
 
+// Bench shows inline(always) rather than inline. Regular inline is 9%
+// slower than always.
+
 /// Tests one run of entities against the view radius and appends survivors.
-// inline(always) rather than inline: downgrading costs 9% of gather/uniform.
 #[inline(always)]
 fn take(
     viewer: Pos3,

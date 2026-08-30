@@ -1,9 +1,10 @@
 //! Assembling one client's payload.
 //!
-//! A payload is a header, then despawns, then state records. It is bytes in a
-//! buffer and nothing more: no socket, no framing to an edge, no transport.
-//! Handing it to a client belongs to `SimulatorEdge` and the sim-to-edge
-//! protocol, neither of which is built.
+//! **Not a game-developer surface.** A game receives
+//! [`TickObservation`] through [`ClientGame::observed`](crate::ClientGame::observed)
+//! and never assembles or decodes payloads.
+//!
+//! A payload consists of a header, then despawns, then state records.
 //!
 //! Despawns come first because they are few and cheap, and because a client
 //! that drops before it adds never holds more ghosts than the server thinks it
@@ -13,15 +14,14 @@ use crate::codec::RecordCodec;
 use crate::entity::EntityId;
 use crate::pos::Pos3;
 
-/// Bytes a despawn occupies: an [`EntityId`] and nothing else. A client already
+/// Bytes a despawn occupies: just [`EntityId`]. A client already
 /// holds the position it is being told to forget.
 pub(crate) const DESPAWN_BYTES: usize = 4;
 
 /// Fixed-size preamble.
 ///
-/// Sixteen bytes, which is what a packet's budget reserves for it. The
-/// acknowledgment fields are carried but never populated, since nothing
-/// acknowledges anything yet.
+/// Sixteen bytes. The sequence number is used but acknowledgments are not
+/// yet implemented.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PacketHeader {
     /// Which tick's snapshot this was built from.
@@ -74,7 +74,8 @@ impl PacketHeader {
 
 /// Builds payloads into a buffer it keeps.
 ///
-/// Held per worker thread and reused across viewers, so it allocates once.
+/// Held per worker thread and reused across viewers for a single
+/// allocation.
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct PacketWriter {

@@ -1,22 +1,22 @@
-//! Who and what, named.
+//! Identifying participants in a world simulation at a logical level. 
+//! These IDs are transport agnostic and provide newtype identities
+//! for regions, connections, edge-held entities, and game-held entities.
 //!
-//! Nothing here is about networking. These name a region, a connection, an
-//! entity an edge is holding and an entity a game is holding, and they would
-//! name the same things in a program that never opened a socket. They live
-//! outside `net` so that the traits a consumer implements can be written
-//! without reaching into it.
-//!
-//! [`EntityId`](crate::EntityId) is the exception that stays where it is: it is
-//! an identifier *and* the index of a slot in the simulation's position arrays,
-//! so it belongs beside the set that says which slots are live.
+//! It might seem excessive to have newtypes for IDs as understood by
+//! each simulation, edge, and game client. However, since all of these 
+//! IDs are just numbers, the type system does some work here in avoiding
+//! confusion at call sites.
+//! 
+//! [`EntityId`](crate::EntityId) is the exception that can be found at
+//! the root of the crate.
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Which region a simulation owns.
 ///
-/// Assigned by the control plane, which is not built. Until then a consumer
-/// picks one and passes it to
+/// Typically assigned by a control plane but can also be explicitly set
+/// in tests and rigid configuration scenarios.
 /// [`RegionServer::new`](crate::net::RegionServer::new).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -49,16 +49,9 @@ impl fmt::Display for RegionId {
 }
 
 /// One live game client connection.
-///
-/// Not an account, not a player, not a session that survives a reconnect —
-/// reconnecting produces a new one. Whatever a game knows about *who* is behind
-/// a connection is its own, keyed by this.
-///
-/// **Never reused.** A recycled [`EdgeId`](crate::net::EdgeId) is safe because
-/// nothing outside a region holds one across the gap. A `ClientId` is held
-/// freely by the consumer, in its own tables and timers, and a recycled one
-/// would send one player's packets to another. So a stale one resolves to
-/// nothing rather than to somebody else.
+/// 
+/// Whatever a game knows about *who* is behind a connection is the responsibility
+/// of the game and not Umwelt.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientId(u64);

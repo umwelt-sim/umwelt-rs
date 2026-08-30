@@ -534,7 +534,8 @@ impl<G: Game> WorldSimulation<G, NullSink> {
         )
     }
 
-    /// Both parameters are placeholders in `new`, so this exists to sweep them.
+    /// With an explicit walk capacity and replication policy, which `new`
+    /// leaves at their defaults.
     pub fn with_replication(
         cfg: WorldConfig,
         game: G,
@@ -691,13 +692,12 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         self.live.live()
     }
 
-    /// Every entity slot ever allocated, live or not.
+    /// Total entity ids allocated, alive or not.
     ///
-    /// Despawn clears a liveness bit and does not reclaim the slot, so this
+    /// Despawn clears a liveness bit and does not reclaim the id, so this
     /// climbs with churn while [`entity_count`](Self::entity_count) does not.
-    /// See §Slot growth under churn.
     #[inline]
-    pub fn slots(&self) -> usize {
+    pub fn id_space(&self) -> usize {
         self.xs.len()
     }
 
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn quantized_positions_survive_the_round_trip() {
+    fn rounded_positions_survive_the_round_trip() {
         use crate::packet::TickObservation;
         let mut s = sim(Walk::new(1));
         let ids = populate(&mut s, 60);

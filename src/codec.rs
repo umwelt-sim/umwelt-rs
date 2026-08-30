@@ -1,14 +1,14 @@
 //! Encoding and decoding for entity update records.
 //!
-//! A record is an [`EntityId`] followed by a quantized position packed into the
+//! A record is an [`EntityId`] followed by a reduced-precision position packed into the
 //! fewest whole bytes the configured precision needs. The record size
 //! depends on the horizontal and vertical bits derived by a [`WorldConfig`].
 //!
 //! Multiple records are included per packet. If available, additional game
 //! data supplied from outside this library is added to the packet after records.
 //!
-//! Records carry no game state. A consumer replicating health or orientation
-//! appends its own bytes; that is not built.
+//! Records carry no game state. A consumer replicating health or physics
+//! values appends its own bytes; that is not built.
 
 use crate::config::WorldConfig;
 use crate::entity::EntityId;
@@ -28,9 +28,7 @@ impl RecordCodec {
     ///
     /// The wire layout depends on exactly two numbers: horizontal bits are the
     /// region size's, vertical bits the extent's. View radius, speed cap and
-    /// tick rate change nothing a decoder does, which is why a client is never
-    /// told them — see `net::edge::protocol::EdgeInfo`. The three the builder
-    /// still needs are set to valid values here and reach nothing.
+    /// tick rate don't impact wire encoding.
     ///
     /// # Errors
     ///

@@ -36,8 +36,7 @@ impl Ghost {
 /// below half full. Computed: 12 bytes per slot, so 24 bytes per ghost.
 ///
 /// The hash is fixed rather than seeded, so a replay reconstructs identical
-/// probe orders. Entity ids are server-assigned, so there is nothing to defend
-/// against.
+/// probe orders. Entity ids are server-assigned.
 ///
 /// One of these belongs to each viewer, and viewers are partitioned across
 /// threads. Whatever owns them is responsible for keeping two viewers' tables
@@ -49,9 +48,8 @@ pub struct GhostTable {
 }
 
 /// Fibonacci hash. The high bits of a multiplicative hash are the mixed ones,
-/// so they are shifted down rather than the low bits masked.
-// inline(always) rather than inline: downgrading home and find together
-// costs 9% of ghost/seen/hot.
+/// so they are shifted down rather than the low bits masked. Basically asks
+/// where a given ID wants to live
 #[inline(always)]
 fn home(id: u32, bits: u32) -> usize {
     (id.wrapping_mul(0x9E37_79B1) >> (32 - bits)) as usize
@@ -194,7 +192,6 @@ impl GhostTable {
     /// `Ok` at the entry, `Err` at the empty slot it would occupy.
     ///
     /// Terminates because the table is never more than half full.
-    // inline(always) rather than inline: see the note on `home`.
     #[inline(always)]
     fn find(&self, id: u32) -> Result<usize, usize> {
         let bits = self.slots.len().trailing_zeros();

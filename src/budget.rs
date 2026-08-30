@@ -4,9 +4,8 @@
 //! [`select`](crate::select::select) takes. It is per-connection, built from
 //! what a client declares at connect plus this protocol's own overheads.
 //!
-//! The event reserve is a floor for events rather than a subtraction from every
-//! packet: it is held back only against an actual backlog, and state takes the
-//! remainder otherwise.
+//! The event reserve holds minimum space so that when event support is added,
+//! everything still works on budget.
 
 use crate::codec::RecordCodec;
 

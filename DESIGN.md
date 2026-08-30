@@ -523,7 +523,7 @@ range. Both extents are already required to be powers of two, so
 from `radius / 2`, which bounds `cell_radius` at 4. Neither needs checking.
 
 Wire precision is lossless, so `horizontal_bits` is `log2(region_raw)`,
-`vertical_bits` is `log2(vertical_raw)`, and both quantization shifts are zero.
+`vertical_bits` is `log2(vertical_raw)`, and both precision-reduction shifts are zero.
 A single global precision has to serve the nearest entity, and at arm's length
 sub-pixel error is sub-millimeter, so there is nothing to trade away. The cost
 is bounded: a record is 12 bytes at the default region and 16 at the largest one
@@ -592,7 +592,7 @@ learning it died. The number itself is arbitrary.
 
 Record size varies with region and precision, since bits per axis is
 `log2(extent / precision)`. A 16 km region costs 13 bytes. Coarsening precision
-to 1/16 m costs 10, saving 2 bytes at the price of quantized motion below
+to 1/16 m costs 10, saving 2 bytes at the price of rounded motion below
 `precision * tick_hz`, which is 1.25 m/s at 20 Hz.
 
 ---|---|
@@ -2905,7 +2905,7 @@ Notes on order:
 
 ## Payload formats: two, not one
 
-**Client payload.** Replicated fields only, quantized, ~16 B/record, budgeted to
+**Client payload.** Replicated fields only, reduced precision, ~16 B/record, budgeted to
 an MTU-sized packet. Produced by the simulation, relayed by edges. **Cannot
 restore a simulation**. It omits AI aggro tables, pathfinding progress,
 cooldowns, RNG state, spawn timers.

@@ -3,29 +3,32 @@
 //! [`WorldConfig`] is required of any participant exchanging world data, since
 //! it carries the protocol-level configuration. Every simulation and edge
 //! touching a region must hold an identical one or they decode each other's
-//! packets into nonsense.
+//! packets into nonsense. Note that user-facing game clients do not need
+//! this to exchange data.
 //!
-//! Nothing needs to check that by hand. A region publishes the five authored
-//! numbers along with the digest of everything they imply, and the handshake
-//! rebuilds the config from the numbers and refuses it if the digests disagree.
-//! [`protocol_hash`](WorldConfig::protocol_hash) is what that comparison is on.
+//! A region publishes the five authored numbers along with the digest
+//! of everything they imply, and the handshake rebuilds the config
+//! from the numbers and refuses it if the digests disagree. Participants
+//! use [`protocol_hash`](WorldConfig::protocol_hash) for comparison.
 //!
 //! # Units
 //!
-//! Distances are [`Fixed`]; see [`crate::fixed`] for the representation and
-//! why it is an integer rather than `f32`.
+//! Distances use [`Fixed`] point numeric representation. See [`crate::fixed`] f
+//! or the representation and why it is an integer rather than `f32`. The short
+//! version is that it's cheaper and faster than floats.
 //!
-//! Some fields must be powers of two, which is what keeps the memory and wire
-//! layouts cheap to index. [`WorldConfigBuilder::build`] enforces those rules
-//! and the rest, and the fields are private so that a config that exists is a
-//! config that passed.
+//! Some fields must be powers of two in order to take advantage of optimizations,
+//! which is what keeps the memory and wire layouts cheap to index.
+//! [`WorldConfigBuilder::build`] enforces those rules and the rest,
+//! and the fields are private so that a config that exists is a config that passed.
 //!
 //! # Axes
 //!
 //! Axis conventions are documented on [`crate::pos`]. Relevant here: `x` and
 //! `y` share an extent, a cell size, and a wire precision. The `z` axis has its
 //! own extent, cell size, and wire precision, and the horizontal
-//! speed cap does not constrain it.
+//! speed cap does not constrain it. It's eaiest to think of the world space as
+//! being organized as a 2D space with vertical cylinders along the Z.
 //!
 //! # Serde
 //!
@@ -54,7 +57,7 @@ pub(crate) const MAX_SUB_GRID_CELLS: usize = {
 /// Which axis group an error refers to. `x` and `y` are configured together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
-    /// `x` and `y`, which share an extent, a cell size and a wire precision.
+    /// `x` and `y`
     Horizontal,
     /// `z`, which has its own of each and is not bound by the speed cap.
     Vertical,
@@ -73,13 +76,13 @@ impl fmt::Display for Axis {
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Why a set of world parameters was refused.
+/// Contains an explanation for why a WorldConfiguration validation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// A distance was zero or negative. [`Fixed`] is signed, so this has to be
     /// checked before any unsigned bit operation.
     NonPositive(&'static str),
-    /// Extent must be a power of two so wire quantization divides evenly.
+    /// Extent must be a power of two so the wire encoding divides evenly.
     ExtentNotPowerOfTwo {
         /// Which axis group.
         axis: Axis,
@@ -122,7 +125,7 @@ impl fmt::Display for ConfigError {
             ExtentNotPowerOfTwo { axis, extent } => write!(
                 f,
                 "{axis} extent {extent} is not a power of two; \
-                 wire quantization would not divide evenly"
+                 the wire encoding would not divide evenly"
             ),
             RadiusExceedsRegion { radius, region_size } => {
                 write!(f, "view radius {radius} exceeds region size {region_size}")
@@ -146,7 +149,7 @@ impl core::error::Error for ConfigError {}
 // WorldConfig
 // ---------------------------------------------------------------------------
 
-/// Shared, protocol-critical world description.
+/// Configuration of a world simulation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldConfig {
     // Authored.
@@ -176,8 +179,8 @@ pub struct WorldConfig {
 }
 
 impl WorldConfig {
-    /// Starts a world. Every field has a default; [`WorldConfigBuilder::build`]
-    /// validates the result.
+    /// Starts building a world configuration. 
+    /// Every field has a default and [`WorldConfigBuilder::build`] validates the result.
     pub fn builder() -> WorldConfigBuilder {
         WorldConfigBuilder::default()
     }
@@ -202,11 +205,11 @@ impl WorldConfig {
         self.horizontal_view_radius
     }
     /// Horizontal speed cap. Entities exceeding this break the strip-delta
-    /// invariant. Vertical speed is unconstrained.
+    /// invariant.
     pub const fn max_horizontal_speed(&self) -> Fixed {
         self.max_horizontal_speed
     }
-    /// Ticks per second.
+    /// Ticks per second when the server is running and managing tick delivery.
     pub const fn tick_hz(&self) -> u32 {
         self.tick_hz
     }
@@ -257,7 +260,8 @@ impl WorldConfig {
         self.tick_ms
     }
     /// Furthest an entity can travel horizontally in one tick. Guaranteed
-    /// less than `cell_size`.
+    /// less than `cell_size`. This doesn't take into account exceptions
+    /// like teleporting/warping.
     pub const fn max_move_per_tick(&self) -> Fixed {
         self.max_move_per_tick
     }
@@ -373,7 +377,7 @@ impl WorldConfig {
         Fixed::from_raw((wire << self.vertical_quant_shift) as i32)
     }
 
-    /// Quantize a full position for the wire, as `(x, y, z)`.
+    /// Lower precision for a full position for the wire, as `(x, y, z)`.
     #[inline]
     pub const fn quantize_pos(&self, pos: Pos3) -> (u32, u32, u32) {
         (
@@ -384,7 +388,7 @@ impl WorldConfig {
     }
 
     /// Inverse of [`Self::quantize_pos`], landing at the low edge of each
-    /// quantization bucket.
+    /// precision step.
     #[inline]
     pub const fn dequantize_pos(&self, x: u32, y: u32, z: u32) -> Pos3 {
         Pos3::new(
@@ -405,20 +409,20 @@ impl WorldConfig {
     /// cannot distinguish positions within a cell at all.
     ///
     /// Whether a given value is acceptable depends on client rendering and
-    /// interpolation, which this crate cannot see — a number to look at, not
-    /// a rule.
+    /// interpolation, which this crate cannot see.
     pub const fn wire_steps_per_cell(&self) -> u32 {
         (self.cell_size.raw() / self.horizontal_precision.raw()) as u32
     }
 
     // -- misc -------------------------------------------------------------
 
-    /// Stable digest of the fields that affect wire decoding. Exchange at
+    /// Stable digest of the fields that affect wire decoding. Exchanged at
     /// connect time and reject on mismatch. This digest only covers the
     /// configuration values that are required for protocol setup and
     /// exchange over the wire. All other configuration values can change
     /// without invalidating communications.
     pub const fn protocol_hash(&self) -> u64 {
+        // FNV-1a 64-bit offset, required as hash starting point
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         h = fnv(h, FIXED_SHIFT);
         h = fnv(h, self.region_size.raw() as u32);
@@ -430,8 +434,8 @@ impl WorldConfig {
         h
     }
 
-    /// A copy with `cell_size` overridden, for benchmarking the spatial index
-    /// at sizes the derivation would not pick.
+    /// A copy of the world configuration with `cell_size` overridden, 
+    /// for benchmarking the spatial index at sizes the derivation would not pick.
     ///
     /// Not part of the normal path. Cell size derives from the view radius and
     /// a consumer has no reason to set it; this exists so the cell-size sweep
@@ -483,8 +487,7 @@ impl WorldConfig {
     }
 
     /// Uniform-distribution estimate of entities in one viewer's subscription.
-    /// A planning aid, not a runtime quantity — real worlds cluster, so treat
-    /// this as a floor and expect hot cells to be far worse.
+    /// A planning aid, not a runtime quantity.
     pub const fn est_entities_in_view(&self, entities_per_region: u32) -> u32 {
         let per_cell = entities_per_region / self.cells_per_region;
         per_cell * self.sub_grid_cells
@@ -493,7 +496,8 @@ impl WorldConfig {
 
 /// FNV-1a over four bytes. Chosen because it is a `const fn`, is stable across
 /// Rust versions and platforms unlike `DefaultHasher`, and carries no
-/// dependency. Not cryptographic: it catches misconfiguration, not attack.
+/// dependency. Not cryptographic strength, only used to catch configuration
+/// mismatch.
 const fn fnv(mut h: u64, v: u32) -> u64 {
     let bytes = v.to_le_bytes();
     let mut i = 0;
@@ -507,10 +511,7 @@ const fn fnv(mut h: u64, v: u32) -> u64 {
 
 impl Default for WorldConfig {
     /// 4096 m region, 1024 m vertical, 256 m view radius, 40 m/s cap, 20 Hz.
-    /// Cell size derives to 128 m and wire precision is lossless.
-    ///
-    /// Must stay a `build()` call. Replacing this with a struct literal would
-    /// skip validation and defeat the private fields.
+    /// Cell size derives to 128 m and wire precision is lossless.    
     fn default() -> Self {
         Self::builder()
             .region_size_m(4096)
@@ -636,16 +637,14 @@ impl WorldConfigBuilder {
             });
         }
 
-        // Wire widths. Precision is one raw unit — 1/1024 m — so a position
-        // keeps every bit the simulation computed with and the quantization
-        // shift is zero. A single global precision has to serve the nearest
-        // entity, and at arm's length sub-pixel error is sub-millimeter, so
-        // there is nothing to trade away.
+        // Wire widths. Precision is one raw unit (1/1024 m) so a position
+        // keeps every bit the simulation computed with and the precision-reduction
+        // shift is zero. 
         //
-        // Coarser precision would save bytes and quantize motion: anything
+        // Coarser precision would save bytes and round off motion: anything
         // moving less than one step per tick would stand still and then jump.
         // That threshold is `precision * tick_hz`, which at 1/16 m and 20 Hz is
-        // 1.25 m/s — inside the range of a walking character.
+        // 1.25 m/s, which is inside the range of a walking human.
         let horizontal_bits = region_raw.trailing_zeros();
         let horizontal_quant_shift = 0;
         let horizontal_precision = Fixed::from_raw(1);
@@ -755,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn quantization_error_is_bounded_on_both_axes() {
+    fn precision_error_is_bounded_on_both_axes() {
         let w = WorldConfig::default();
         for m in 0..1024i32 {
             let p = Pos3::new(

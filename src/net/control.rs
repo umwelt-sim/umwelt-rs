@@ -1,5 +1,8 @@
 //! What a region says about itself, for whoever is watching the tier.
 //!
+//! **Not a game-developer surface.** Heartbeats and load reports are
+//! infrastructure concerns, read by operators and tooling.
+//!
 //! A separate protocol from `net::region`, and deliberately not sharing a
 //! message with it. That one is how a region and its edges do their work; this
 //! one is how an operator sees that the work is happening. The two version
@@ -64,9 +67,9 @@ pub struct RegionLoad {
     pub tick_count: u32,
     /// Entities alive at the end of it.
     pub entities: u32,
-    /// Slots ever allocated. Despawn does not reclaim, so this climbs with
-    /// churn while `entities` does not. See §Slot growth under churn.
-    pub slots: u32,
+    /// Entity ids ever allocated, alive or not. Despawn does not reclaim, so
+    /// this climbs with churn while `entities` does not.
+    pub id_space: u32,
     /// Viewers registered at the end of it.
     pub viewers: u32,
     /// Time inside a tick, averaged over the span.
@@ -116,7 +119,7 @@ impl Heartbeat {
         out.extend_from_slice(&self.edges.to_le_bytes());
         out.extend_from_slice(&self.load.tick_count.to_le_bytes());
         out.extend_from_slice(&self.load.entities.to_le_bytes());
-        out.extend_from_slice(&self.load.slots.to_le_bytes());
+        out.extend_from_slice(&self.load.id_space.to_le_bytes());
         out.extend_from_slice(&self.load.viewers.to_le_bytes());
         out.extend_from_slice(&nanos(self.load.mean_tick).to_le_bytes());
         out.extend_from_slice(&nanos(self.load.worst_tick).to_le_bytes());
@@ -135,7 +138,7 @@ impl Heartbeat {
         let load = RegionLoad {
             tick_count: c.u32()?,
             entities: c.u32()?,
-            slots: c.u32()?,
+            id_space: c.u32()?,
             viewers: c.u32()?,
             mean_tick: Duration::from_nanos(u64::from(c.u32()?)),
             worst_tick: Duration::from_nanos(u64::from(c.u32()?)),
@@ -152,7 +155,7 @@ impl fmt::Display for Heartbeat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} umwelt {} proto {} hash {:#018x} | {} edges | {} entities, {} slots, \
+            "{} umwelt {} proto {} hash {:#018x} | {} edges | {} entities, {} ids, \
              {} viewers | tick mean {:.2} ms worst {:.2} ms | {} late, {} dropped",
             self.region,
             self.server,
@@ -160,7 +163,7 @@ impl fmt::Display for Heartbeat {
             self.protocol_hash,
             self.edges,
             self.load.entities,
-            self.load.slots,
+            self.load.id_space,
             self.load.viewers,
             self.load.mean_tick.as_secs_f64() * 1_000.0,
             self.load.worst_tick.as_secs_f64() * 1_000.0,
@@ -319,7 +322,7 @@ mod tests {
             load: RegionLoad {
                 tick_count: 1_234_567,
                 entities: 8_192,
-                slots: 63_712,
+                id_space: 63_712,
                 viewers: 8_188,
                 mean_tick: Duration::from_micros(15_540),
                 worst_tick: Duration::from_micros(17_420),

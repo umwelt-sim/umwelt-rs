@@ -393,15 +393,15 @@ impl CellSnapshot {
     ///
     /// # Panics
     ///
-    /// If the three slices differ in length, or if `live` covers fewer slots
+    /// If the three slices differ in length, or if `live` covers fewer ids
     /// than the arrays hold.
     pub fn update(&mut self, xs: &[Fixed], ys: &[Fixed], zs: &[Fixed], live: &LiveSet) {
         assert_eq!(xs.len(), ys.len(), "position arrays must be parallel");
         assert_eq!(xs.len(), zs.len(), "position arrays must be parallel");
         assert!(
-            live.slots() >= xs.len(),
-            "live set covers {} slots, position arrays hold {}",
-            live.slots(),
+            live.id_space() >= xs.len(),
+            "live set covers {} ids, position arrays hold {}",
+            live.id_space(),
             xs.len()
         );
 

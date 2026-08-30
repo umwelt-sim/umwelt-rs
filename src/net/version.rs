@@ -1,5 +1,8 @@
 //! The version numbers both links and the control plane report.
 //!
+//! **Not a game-developer surface.** A game reads a version off a heartbeat
+//! or a [`NetError`](crate::NetError) and never chooses one.
+//!
 //! Two separate things. A [`ProtocolVersion`] says what shape the messages on
 //! a link have, and has to match exactly. A [`ServerVersion`] says which build
 //! is running, and nothing rejects on it. A world's wire layout is a third,

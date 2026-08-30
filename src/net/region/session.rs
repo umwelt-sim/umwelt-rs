@@ -107,7 +107,7 @@ struct Load {
     /// Overwritten every tick: what the region holds right now.
     tick_count: u32,
     entities: u32,
-    slots: u32,
+    id_space: u32,
     /// Accumulated until a heartbeat drains it.
     span: TickSpan,
 }
@@ -157,7 +157,7 @@ impl Inbound {
         RegionLoad {
             tick_count: load.tick_count,
             entities: load.entities,
-            slots: load.slots,
+            id_space: load.id_space,
             viewers: span.viewers.checked_div(u64::from(span.ticks)).unwrap_or_default()
                 as u32,
             mean_tick: span.mean(),
@@ -384,7 +384,7 @@ impl Inbound {
             let mut load = self.load.lock().expect("not poisoned");
             load.tick_count = sim.tick_count();
             load.entities = sim.entity_count() as u32;
-            load.slots = sim.slots() as u32;
+            load.id_space = sim.id_space() as u32;
             load.span.merge(sim.take_span());
         }
 

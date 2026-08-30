@@ -22,7 +22,8 @@ impl EntityId {
         self.0
     }
 
-    /// The id as an array index.
+    /// The id as an array index. This array index is only safe in certain situations,
+    /// like indexing within a region
     #[inline]
     pub const fn index(self) -> usize {
         self.0 as usize
@@ -43,28 +44,28 @@ impl fmt::Display for EntityId {
 
 /// What is behind an entity, which decides whether it observes.
 ///
-/// An entity has a position and can be seen by whoever is near it. A viewer
-/// receives: only an observer is sent what it can see, and only an observer
-/// costs a subscription, a gather, a score, a selection and a packet every tick
-/// it is served, plus a table of what its client already holds. Measured
-/// at a constant 8,192 entities, a viewer costs about 1.6 µs a tick against
+/// An entity has a position and can be seen by whoever is near it. Some
+/// entities are viewers, in which case they are "subscribers" to entity 
+/// position updates within their subscribed range.
+/// 
+/// Measured at a constant 8,192 entities, a viewer costs about 1.6 µs a tick against
 /// 0.4 ms of work paid per entity regardless of who observes.
 ///
 /// Static scenery has no kind here, because it is never spawned. A rock that
-/// never moves is already in the client's content package, and holding it in a
-/// region would cost snapshot bytes and a gather-walk visit every tick to
-/// replicate a position the client has. A region holds state that is
-/// authoritative and changes.
+/// never moves is already in the client's content package and doesn't need to be
+/// transmitted or managed in the server's simulation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EntityKind {
-    /// Nothing is behind it. Simulated and replicated to whoever can see it,
-    /// observes nothing itself, and no viewer is registered. Projectiles,
-    /// wildlife, NPCs, a vehicle with no driver.
+    /// An entity that doesn't care about its environment. Simulated and replicated 
+    /// to whoever can see it, observes nothing itself, and no viewer is registered. Projectiles,
+    /// wildlife, NPCs, a vehicle with no driver, a developer hard at work on a side project
+    /// in a dark corner.
     #[default]
     Unattended = 0,
-    /// A game client is behind it. The region registers a viewer watching it,
-    /// so it is sent a budgeted approximation of what it can see.
+    /// A game client backs this entity. The region registers a viewer watching it,
+    /// so it is sent a budgeted approximation of what it can see. Observers receive
+    /// entity position and spawn updates within range.
     Observer = 1,
 }
 
@@ -106,14 +107,14 @@ mod tests {
     }
 }
 
-/// Which entity slots hold a live entity.
+/// Which entities are alive.
 ///
-/// One bit per slot, parallel to the position arrays. A slot's bit is set while
+/// One bit per entity id, parallel to the position arrays. A bit is set while
 /// an entity occupies it and cleared on despawn. Ids are never moved, so an
 /// `EntityId` stays valid for the lifetime of the entity it names.
 ///
 /// Clearing a bit removes the entity from the snapshot. It does not make the
-/// slot safe to reuse: a client holding a ghost of the previous occupant would
+/// id safe to reuse: a client holding a ghost of the previous occupant would
 /// alias the new one. Reuse requires either compaction during a quiet period or
 /// a quarantine until every client has acknowledged the despawn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -129,19 +130,19 @@ impl LiveSet {
         LiveSet::default()
     }
 
-    /// Empty, with room for `slots` before it grows.
-    pub fn with_capacity(slots: usize) -> LiveSet {
-        LiveSet { words: Vec::with_capacity(slots.div_ceil(64)), slots: 0, live: 0 }
+    /// Empty, with room for `entities` before it grows.
+    pub fn with_capacity(entities: usize) -> LiveSet {
+        LiveSet { words: Vec::with_capacity(entities.div_ceil(64)), slots: 0, live: 0 }
     }
 
-    /// Highest slot count seen, live or not. Matches the length of the position
-    /// arrays.
+    /// Total entity ids allocated, alive or not. Matches the length of the
+    /// position arrays.
     #[inline]
-    pub fn slots(&self) -> usize {
+    pub fn id_space(&self) -> usize {
         self.slots
     }
 
-    /// How many slots currently hold a live entity.
+    /// How many entities are currently alive.
     #[inline]
     pub fn live(&self) -> usize {
         self.live
@@ -153,12 +154,12 @@ impl LiveSet {
         self.live == 0
     }
 
-    /// Live slots in ascending order, skipping dead ones 64 at a time.
+    /// Live entities in ascending id order, skipping dead ones 64 at a time.
     ///
-    /// Testing each slot in turn costs the same whether it holds an entity or
+    /// Testing each id in turn costs the same whether it holds an entity or
     /// not, so a region that has despawned far more than it holds pays for
-    /// every slot it ever allocated. A word that is entirely dead is one
-    /// comparison rather than 64. See §Slot growth under churn.
+    /// every id it ever allocated. A word that is entirely dead is one
+    /// comparison rather than 64.
     #[inline]
     pub fn iter(&self) -> LiveIter<'_> {
         LiveIter {
@@ -168,7 +169,7 @@ impl LiveSet {
         }
     }
 
-    /// Whether that slot holds a live entity.
+    /// Whether that entity is alive.
     #[inline]
     pub fn contains(&self, id: EntityId) -> bool {
         let i = id.index();
@@ -178,7 +179,7 @@ impl LiveSet {
         self.words[i >> 6] & (1u64 << (i & 63)) != 0
     }
 
-    /// Marks a slot live, growing to cover it if needed.
+    /// Marks an entity live, growing to cover it if needed.
     pub fn insert(&mut self, id: EntityId) {
         let i = id.index();
         if i >= self.slots {
@@ -196,7 +197,7 @@ impl LiveSet {
         }
     }
 
-    /// Marks a slot dead. The slot is not reclaimed and the id is not reused.
+    /// Marks an entity dead. The id is not reclaimed or reused.
     pub fn remove(&mut self, id: EntityId) {
         let i = id.index();
         if i >= self.slots {
@@ -210,7 +211,7 @@ impl LiveSet {
         }
     }
 
-    /// Marks every slot dead, keeping the allocation.
+    /// Marks every entity dead, keeping the allocation.
     pub fn clear(&mut self) {
         self.words.clear();
         self.slots = 0;
@@ -218,7 +219,7 @@ impl LiveSet {
     }
 }
 
-/// Ascending live slots from a [`LiveSet`], produced by [`LiveSet::iter`].
+/// Ascending live entities from a [`LiveSet`], produced by [`LiveSet::iter`].
 ///
 /// Holds the current word rather than re-reading it, and clears the lowest set
 /// Which entities are alive, readable while their positions are held.
@@ -256,7 +257,7 @@ impl<'a> Live<'a> {
     }
 }
 
-/// bit per step, so a dense word costs one instruction per live slot and an
+/// bit per step, so a dense word costs one instruction per live entity and an
 /// empty one costs a single test.
 #[derive(Clone, Debug)]
 pub struct LiveIter<'a> {
@@ -306,13 +307,13 @@ mod live_tests {
     }
 
     #[test]
-    fn iter_yields_live_slots_in_ascending_order() {
+    fn iter_yields_live_entities_in_ascending_order() {
         assert_eq!(walked(&set(&[5, 0, 63, 64, 200])), vec![0, 5, 63, 64, 200]);
     }
 
     #[test]
-    fn iter_skips_a_long_run_of_dead_slots() {
-        // One live slot either side of 10,000 dead ones.
+    fn iter_skips_a_long_run_of_dead_ids() {
+        // One live entity either side of 10,000 dead ones.
         let mut live = set(&[0, 10_001]);
         assert_eq!(walked(&live), vec![0, 10_001]);
         live.remove(EntityId::from_raw(0));
@@ -334,7 +335,7 @@ mod live_tests {
     }
 
     #[test]
-    fn iter_agrees_with_contains_across_every_slot() {
+    fn iter_agrees_with_contains_across_every_id() {
         // The property the two walks in `snapshot` and `odometer` rely on.
         let mut live = LiveSet::new();
         for n in 0..1_000u32 {
@@ -348,7 +349,7 @@ mod live_tests {
                 live.remove(EntityId::from_raw(n));
             }
         }
-        let by_contains: Vec<u32> = (0..live.slots() as u32)
+        let by_contains: Vec<u32> = (0..live.id_space() as u32)
             .filter(|&n| live.contains(EntityId::from_raw(n)))
             .collect();
         assert_eq!(walked(&live), by_contains);
@@ -376,12 +377,12 @@ mod live_tests {
         s.insert(id(64));
         s.insert(id(1000));
         for n in [0, 63, 64, 1000] {
-            assert!(s.contains(id(n)), "slot {n} should be live");
+            assert!(s.contains(id(n)), "entity {n} should be live");
         }
         assert!(!s.contains(id(1)));
         assert!(!s.contains(id(999)));
         assert_eq!(s.live(), 4);
-        assert_eq!(s.slots(), 1001);
+        assert_eq!(s.id_space(), 1001);
     }
 
     #[test]
@@ -398,12 +399,12 @@ mod live_tests {
     }
 
     #[test]
-    fn slots_does_not_shrink_on_remove() {
+    fn id_space_does_not_shrink_on_remove() {
         let mut s = LiveSet::new();
         s.insert(id(500));
         s.remove(id(500));
         assert_eq!(s.live(), 0);
-        assert_eq!(s.slots(), 501, "an id must stay valid for its entity's lifetime");
+        assert_eq!(s.id_space(), 501, "an id must stay valid for its entity's lifetime");
     }
 
     #[test]
@@ -418,7 +419,7 @@ mod live_tests {
     }
 
     #[test]
-    fn absent_slots_are_not_live() {
+    fn absent_ids_are_not_live() {
         let s = LiveSet::new();
         assert!(!s.contains(id(0)));
         assert!(!s.contains(id(9999)));

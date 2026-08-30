@@ -1,14 +1,17 @@
 //! Per-entity accumulated displacement.
 //!
 //! [`Odometer`] holds, for each entity slot, the sum of how far that entity has
-//! moved between consecutive calls to [`Odometer::accumulate`]. It is the
-//! staleness input to priority scoring: the difference between an entity's
+//! moved between consecutive calls to [`Odometer::accumulate`]. It's the
+//! staleness input to priority scoring. The difference between an entity's
 //! reading now and its reading when a client was last told about it bounds how
-//! far that client's copy of it has fallen behind.
+//! far that client's copy of it has fallen behind. This measure of how far
+//! behind a thing is can then be used in prioritizing entity updates.
 //!
 //! The value carries no direction and no rate. It is a sum of per-call
 //! displacements, so calling at a different cadence yields a different number.
-//! Velocity belongs to the consumer and does not appear here.
+//! 
+//! Measures like velocity and heading are game-level concepts owned by the
+//! library consumer.
 
 use crate::entity::{EntityId, LiveSet};
 use crate::fixed::Fixed;
@@ -66,25 +69,20 @@ impl Odometer {
 
     /// Adds each live entity's displacement since the previous call.
     ///
-    /// The three slices are parallel; entity id is the index into them, matching
+    /// The three slices are parallel with entity id as the index into them, matching
     /// [`CellSnapshot::update`](crate::snapshot::CellSnapshot::update). Slots
     /// absent from `live` are left untouched, so a despawned entity's reading
     /// freezes.
     ///
-    /// A slot seen for the first time is seeded from its current position and
-    /// contributes nothing on that call.
-    ///
     /// Displacement is `|dx| + |dy| + |dz|`, which needs no square root and
     /// over-estimates the Euclidean step by up to a factor of 1.73 depending on
-    /// direction of travel. Nothing distinguishes a step from a teleport; both
-    /// are measured, since both leave a client's copy equally wrong.
+    /// direction of travel (Manhattan distance). Nothing distinguishes a step
+    /// from a teleport; both are measured, since both leave a client's copy equally wrong.
     ///
     /// Positions do not change within a tick, so a second call in the same tick
     /// adds nothing.
     ///
-    /// Reusing an entity slot for a different entity is not supported: the new
-    /// occupant's first call would accumulate its separation from the previous
-    /// occupant's last position.
+    /// Reusing an entity slot for a different entity is forbidden.
     ///
     /// Allocates only while slot capacity is growing.
     ///
@@ -102,9 +100,9 @@ impl Odometer {
         assert_eq!(xs.len(), ys.len(), "position arrays must be parallel");
         assert_eq!(xs.len(), zs.len(), "position arrays must be parallel");
         assert!(
-            live.slots() >= xs.len(),
-            "live set covers {} slots, position arrays hold {}",
-            live.slots(),
+            live.id_space() >= xs.len(),
+            "live set covers {} ids, position arrays hold {}",
+            live.id_space(),
             xs.len()
         );
 

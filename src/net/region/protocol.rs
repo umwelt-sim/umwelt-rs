@@ -203,8 +203,8 @@ const SPAWN_BYTES: usize = 21;
 
 /// Bytes one move takes: an id, and three raw [`Fixed`](crate::Fixed) axes.
 ///
-/// Raw fixed point rather than the quantized wire record, because this is the
-/// authoritative position going *into* the simulation. The quantization in
+/// Raw fixed point rather than the reduced-precision wire record, because this is the
+/// authoritative position going *into* the simulation. The precision reduction in
 /// [`RecordCodec`](crate::RecordCodec) is a budget decision about what a client
 /// needs to see. Applying it to an inbound command would add a small position
 /// error on every round trip through the region.

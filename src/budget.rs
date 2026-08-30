@@ -20,7 +20,7 @@ pub const DEFAULT_PAYLOAD_BYTES: u16 = 1200;
 /// Sequence number, acknowledgment and its bitfield, tick, and the two record
 /// counts.
 ///
-/// Matches [`PacketHeader::BYTES`](crate::PacketHeader::BYTES), which a test
+/// Matches [`PacketHeader::BYTES`](crate::packet::PacketHeader::BYTES), which a test
 /// pins.
 pub const DEFAULT_HEADER_BYTES: u16 = 16;
 

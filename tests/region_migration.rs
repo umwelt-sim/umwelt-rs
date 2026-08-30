@@ -22,11 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::internals::RecordCodec;
 use umwelt::internals::region::{Incoming, Presence, RegionClient, Spawn};
+use umwelt::internals::{RecordCodec, read_payload};
 use umwelt::net::{EdgeId, EdgeName, EdgeSink, Edges, Inbound};
 use umwelt::{ClientLimits, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
-use umwelt::{Pacing, PacketReader, Pos3, RegionId, RegionServer, Step, Wait};
+use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
 /// Unattended entities the origin holds and the destination does not, so the
@@ -237,7 +237,7 @@ impl Edge {
                 self.first_packet.entry((region, entity)).or_insert_with(Instant::now);
                 // Read out before either set is touched: the reader borrows the
                 // codec, which lives on the same struct.
-                let Some(reader) = PacketReader::new(&self.codec, &packet) else {
+                let Some(reader) = read_payload(&self.codec, &packet) else {
                     return;
                 };
                 let forgot: Vec<EntityId> = reader.despawns().collect();

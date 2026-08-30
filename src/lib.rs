@@ -37,7 +37,7 @@ pub use net::{
     ClientHandle, EdgeClient, EdgeHandle, EdgeServer, NetError, ProtocolVersion,
     RegionServer, ServerVersion,
 };
-pub use packet::{PacketHeader, PacketReader};
+pub use packet::TickObservation;
 pub use pos::{CellCoord, CellId, Pos2, Pos3};
 // From modules the crate keeps to itself. A consumer names these — `Policy` and
 // `Weights` to tune replication, the rest to read what a region reports — and

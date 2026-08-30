@@ -35,7 +35,7 @@ use crate::net::edge::protocol::{
     Framer, FromClient, MAX_MOVES_PER_DATAGRAM, MOVE_BYTES, MOVES_HEADER_BYTES, ToClient,
 };
 use crate::net::error::NetError;
-use crate::packet::PacketReader;
+use crate::packet::TickObservation;
 use crate::pos::Pos3;
 
 /// What a client holds, shared with every handle to it.
@@ -118,7 +118,7 @@ impl Shared {
 ///
 /// ```no_run
 /// use umwelt::{ClientGame, EdgeClient, EntityHandle, EntityId, EntityKind};
-/// use umwelt::{PacketReader, Pos3, RegionId};
+/// use umwelt::{TickObservation, Pos3, RegionId};
 ///
 /// /// A game that counts what it can see.
 /// #[derive(Default)]
@@ -131,8 +131,13 @@ impl Shared {
 ///         println!("{handle} is {entity} in {region}");
 ///     }
 ///
-///     fn observed(&mut self, _: EntityHandle, _: RegionId, state: &PacketReader<'_>) {
-///         self.seen += state.header().updates as usize;
+///     fn observed(
+///         &mut self,
+///         _: EntityHandle,
+///         _: RegionId,
+///         observation: &TickObservation<'_>,
+///     ) {
+///         self.seen += observation.updates().count();
 ///     }
 /// }
 ///
@@ -472,7 +477,7 @@ fn deliver(shared: &Shared, body: &[u8]) {
         // reliable stream, so a missing codec means a handle this client never
         // spent.
         let Some(codec) = codecs.get(&region) else { return };
-        let Some(state) = PacketReader::new(codec, packet) else { return };
+        let Some(state) = TickObservation::new(codec, packet) else { return };
         shared.with_game(|game| game.observed(handle, region, &state));
         return;
     }

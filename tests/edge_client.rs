@@ -18,7 +18,7 @@ use umwelt::internals::edge::FromClient;
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{ClientGame, ClientHandle, ClientLimits, EdgeClient, EdgeServer};
 use umwelt::{EntityHandle, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
-use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, PacketReader, Wait};
+use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, TickObservation, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
 /// Entities the client asks for. Small: this is a wiring test, not a load one.
@@ -97,13 +97,13 @@ impl ClientGame for Watcher {
         &mut self,
         _handle: EntityHandle,
         region: RegionId,
-        state: &PacketReader<'_>,
+        observation: &TickObservation<'_>,
     ) {
         assert_eq!(region, self.region, "a packet from a region nobody asked about");
         // Already decoded: no codec here, and no world the region was built
         // with. A packet reaching this client is one built for an avatar it
         // owns, and an avatar always sees itself.
-        for (_, pos) in state.updates() {
+        for (_, pos) in observation.updates() {
             if pos.x.floor_meters() > 200 {
                 self.confirmed.fetch_add(1, Ordering::Relaxed);
             }

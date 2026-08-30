@@ -14,11 +14,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use umwelt::internals::RecordCodec;
 use umwelt::internals::region::{Incoming, Presence, RegionClient, Spawn};
+use umwelt::internals::{RecordCodec, read_payload};
 use umwelt::net::{EdgeName, EdgeSink, Inbound};
 use umwelt::{ClientLimits, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
-use umwelt::{Pacing, PacketReader, Pos3, RegionId, RegionServer, Step, Wait};
+use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
 const EDGES: usize = 3;
@@ -255,8 +255,7 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                         };
                         match message {
                             Incoming::State { entity, packet, .. } => {
-                                let Some(reader) = PacketReader::new(&codec, &packet)
-                                else {
+                                let Some(reader) = read_payload(&codec, &packet) else {
                                     continue;
                                 };
                                 // A packet is named by the avatar it was built

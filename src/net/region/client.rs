@@ -55,7 +55,7 @@ pub struct Offer {
 #[derive(Clone, Debug)]
 pub enum Incoming {
     /// One observer's packet, named by the entity it belongs to. Decode it with
-    /// [`PacketReader`](crate::PacketReader).
+    /// [`TickObservation`](crate::TickObservation).
     State {
         /// Which region built it.
         region: RegionId,

@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 
 use crate::entity::EntityId;
 use crate::id::{ClientId, EntityHandle, EntityKey, RegionId};
-use crate::packet::PacketReader;
+use crate::packet::TickObservation;
 use crate::sim::Step;
 
 /// The logic and rules for a durable, server-side game. The [`Game::step`]
@@ -173,13 +173,13 @@ pub trait EdgeGame: Send + 'static {
 /// in the game.
 ///
 /// ```
-/// # use umwelt::{ClientGame, EntityHandle, EntityId, PacketReader, RegionId};
+/// # use umwelt::{ClientGame, EntityHandle, EntityId, TickObservation, RegionId};
 /// # struct Farm;
 /// # impl Farm {
 /// #     fn remember(&mut self, _h: EntityHandle, _r: RegionId, _e: EntityId) {}
 /// #     fn forget(&mut self, _handle: EntityHandle) {}
-/// #     fn drop_gone(&mut self, _region: RegionId, _state: &PacketReader<'_>) {}
-/// #     fn redraw(&mut self, _region: RegionId, _state: &PacketReader<'_>) {}
+/// #     fn drop_gone(&mut self, _region: RegionId, _seen: &TickObservation<'_>) {}
+/// #     fn redraw(&mut self, _region: RegionId, _seen: &TickObservation<'_>) {}
 /// #     fn clear_scene(&mut self) {}
 /// # }
 /// impl ClientGame for Farm {
@@ -196,11 +196,11 @@ pub trait EdgeGame: Send + 'static {
 ///         &mut self,
 ///         _handle: EntityHandle,
 ///         region: RegionId,
-///         state: &PacketReader<'_>,
+///         observation: &TickObservation<'_>,
 ///     ) {
 ///         // An id belongs to its region, so the scene is keyed by both.
-///         self.drop_gone(region, state);
-///         self.redraw(region, state);
+///         self.drop_gone(region, observation);
+///         self.redraw(region, observation);
 ///     }
 ///
 ///     fn disconnected(&mut self) {
@@ -247,7 +247,7 @@ pub trait ClientGame: Send + 'static {
         &mut self,
         handle: EntityHandle,
         region: RegionId,
-        state: &PacketReader<'_>,
+        observation: &TickObservation<'_>,
     ) {
     }
 

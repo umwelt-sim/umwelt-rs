@@ -23,7 +23,7 @@ pub(crate) const DESPAWN_BYTES: usize = 4;
 /// acknowledgment fields are carried but never populated, since nothing
 /// acknowledges anything yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PacketHeader {
+pub(crate) struct PacketHeader {
     /// Which tick's snapshot this was built from.
     pub tick: u32,
     /// Counts up once per packet sent to this client, and wraps.
@@ -146,20 +146,34 @@ impl PacketWriter {
     }
 }
 
-/// Reads a payload back, which is what a client does.
+/// What one entity saw on one tick: which to forget, and where the rest are.
 ///
-/// Exists so the format round-trips under test and so the quality harness can
-/// model a client from the bytes rather than from the server's own decision.
-pub struct PacketReader<'a> {
+/// A borrowed view over a payload that has already arrived. It does no I/O and
+/// owns no buffer — reading it is walking bytes somebody else received.
+///
+/// Every one of these is a single tick's worth, and says which tick in
+/// [`tick`](Self::tick). A client is handed one every
+/// [`send_period`](crate::ClientLimits::send_period) ticks, which defaults to
+/// every tick.
+///
+/// This is what [`ClientGame::observed`](crate::ClientGame::observed) receives.
+/// The crate's own tests and quality harness also build one, to model a client
+/// from the bytes rather than from the server's own decision.
+pub struct TickObservation<'a> {
     codec: &'a RecordCodec,
     header: PacketHeader,
     body: &'a [u8],
 }
 
-impl<'a> PacketReader<'a> {
+impl<'a> TickObservation<'a> {
     /// `None` if `buf` is too short to hold the header and the body its counts
     /// claim.
-    pub fn new(codec: &'a RecordCodec, buf: &'a [u8]) -> Option<PacketReader<'a>> {
+    ///
+    /// Crate-private: a game is handed one of these and never builds one.
+    pub(crate) fn new(
+        codec: &'a RecordCodec,
+        buf: &'a [u8],
+    ) -> Option<TickObservation<'a>> {
         let header = PacketHeader::decode(buf)?;
         let want = PacketHeader::BYTES
             + header.despawns as usize * DESPAWN_BYTES
@@ -167,12 +181,24 @@ impl<'a> PacketReader<'a> {
         if buf.len() < want {
             return None;
         }
-        Some(PacketReader { codec, header, body: &buf[PacketHeader::BYTES..want] })
+        Some(TickObservation { codec, header, body: &buf[PacketHeader::BYTES..want] })
     }
 
-    /// What the finished packet's header says.
+    /// Which tick this observation was built from.
+    ///
+    /// A region stamps every payload with the tick whose snapshot produced it.
+    /// Two observations from the same region compare by this.
     #[inline]
-    pub fn header(&self) -> PacketHeader {
+    pub fn tick(&self) -> u32 {
+        self.header.tick
+    }
+
+    /// The whole preamble, which is umwelt's own bookkeeping: sequence numbers
+    /// and the acknowledgment fields nothing populates yet. Nothing outside a
+    /// test reads it, so it does not exist outside one.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn header(&self) -> PacketHeader {
         self.header
     }
 
@@ -257,7 +283,7 @@ mod tests {
         ];
 
         let bytes = w.build(77, 5, &gone, moved.clone());
-        let r = PacketReader::new(&c, bytes).expect("well formed");
+        let r = TickObservation::new(&c, bytes).expect("well formed");
 
         assert_eq!(r.header().tick, 77);
         assert_eq!(r.header().sequence, 5);
@@ -273,7 +299,7 @@ mod tests {
         let mut w = PacketWriter::new(c.clone(), 1200);
         let bytes = w.build(1, 1, &[], std::iter::empty());
         assert_eq!(bytes.len(), PacketHeader::BYTES);
-        let r = PacketReader::new(&c, bytes).expect("well formed");
+        let r = TickObservation::new(&c, bytes).expect("well formed");
         assert_eq!(r.despawns().count(), 0);
         assert_eq!(r.updates().count(), 0);
     }
@@ -308,7 +334,7 @@ mod tests {
         let bytes = w.build(1, 1, &[id(9)], moved).to_vec();
         for cut in 1..bytes.len() {
             assert!(
-                PacketReader::new(&c, &bytes[..cut]).is_none(),
+                TickObservation::new(&c, &bytes[..cut]).is_none(),
                 "a payload {cut} bytes short must not parse"
             );
         }

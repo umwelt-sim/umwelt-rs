@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn a_payload_carries_exactly_what_was_selected() {
-        use crate::packet::PacketReader;
+        use crate::packet::TickObservation;
         let mut s = sim(Walk::new(1));
         let ids = populate(&mut s, 400);
         s.set_thread_count(1);
@@ -1143,7 +1143,7 @@ mod tests {
         let codec = RecordCodec::new(&WorldConfig::default());
         let checked = AtomicBool::new(false);
         s.tick_with(&|o: Outbound<'_>| {
-            let r = PacketReader::new(&codec, o.bytes).expect("well formed payload");
+            let r = TickObservation::new(&codec, o.bytes).expect("well formed payload");
             let want: Vec<EntityId> = o
                 .selection
                 .records()
@@ -1179,7 +1179,7 @@ mod tests {
 
     #[test]
     fn quantized_positions_survive_the_round_trip() {
-        use crate::packet::PacketReader;
+        use crate::packet::TickObservation;
         let mut s = sim(Walk::new(1));
         let ids = populate(&mut s, 60);
         s.set_thread_count(1);
@@ -1191,7 +1191,7 @@ mod tests {
         let codec = RecordCodec::new(&WorldConfig::default());
         let seen: Mutex<Vec<(EntityId, Pos3)>> = Mutex::new(Vec::new());
         s.tick_with(&|o: Outbound<'_>| {
-            let r = PacketReader::new(&codec, o.bytes).expect("well formed");
+            let r = TickObservation::new(&codec, o.bytes).expect("well formed");
             *seen.lock().unwrap() = r.updates().collect();
         });
         let seen = seen.into_inner().unwrap();
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn a_sink_receives_a_payload_per_served_viewer() {
-        use crate::packet::PacketReader;
+        use crate::packet::TickObservation;
         let mut s = sim(Walk::new(1)).with_sink(RecordingSink::new());
         let ids = populate(&mut s, 200);
         let a = s.register_viewer(ids[0], ClientLimits::default());
@@ -1216,7 +1216,7 @@ mod tests {
         let codec = RecordCodec::new(&WorldConfig::default());
         for v in [a, b] {
             let bytes = s.sink().latest(v).expect("served");
-            let r = PacketReader::new(&codec, &bytes).expect("well formed");
+            let r = TickObservation::new(&codec, &bytes).expect("well formed");
             assert_eq!(r.header().tick, 1);
             assert_eq!(r.header().sequence, 1, "sequence starts at one per client");
             assert!(r.updates().count() > 0);

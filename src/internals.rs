@@ -14,6 +14,19 @@ pub use crate::sim::Outbound;
 pub use crate::snapshot::{CellOccupants, CellSnapshot, SubCells};
 pub use crate::subscription::{CellList, Subscription};
 
+/// Reads a payload back into a [`TickObservation`](crate::TickObservation),
+/// which is what a client does with one.
+///
+/// Here rather than on the type because a consumer is handed observations by
+/// [`ClientGame::observed`](crate::ClientGame::observed) and never makes one.
+/// umwelt's own integration tests do, to model a client from the bytes.
+pub fn read_payload<'a>(
+    codec: &'a RecordCodec,
+    buf: &'a [u8],
+) -> Option<crate::TickObservation<'a>> {
+    crate::packet::TickObservation::new(codec, buf)
+}
+
 /// The region-to-edge wire, and an edge's side of it.
 pub mod region {
     pub use crate::net::region::client::{Incoming, Offer, RegionClient};

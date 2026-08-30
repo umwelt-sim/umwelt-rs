@@ -192,7 +192,7 @@ via QUIC, and create your `ClientHandle`.
 
 ```rust,no_run
 use umwelt::{
-    ClientGame, ClientHandle, EdgeClient, EntityHandle, EntityId, EntityKind, PacketReader, Pos3,
+    ClientGame, ClientHandle, EdgeClient, EntityHandle, EntityId, EntityKind, TickObservation, Pos3,
     RegionId,
 };
 
@@ -212,13 +212,13 @@ impl ClientGame for Farm {
         &mut self,
         _handle: EntityHandle,
         _region: RegionId,
-        state: &PacketReader<'_>,
+        observation: &TickObservation<'_>,
     ) {
-        for gone in state.despawns() {
+        for gone in observation.despawns() {
             // .. your logic here: the neighbor's goat wandered out of sight
             let _ = gone;
         }
-        for (id, at) in state.updates() {
+        for (id, at) in observation.updates() {
             // .. and here: draw whatever `id` is at `at`
             let _ = (id, at);
         }

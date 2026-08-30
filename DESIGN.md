@@ -854,7 +854,7 @@ reserve.
 ### Payload assembly
 
 A payload is a header, then despawns, then state records. `PacketWriter` builds
-it into a buffer it keeps, so a worker allocates once; `PacketReader` reads it
+it into a buffer it keeps, so a worker allocates once; `TickObservation` reads it
 back, which is what a client does and what makes the format testable by round
 trip.
 

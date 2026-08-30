@@ -50,11 +50,16 @@ impl Fixed {
         Fixed(m * FIXED_ONE)
     }
 
-    /// From meters and thousandths, e.g. `from_millis(3, 500)` is 3.5 m.
+    /// From meters and millimeters, e.g. `from_millimeters(3, 500)` is 3.5 m.
+    ///
+    /// Millimeters of distance, not milliseconds. This crate measures the world
+    /// in meters and measures time with [`Duration`](std::time::Duration), and
+    /// the two constructors sit close enough together to be worth saying so.
+    ///
     /// Rounds toward zero; 1/1000 is not exactly representable in binary.
     #[inline]
-    pub const fn from_millis(m: i32, milli: i32) -> Fixed {
-        Fixed(m * FIXED_ONE + (milli * FIXED_ONE) / 1000)
+    pub const fn from_millimeters(m: i32, mm: i32) -> Fixed {
+        Fixed(m * FIXED_ONE + (mm * FIXED_ONE) / 1000)
     }
 
     /// From raw internal units. Use when the value is already scaled.
@@ -201,7 +206,7 @@ impl Mul for Fixed {
     type Output = Fixed;
     /// Fixed times fixed. The raw product carries 20 fractional bits, so it
     /// is shifted back down by 10. Widened to `i64` first because two 32-bit
-    /// values overflow `i32` before the shift can bring them back in range.    
+    /// values overflow `i32` before the shift can bring them back in range.
     #[inline]
     fn mul(self, rhs: Fixed) -> Fixed {
         Fixed(((self.0 as i64 * rhs.0 as i64) >> FIXED_SHIFT) as i32)
@@ -350,8 +355,8 @@ mod tests {
         assert_eq!(three * Fixed::from_meters(2), Fixed::from_meters(6));
         // Same answer here, but only because 2 m and the count 2 coincide.
         // Half a meter shows the difference.
-        let half = Fixed::from_millis(0, 500);
-        assert_eq!(three * half, Fixed::from_millis(1, 500));
+        let half = Fixed::from_millimeters(0, 500);
+        assert_eq!(three * half, Fixed::from_millimeters(1, 500));
     }
 
     #[test]
@@ -365,15 +370,15 @@ mod tests {
     }
 
     #[test]
-    fn from_millis_matches_expectation() {
-        assert_eq!(Fixed::from_millis(1, 500).raw(), 1536);
-        assert_eq!(Fixed::from_millis(0, 0), Fixed::ZERO);
+    fn from_millimeters_matches_expectation() {
+        assert_eq!(Fixed::from_millimeters(1, 500).raw(), 1536);
+        assert_eq!(Fixed::from_millimeters(0, 0), Fixed::ZERO);
     }
 
     #[test]
     fn display_has_no_float() {
         assert_eq!(Fixed::from_meters(293).to_string(), "293.000m");
-        assert_eq!(Fixed::from_millis(1, 500).to_string(), "1.500m");
+        assert_eq!(Fixed::from_millimeters(1, 500).to_string(), "1.500m");
         assert_eq!(Fixed::from_meters(-4).to_string(), "-4.000m");
     }
 

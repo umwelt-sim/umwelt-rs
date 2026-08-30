@@ -1533,14 +1533,14 @@ mod tests {
         let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
         step.translate(
             id,
-            Fixed::from_millis(0, 250),
+            Fixed::from_millimeters(0, 250),
             Fixed::from_meters(-1),
             Fixed::ZERO,
         );
         assert_eq!(
             step.position(id),
             Some(Pos3::new(
-                Fixed::from_millis(2048, 250),
+                Fixed::from_millimeters(2048, 250),
                 Fixed::from_meters(2047),
                 Fixed::ZERO
             ))
@@ -1553,7 +1553,7 @@ mod tests {
         let mut step = step_over(&mut s);
         let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
         for _ in 0..4 {
-            step.translate(id, Fixed::from_millis(0, 250), Fixed::ZERO, Fixed::ZERO);
+            step.translate(id, Fixed::from_millimeters(0, 250), Fixed::ZERO, Fixed::ZERO);
         }
         assert_eq!(step.position(id).map(|at| at.x), Some(Fixed::from_meters(2049)));
     }

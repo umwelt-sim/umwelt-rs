@@ -103,7 +103,7 @@ impl Game for MildewValley {
         // .. your logic here: grow the crops, wander the goats, spread the rot.
         // An entity is named by its id. A quarter of a meter east a tick.
         for goat in &self.goats {
-            world.translate(*goat, Fixed::from_millis(0, 250), Fixed::ZERO, Fixed::ZERO);
+            world.translate(*goat, Fixed::from_millimeters(0, 250), Fixed::ZERO, Fixed::ZERO);
         }
     }
 }

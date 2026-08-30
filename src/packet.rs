@@ -277,7 +277,11 @@ mod tests {
             (id(1), Pos3::from_meters(100, 200, 5)),
             (
                 id(2),
-                Pos3::new(Fixed::from_millis(7, 500), Fixed::ZERO, Fixed::from_meters(3)),
+                Pos3::new(
+                    Fixed::from_millimeters(7, 500),
+                    Fixed::ZERO,
+                    Fixed::from_meters(3),
+                ),
             ),
             (id(3), Pos3::from_meters(4095, 4095, 1023)),
         ];

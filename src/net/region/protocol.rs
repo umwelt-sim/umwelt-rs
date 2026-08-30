@@ -673,7 +673,7 @@ mod tests {
                 (
                     ent(1),
                     Pos3::new(
-                        Fixed::from_millis(7, 500),
+                        Fixed::from_millimeters(7, 500),
                         Fixed::ZERO,
                         Fixed::from_raw(1),
                     ),

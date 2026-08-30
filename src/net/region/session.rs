@@ -667,7 +667,8 @@ mod tests {
     fn a_position_survives_the_wire_exactly() {
         // What apply writes into the arrays has to be what the edge sent, or a
         // stationary entity would drift a little every tick.
-        let sent = Pos3::new(Fixed::from_millis(7, 500), Fixed::ZERO, Fixed::from_raw(1));
+        let sent =
+            Pos3::new(Fixed::from_millimeters(7, 500), Fixed::ZERO, Fixed::from_raw(1));
         let mut body = Vec::new();
         MoveEntities { moves: vec![(ent(1), sent)] }.encode(&mut body);
         let back = MoveEntities::decode(&body[1..]).expect("well formed");

@@ -181,9 +181,9 @@ mod tests {
             (
                 u32::MAX,
                 Pos3::new(
-                    Fixed::from_millis(1234, 567),
-                    Fixed::from_millis(89, 12),
-                    Fixed::from_millis(500, 999),
+                    Fixed::from_millimeters(1234, 567),
+                    Fixed::from_millimeters(89, 12),
+                    Fixed::from_millimeters(500, 999),
                 ),
             ),
         ];

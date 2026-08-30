@@ -29,7 +29,7 @@ mod subscription;
 pub mod internals;
 
 pub use config::{ConfigError, WorldConfig, WorldConfigBuilder};
-pub use entity::{EntityId, EntityKind, LiveSet};
+pub use entity::{EntityId, EntityKind, LiveIter, LiveSet};
 pub use fixed::{DistSq, Fixed};
 pub use game::{ClientGame, EdgeGame, Game};
 pub use id::{ClientId, EntityHandle, EntityKey, RegionId};

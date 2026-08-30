@@ -62,7 +62,7 @@ impl Game for Applier {
         self.inbound.apply(step);
         self.ticks += 1;
         if self.ticks == CULL_AT
-            && let Some(id) = step.live().iter().next()
+            && let Some(id) = step.entities().next()
         {
             step.despawn(id);
             *self.culled.lock().expect("not poisoned") = Some(id);

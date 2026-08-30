@@ -57,7 +57,7 @@ impl Game for Applier {
         self.ticks += 1;
         if self.ticks == CULL_AT {
             // The first live slot will do; it belongs to some edge.
-            if let Some(id) = step.live().iter().next() {
+            if let Some(id) = step.entities().next() {
                 step.despawn(id);
                 *self.culled.lock().expect("not poisoned") = Some(id);
             }

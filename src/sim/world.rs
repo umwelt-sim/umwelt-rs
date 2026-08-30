@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::budget::PacketBudget;
 use crate::codec::RecordCodec;
 use crate::config::WorldConfig;
-use crate::entity::{EntityId, LiveSet};
+use crate::entity::{EntityId, LiveIter, LiveSet};
 use crate::fixed::Fixed;
 use crate::game::Game;
 use crate::gather::DiscoveredEntities;
@@ -91,20 +91,72 @@ impl Step<'_> {
         self.cfg
     }
 
-    /// Every slot ever allocated, live or not. Entity id is the index.
+    /// How many entities are alive.
     #[inline]
-    pub fn slots(&self) -> usize {
-        self.xs.len()
+    pub fn entity_count(&self) -> usize {
+        self.live.live()
     }
 
-    /// Which slots hold an entity.
+    /// Whether that entity is alive. A despawned id is not.
     #[inline]
-    pub fn live(&self) -> &LiveSet {
-        self.live
+    pub fn contains(&self, id: EntityId) -> bool {
+        self.live.contains(id)
     }
 
-    /// The position arrays, to be moved in place. Struct of arrays, so there is
-    /// no per-tick marshaling pass.
+    /// Every live entity, in ascending id order.
+    ///
+    /// Holds the whole `Step` borrowed for as long as the iterator lives, so
+    /// collect the ids first if the loop body has to move anything.
+    #[inline]
+    pub fn entities(&self) -> LiveIter<'_> {
+        self.live.iter()
+    }
+
+    /// Where an entity is, or `None` if it is not alive.
+    #[inline]
+    pub fn position(&self, id: EntityId) -> Option<Pos3> {
+        if !self.live.contains(id) {
+            return None;
+        }
+        let at = id.index();
+        Some(Pos3::new(self.xs[at], self.ys[at], self.zs[at]))
+    }
+
+    /// Moves an entity. An id that is not alive is ignored.
+    pub fn move_to(&mut self, id: EntityId, pos: Pos3) {
+        debug_assert!(self.cfg.contains(pos), "moved outside the region to {pos:?}");
+        if !self.live.contains(id) {
+            return;
+        }
+        let at = id.index();
+        self.xs[at] = pos.x;
+        self.ys[at] = pos.y;
+        self.zs[at] = pos.z;
+    }
+
+    /// Offsets an entity, saturating at the bounds of [`Fixed`] on each axis.
+    /// An id that is not alive is ignored.
+    pub fn translate(&mut self, id: EntityId, dx: Fixed, dy: Fixed, dz: Fixed) {
+        let Some(at) = self.position(id) else { return };
+        self.move_to(
+            id,
+            Pos3::new(
+                at.x.saturating_add(dx),
+                at.y.saturating_add(dy),
+                at.z.saturating_add(dz),
+            ),
+        );
+    }
+
+    /// Every position, to be moved in place. Struct of arrays, so a sweep over
+    /// the whole world costs no marshaling pass.
+    ///
+    /// This is the bulk path, and the slices are indexed by
+    /// [`EntityId::index`]. They cover despawned entities too, so a sweep that
+    /// must skip those needs [`contains`](Self::contains). Prefer
+    /// [`move_to`](Self::move_to) and [`translate`](Self::translate) for
+    /// anything that names its entity: they bounds-check the destination and
+    /// never touch a despawned one.
     #[inline]
     pub fn positions_mut(&mut self) -> (&mut [Fixed], &mut [Fixed], &mut [Fixed]) {
         (self.xs.as_mut_slice(), self.ys.as_mut_slice(), self.zs.as_mut_slice())
@@ -1387,5 +1439,122 @@ mod tests {
         assert_eq!(s.snapshot().len(), snap);
         let after: Vec<usize> = (0..20).map(|i| s.viewers[i].ghosts.slots()).collect();
         assert_eq!(after, ghosts, "ghost tables must reach a steady size");
+    }
+
+    // -- what a game may do to one entity -----------------------------------
+
+    fn step_over(sim: &mut WorldSimulation<Walk>) -> Step<'_> {
+        Step {
+            xs: &mut sim.xs,
+            ys: &mut sim.ys,
+            zs: &mut sim.zs,
+            live: &mut sim.live,
+            despawned: &mut sim.despawned,
+            cfg: &sim.cfg,
+            tick: 0,
+        }
+    }
+
+    #[test]
+    fn a_position_reads_back_what_was_spawned() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let at = Pos3::from_meters(2048, 2049, 3);
+        let id = step.spawn(at);
+        assert_eq!(step.position(id), Some(at));
+        assert!(step.contains(id));
+    }
+
+    #[test]
+    fn a_despawned_entity_has_no_position() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        step.despawn(id);
+        assert_eq!(step.position(id), None);
+        assert!(!step.contains(id));
+    }
+
+    #[test]
+    fn a_never_allocated_id_has_no_position() {
+        let mut s = sim(Walk::still());
+        let step = step_over(&mut s);
+        assert_eq!(step.position(EntityId::from_raw(9)), None);
+    }
+
+    #[test]
+    fn move_to_puts_an_entity_where_it_was_told() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        let to = Pos3::from_meters(2100, 2000, 12);
+        step.move_to(id, to);
+        assert_eq!(step.position(id), Some(to));
+    }
+
+    #[test]
+    fn move_to_leaves_a_despawned_entity_alone() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let gone = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        let neighbour = step.spawn(Pos3::from_meters(2049, 2048, 0));
+        step.despawn(gone);
+        step.move_to(gone, Pos3::from_meters(2100, 2100, 0));
+        assert_eq!(step.position(gone), None);
+        assert_eq!(step.position(neighbour), Some(Pos3::from_meters(2049, 2048, 0)));
+    }
+
+    #[test]
+    fn translate_offsets_from_where_the_entity_is() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        step.translate(
+            id,
+            Fixed::from_millis(0, 250),
+            Fixed::from_meters(-1),
+            Fixed::ZERO,
+        );
+        assert_eq!(
+            step.position(id),
+            Some(Pos3::new(
+                Fixed::from_millis(2048, 250),
+                Fixed::from_meters(2047),
+                Fixed::ZERO
+            ))
+        );
+    }
+
+    #[test]
+    fn translate_accumulates_across_calls() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        for _ in 0..4 {
+            step.translate(id, Fixed::from_millis(0, 250), Fixed::ZERO, Fixed::ZERO);
+        }
+        assert_eq!(step.position(id).map(|at| at.x), Some(Fixed::from_meters(2049)));
+    }
+
+    #[test]
+    fn translate_leaves_a_despawned_entity_alone() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        step.despawn(id);
+        step.translate(id, Fixed::from_meters(1), Fixed::ZERO, Fixed::ZERO);
+        assert_eq!(step.position(id), None);
+    }
+
+    #[test]
+    fn entities_lists_the_live_ids_in_ascending_order() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let ids: Vec<EntityId> =
+            (0..5).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0))).collect();
+        step.despawn(ids[1]);
+        step.despawn(ids[3]);
+        assert_eq!(step.entities().collect::<Vec<_>>(), vec![ids[0], ids[2], ids[4]]);
+        assert_eq!(step.entity_count(), 3);
     }
 }

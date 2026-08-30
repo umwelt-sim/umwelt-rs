@@ -80,8 +80,8 @@ use std::time::Duration;
 
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{
-    ClientLimits, Fixed, Flow, Game, Handoff, Pacing, RegionId, RegionServer, Step, WorldConfig,
-    WorldSimulation,
+    ClientLimits, EntityId, Fixed, Flow, Game, Handoff, Pacing, RegionId, RegionServer, Step,
+    WorldConfig, WorldSimulation,
 };
 
 // Everything the valley simulates: crops, livestock, and the farmers walking
@@ -89,6 +89,8 @@ use umwelt::{
 struct MildewValley {
     /// What the edges have asked for, applied inside the tick.
     inbound: Arc<Inbound>,
+    /// The entities this game is keeping track of itself.
+    goats: Vec<EntityId>,
 }
 
 // Implement the region sim's callback, the core responsibility of
@@ -99,9 +101,9 @@ impl Game for MildewValley {
         self.inbound.apply(world);
 
         // .. your logic here: grow the crops, wander the goats, spread the rot.
-        let (xs, _, _) = world.positions_mut();
-        for x in xs {
-            *x = x.saturating_add(Fixed::from_raw(4));
+        // An entity is named by its id. A quarter of a meter east a tick.
+        for goat in &self.goats {
+            world.translate(*goat, Fixed::from_millis(0, 250), Fixed::ZERO, Fixed::ZERO);
         }
     }
 }
@@ -127,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // MildewValley is your type, WorldSimulation belongs to umwelt.
-    let game = MildewValley { inbound: Arc::clone(&inbound) };
+    let game = MildewValley { inbound: Arc::clone(&inbound), goats: Vec::new() };
     let mut sim = WorldSimulation::new(config, game).with_sink(Handoff::new(sink.clone()));
 
     // umwelt owns the loop, because it owns the tick rate.

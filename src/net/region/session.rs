@@ -245,7 +245,7 @@ impl Inbound {
         // Orphans first, so a stale command later in this same batch cannot
         // move an entity whose edge has already gone.
         for id in self.edges.take_detached() {
-            if step.live().contains(id) {
+            if step.contains(id) {
                 step.despawn(id);
                 gone.push((None, id));
                 out.orphaned += 1;
@@ -296,7 +296,7 @@ impl Inbound {
                     for (id, pos) in moves {
                         if self.edges.edge_for(id) != Some(edge)
                             || !cfg.contains(pos)
-                            || !step.live().contains(id)
+                            || !step.contains(id)
                         {
                             refuse(&mut out, &stats);
                             continue;

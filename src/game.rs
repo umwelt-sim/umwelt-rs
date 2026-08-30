@@ -1,17 +1,23 @@
-//! The three traits a consumer implements.
+//! Traits to be implemented by game developers.
 //!
-//! [`Game`] is a region's, called once per tick with a [`Step`]. [`EdgeGame`]
-//! is an edge's, called when a client connects, says something, or goes away.
-//! [`ClientGame`] is a game client's, called when the edge says something back.
+//! If you're developing a game then this module is where you should start.
 //!
-//! They live here rather than beside the tier that calls each one because they
-//! are the consumer's extension points and a consumer looks for them together,
-//! not one per module.
+//! ## Simulation
+//! A simulation is a single region of the overall universe of the game. You define
+//! your game logic (e.g. physics, combat, decay, etc) within the callback from the
+//! [`Game`] trait. The simulation server calls the [`Game::step`] handler, which
+//! you define.
 //!
-//! Two of the three are written in networking vocabulary, but this module
-//! reaches into no protocol to say so: the names it needs — [`ClientId`],
-//! [`EntityKey`], [`EntityHandle`] — are in [`id`](crate::id), which is about
-//! who and what rather than about wires.
+//! ## Edge
+//! While a simulation needs to be resilient and to restore itself after a crash,
+//! edges are disposable. Edges are started to support game client load, relaying
+//! communication between the game client and the simulation. Edges can be deployed
+//! without writing any new code, or you can implement your own [`EdgeGame`].
+//!
+//! ## Game Client
+//! The game client is the user-facing component of your game. Implementing
+//! [`ClientGame`] and establishing a **QUIC** connection to an edge provided
+//! by **umwelt** gives your multi-billion dollar viral game the necessary plumbing.
 
 use std::net::SocketAddr;
 
@@ -20,10 +26,16 @@ use crate::id::{ClientId, EntityHandle, EntityKey, RegionId};
 use crate::packet::PacketReader;
 use crate::sim::Step;
 
-/// The consumer's game, called once per tick.
+/// The logic and rules for a durable, server-side game. The [`Game::step`]
+/// function is called once per tick (default is **20Hz**).
 pub trait Game {
     /// Moves entities, spawns and despawns. Everything that is not position is
-    /// the consumer's own storage, keyed by [`EntityId`].
+    /// the consumer's own storage, keyed by [`EntityId`]. The implementer
+    /// of this function must not block and must not panic, nor can it
+    /// start its own async runtime.
+    /// The `world` parameter is a no-allocation output buffer. The
+    /// [`Step`] struct provides appropriate access to this buffer.
+    /// 
     fn step(&mut self, world: &mut Step<'_>);
 }
 

@@ -1519,11 +1519,11 @@ mod tests {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
         let gone = step.spawn(Pos3::from_meters(2048, 2048, 0));
-        let neighbour = step.spawn(Pos3::from_meters(2049, 2048, 0));
+        let neighbor = step.spawn(Pos3::from_meters(2049, 2048, 0));
         step.despawn(gone);
         step.move_to(gone, Pos3::from_meters(2100, 2100, 0));
         assert_eq!(step.position(gone), None);
-        assert_eq!(step.position(neighbour), Some(Pos3::from_meters(2049, 2048, 0)));
+        assert_eq!(step.position(neighbor), Some(Pos3::from_meters(2049, 2048, 0)));
     }
 
     #[test]

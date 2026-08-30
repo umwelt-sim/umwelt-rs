@@ -100,10 +100,10 @@ pub struct Heartbeat {
 
 impl Heartbeat {
     /// A heartbeat's width on the wire.
-    pub const BYTES: usize = 56;
+    pub(crate) const BYTES: usize = 56;
 
     /// Replaces `out` with the encoded heartbeat.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         out.extend_from_slice(&self.region.raw().to_le_bytes());
         out.extend_from_slice(&self.protocol.raw().to_le_bytes());
@@ -218,10 +218,10 @@ pub struct EdgeHeartbeat {
 
 impl EdgeHeartbeat {
     /// Everything but the name and the region list, both of which vary.
-    pub const FIXED_BYTES: usize = 55;
+    pub(crate) const FIXED_BYTES: usize = 55;
 
     /// Replaces `out` with the encoded heartbeat.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         let name = self.edge.as_str().as_bytes();
         // An `EdgeName` is at most 64 bytes, checked when it was built.

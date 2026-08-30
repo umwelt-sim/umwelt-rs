@@ -50,13 +50,9 @@ impl Fixed {
         Fixed(m * FIXED_ONE)
     }
 
-    /// From meters and millimeters, e.g. `from_millimeters(3, 500)` is 3.5 m.
-    ///
-    /// Millimeters of distance, not milliseconds. This crate measures the world
-    /// in meters and measures time with [`Duration`](std::time::Duration), and
-    /// the two constructors sit close enough together to be worth saying so.
-    ///
-    /// Rounds toward zero; 1/1000 is not exactly representable in binary.
+    /// From meters and millimeters of distance, e.g. `from_millimeters(3, 500)`
+    /// is 3.5 m. Rounds toward zero; 1/1000 is not exactly representable in
+    /// binary.
     #[inline]
     pub const fn from_millimeters(m: i32, mm: i32) -> Fixed {
         Fixed(m * FIXED_ONE + (mm * FIXED_ONE) / 1000)

@@ -17,6 +17,19 @@
 //!
 //! How long silence has to last before anyone believes a server has stopped is
 //! a deployment judgment, and belongs to whatever is listening.
+//!
+//! # Subjects
+//!
+//! Building a subject is umwelt's on both ends, so the functions that do it are
+//! crate-private. A watcher outside this crate subscribes to these patterns:
+//!
+//! | pattern | carries |
+//! |---|---|
+//! | `umwelt.control.region.*.heartbeat` | every region's [`Heartbeat`] |
+//! | `umwelt.control.edge.*.heartbeat` | every edge's [`EdgeHeartbeat`] |
+//!
+//! That, and what [`Heartbeat::decode`] and [`EdgeHeartbeat::decode`] read, is
+//! the whole of what a watcher needs to know about the transport.
 
 use core::fmt;
 use std::time::Duration;
@@ -28,23 +41,13 @@ use crate::net::region::protocol::{ProtocolVersion, ServerVersion};
 use crate::net::wire::Cursor;
 
 /// One region's heartbeat subject.
-pub fn subject(region: RegionId) -> String {
+pub(crate) fn subject(region: RegionId) -> String {
     format!("umwelt.control.region.{}.heartbeat", region.raw())
 }
 
-/// Every region's, for a watcher that wants the whole tier.
-pub fn all_subjects() -> &'static str {
-    "umwelt.control.region.*.heartbeat"
-}
-
 /// One edge's heartbeat subject.
-pub fn edge_subject(edge: &EdgeName) -> String {
+pub(crate) fn edge_subject(edge: &EdgeName) -> String {
     format!("umwelt.control.edge.{edge}.heartbeat")
-}
-
-/// Every edge's. Edges are cattle, and a herd is still worth watching.
-pub fn all_edge_subjects() -> &'static str {
-    "umwelt.control.edge.*.heartbeat"
 }
 
 /// What only the region's own loop can report.
@@ -439,15 +442,32 @@ mod tests {
         assert_eq!(back.load.worst_tick, Duration::from_nanos(u64::from(u32::MAX)));
     }
 
+    /// Whether a NATS subject matches a `*`-wildcard pattern token by token.
+    fn matches(pattern: &str, concrete: &str) {
+        let (p, c): (Vec<_>, Vec<_>) =
+            (pattern.split('.').collect(), concrete.split('.').collect());
+        assert_eq!(p.len(), c.len(), "{concrete} against {pattern}");
+        assert!(
+            p.iter().zip(&c).all(|(a, b)| *a == "*" || a == b),
+            "{concrete} against {pattern}"
+        );
+    }
+
     #[test]
-    fn the_wildcard_matches_any_region() {
-        // What a watcher subscribes to once and never again.
+    fn the_documented_wildcards_match_what_is_published() {
+        // Building a subject is crate-private, so a watcher outside the crate
+        // subscribes to the patterns written in this module's doc. Nothing
+        // constructs them any more, which is why they are spelled out here:
+        // this is what keeps the doc honest if a subject ever changes shape.
         for region in [1u32, 7, 4_000_000] {
-            let concrete = subject(RegionId::from_raw(region));
-            let (p, c): (Vec<_>, Vec<_>) =
-                (all_subjects().split('.').collect(), concrete.split('.').collect());
-            assert_eq!(p.len(), c.len());
-            assert!(p.iter().zip(&c).all(|(a, b)| *a == "*" || a == b), "{concrete}");
+            matches(
+                "umwelt.control.region.*.heartbeat",
+                &subject(RegionId::from_raw(region)),
+            );
+        }
+        for edge in ["herd-3fd3d8", "e1"] {
+            let name = EdgeName::new(edge).expect("valid name");
+            matches("umwelt.control.edge.*.heartbeat", &edge_subject(&name));
         }
     }
 

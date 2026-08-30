@@ -20,37 +20,37 @@ use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
 
 /// Where a region answers what world it runs.
-pub fn info(region: RegionId) -> String {
+pub(crate) fn info(region: RegionId) -> String {
     format!("umwelt.{}.info", region.raw())
 }
 
 /// One observer's assembled packet.
-pub fn state(region: RegionId, edge: &EdgeName) -> String {
+pub(crate) fn state(region: RegionId, edge: &EdgeName) -> String {
     format!("umwelt.{}.edge.{edge}.state", region.raw())
 }
 
 /// Entities appearing and leaving, for the edge that owns them.
-pub fn presence(region: RegionId, edge: &EdgeName) -> String {
+pub(crate) fn presence(region: RegionId, edge: &EdgeName) -> String {
     format!("umwelt.{}.edge.{edge}.presence", region.raw())
 }
 
 /// Where one edge sends its commands to one region.
-pub fn command(region: RegionId, edge: &EdgeName) -> String {
+pub(crate) fn command(region: RegionId, edge: &EdgeName) -> String {
     format!("umwelt.{}.edge.{edge}.command", region.raw())
 }
 
 /// Every command sent to one region, whichever edge sent it.
-pub fn commands_to(region: RegionId) -> String {
+pub(crate) fn commands_to(region: RegionId) -> String {
     format!("umwelt.{}.edge.*.command", region.raw())
 }
 
 /// Everything addressed to one edge with the given leaf, from any region.
-pub fn to_edge(edge: &EdgeName, leaf: &str) -> String {
+pub(crate) fn to_edge(edge: &EdgeName, leaf: &str) -> String {
     format!("umwelt.*.edge.{edge}.{leaf}")
 }
 
 /// The edge that sent a command, read out of the subject it arrived on.
-pub fn sender(subject: &str) -> Result<EdgeName, NetError> {
+pub(crate) fn sender(subject: &str) -> Result<EdgeName, NetError> {
     match subject.split('.').collect::<Vec<_>>()[..] {
         ["umwelt", _, "edge", edge, "command"] => EdgeName::new(edge),
         _ => Err(NetError::BadSubject),
@@ -58,7 +58,7 @@ pub fn sender(subject: &str) -> Result<EdgeName, NetError> {
 }
 
 /// The region a state or presence message came from, read out of its subject.
-pub fn origin(subject: &str) -> Result<RegionId, NetError> {
+pub(crate) fn origin(subject: &str) -> Result<RegionId, NetError> {
     match subject.split('.').collect::<Vec<_>>()[..] {
         ["umwelt", region, "edge", _, "state" | "presence"] => {
             region.parse().map(RegionId::from_raw).map_err(|_| NetError::BadSubject)

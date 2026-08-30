@@ -23,7 +23,6 @@ pub mod region {
         Presence, ProtocolVersion, ServerInfo, ServerVersion, Spawn, SpawnEntities,
         WorldParams,
     };
-    pub use crate::net::region::subjects;
 }
 
 /// The edge-to-client wire.

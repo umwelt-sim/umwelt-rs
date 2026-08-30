@@ -16,7 +16,7 @@ mod server;
 pub(crate) mod edges;
 pub(crate) mod protocol;
 pub(crate) mod session;
-pub mod subjects;
+pub(crate) mod subjects;
 
 pub use edges::{ClaimError, EdgeId, EdgeName, EdgeView, Edges};
 pub use server::RegionServer;

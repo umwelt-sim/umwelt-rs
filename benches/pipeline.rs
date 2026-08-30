@@ -82,7 +82,7 @@ impl Game for Scenario {
         self.phase = !self.phase;
         let d = Fixed::from_meters(self.step_m).raw();
         let up = self.phase;
-        let (xs, _, _) = w.positions_mut();
+        let (xs, _, _, _) = w.positions_mut();
         for (i, x) in xs.iter_mut().enumerate() {
             let forward = (i % 2 == 0) == up;
             *x = Fixed::from_raw(if forward { x.raw() + d } else { x.raw() - d });
@@ -139,7 +139,7 @@ impl Game for Travelers {
         // Walked even at zero speed, so the still row pays the same scattered
         // writes as a moving one and the difference between rows is motion
         // rather than this loop.
-        let (_, ys, _) = w.positions_mut();
+        let (_, ys, _, _) = w.positions_mut();
         for (k, &e) in self.movers.iter().enumerate() {
             let i = e as usize;
             let mut y = ys[i].raw() + self.dir[k] * self.per_tick;

@@ -307,7 +307,7 @@ impl Inbound {
             }
         }
 
-        let (xs, ys, zs) = step.positions_mut();
+        let (xs, ys, zs, _) = step.positions_mut();
         for (at, pos) in writes {
             xs[at] = pos.x;
             ys[at] = pos.y;

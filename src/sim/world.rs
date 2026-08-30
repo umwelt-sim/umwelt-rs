@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::budget::PacketBudget;
 use crate::codec::RecordCodec;
 use crate::config::WorldConfig;
-use crate::entity::{EntityId, LiveIter, LiveSet};
+use crate::entity::{EntityId, Live, LiveIter, LiveSet};
 use crate::fixed::Fixed;
 use crate::game::Game;
 use crate::gather::DiscoveredEntities;
@@ -97,6 +97,18 @@ impl Step<'_> {
         self.live.live()
     }
 
+    /// How long an array keyed by [`EntityId::index`] has to be to cover every
+    /// entity.
+    ///
+    /// A game that keeps its own state in dense arrays beside umwelt's needs
+    /// this to size them. Ids are never reused, so it only ever grows, and a
+    /// slot whose entity has despawned still counts — which is why this is not
+    /// [`entity_count`](Self::entity_count).
+    #[inline]
+    pub fn id_space(&self) -> usize {
+        self.xs.len()
+    }
+
     /// Whether that entity is alive. A despawned id is not.
     #[inline]
     pub fn contains(&self, id: EntityId) -> bool {
@@ -152,14 +164,24 @@ impl Step<'_> {
     /// the whole world costs no marshaling pass.
     ///
     /// This is the bulk path, and the slices are indexed by
-    /// [`EntityId::index`]. They cover despawned entities too, so a sweep that
-    /// must skip those needs [`contains`](Self::contains). Prefer
-    /// [`move_to`](Self::move_to) and [`translate`](Self::translate) for
+    /// [`EntityId::index`]. They cover despawned entities too, which is what
+    /// the [`Live`] handed back with them is for: these slices borrow the whole
+    /// `Step`, so a sweep that must skip the dead would otherwise have to
+    /// record liveness before taking them.
+    ///
+    /// Prefer [`move_to`](Self::move_to) and [`translate`](Self::translate) for
     /// anything that names its entity: they bounds-check the destination and
     /// never touch a despawned one.
     #[inline]
-    pub fn positions_mut(&mut self) -> (&mut [Fixed], &mut [Fixed], &mut [Fixed]) {
-        (self.xs.as_mut_slice(), self.ys.as_mut_slice(), self.zs.as_mut_slice())
+    pub fn positions_mut(
+        &mut self,
+    ) -> (&mut [Fixed], &mut [Fixed], &mut [Fixed], Live<'_>) {
+        (
+            self.xs.as_mut_slice(),
+            self.ys.as_mut_slice(),
+            self.zs.as_mut_slice(),
+            Live::new(&*self.live),
+        )
     }
 
     /// Appends an entity. Slots are never reused, so the id is new.
@@ -444,7 +466,7 @@ impl TickSpan {
 ///         }
 ///         // A tenth of a meter a tick, in place, with no marshaling pass.
 ///         let step = Fixed::from_raw(102);
-///         let (_, ys, _) = world.positions_mut();
+///         let (_, ys, _, _) = world.positions_mut();
 ///         for y in ys {
 ///             *y = y.saturating_add(step);
 ///         }
@@ -912,7 +934,7 @@ mod tests {
             let extent = w.config().region_size().raw();
             let d = Fixed::from_meters(self.per_tick).raw();
             let frozen = self.frozen.clone();
-            let (xs, _, _) = w.positions_mut();
+            let (xs, _, _, _) = w.positions_mut();
             for (i, x) in xs.iter_mut().enumerate() {
                 if frozen.contains(&EntityId::from_raw(i as u32)) {
                     continue;
@@ -1544,6 +1566,35 @@ mod tests {
         step.despawn(id);
         step.translate(id, Fixed::from_meters(1), Fixed::ZERO, Fixed::ZERO);
         assert_eq!(step.position(id), None);
+    }
+
+    #[test]
+    fn positions_mut_hands_back_liveness_for_the_slices_it_returns() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let ids: Vec<EntityId> =
+            (0..3).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0))).collect();
+        step.despawn(ids[1]);
+
+        // The point of handing it back: readable while the slices are held.
+        let (xs, _, _, live) = step.positions_mut();
+        assert_eq!(live.count(), 2);
+        assert_eq!(live.iter().collect::<Vec<_>>(), vec![ids[0], ids[2]]);
+        let skipped: Vec<usize> = (0..xs.len())
+            .filter(|&i| !live.contains(EntityId::from_raw(i as u32)))
+            .collect();
+        assert_eq!(skipped, vec![1], "the despawned slot is still in the slices");
+    }
+
+    #[test]
+    fn id_space_covers_despawned_entities_and_entity_count_does_not() {
+        let mut s = sim(Walk::still());
+        let mut step = step_over(&mut s);
+        let ids: Vec<EntityId> =
+            (0..3).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0))).collect();
+        step.despawn(ids[1]);
+        assert_eq!(step.id_space(), 3, "a despawned slot still has to be covered");
+        assert_eq!(step.entity_count(), 2);
     }
 
     #[test]

@@ -381,7 +381,7 @@ impl Game for MyGame {
         // spawn, despawn, and move an entity the game names by id
         world.move_to(goat, there);
         // or sweep every position at once
-        let (xs, ys, zs) = world.positions_mut();
+        let (xs, ys, zs, live) = world.positions_mut();
     }
 }
 
@@ -3001,13 +3001,6 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 
 ## Open items
 
-- **`Step::positions_mut` borrows the whole `Step`**, so nothing else on it is
-  reachable while the position slices are held. A bulk sweep that reads liveness
-  while moving entities still has to clone the `LiveSet` first, which `herd`
-  does every tick. Handing back the liveness reference alongside the slices
-  would fix it. A point update no longer runs into this at all: `position`,
-  `move_to` and `translate` name the entity and hold the borrow only for the
-  call.
 - **`WorldSimulation` reports `entity_count`, which is live entities, and has no
   accessor for slots ever allocated.** That is the number the slot reuse item
   above is about, and a consumer currently measures it from the length of its

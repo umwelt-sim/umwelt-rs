@@ -221,6 +221,41 @@ impl LiveSet {
 /// Ascending live slots from a [`LiveSet`], produced by [`LiveSet::iter`].
 ///
 /// Holds the current word rather than re-reading it, and clears the lowest set
+/// Which entities are alive, readable while their positions are held.
+///
+/// Handed back by [`Step::positions_mut`](crate::Step::positions_mut). Those
+/// slices borrow the whole `Step`, and a sweep over them has to skip whatever
+/// is no longer there, so the test comes back alongside the slices rather than
+/// having to be recorded first.
+#[derive(Clone, Copy, Debug)]
+pub struct Live<'a> {
+    set: &'a LiveSet,
+}
+
+impl<'a> Live<'a> {
+    pub(crate) fn new(set: &'a LiveSet) -> Live<'a> {
+        Live { set }
+    }
+
+    /// Whether that entity is alive. A despawned id is not.
+    #[inline]
+    pub fn contains(&self, id: EntityId) -> bool {
+        self.set.contains(id)
+    }
+
+    /// Every live entity, in ascending id order.
+    #[inline]
+    pub fn iter(&self) -> LiveIter<'a> {
+        self.set.iter()
+    }
+
+    /// How many entities are alive.
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.set.live()
+    }
+}
+
 /// bit per step, so a dense word costs one instruction per live slot and an
 /// empty one costs a single test.
 #[derive(Clone, Debug)]

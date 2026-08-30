@@ -130,7 +130,7 @@ impl Game for Crowd {
         }
         let (lo, hi) = (self.lo, self.hi);
         let (vx, vy) = (&mut self.vx, &mut self.vy);
-        let (xs, ys, _) = w.positions_mut();
+        let (xs, ys, _, _) = w.positions_mut();
         for i in 0..xs.len() {
             let nx = xs[i].raw() + vx[i];
             if nx < lo || nx > hi {

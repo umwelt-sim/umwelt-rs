@@ -36,6 +36,9 @@ pub(crate) const KIND_STATE: u8 = 6;
 pub(crate) const KIND_MESSAGE: u8 = 7;
 pub(crate) const KIND_REGION: u8 = 8;
 pub(crate) const KIND_MOVES: u8 = 9;
+pub(crate) const KIND_TELEPORT: u8 = 10;
+pub(crate) const KIND_TELEPORTED: u8 = 11;
+pub(crate) const KIND_TELEPORT_FAILED: u8 = 12;
 
 /// The largest body either end will frame on a stream.
 ///
@@ -125,6 +128,17 @@ pub enum FromClient {
     },
     /// The game's own, which umwelt does not read.
     Message(Vec<u8>),
+    /// Asks the edge to teleport an entity to another region. The handle stays
+    /// valid throughout — moves sent during the transition are held at the edge
+    /// and forwarded when the destination confirms.
+    Teleport {
+        /// Which entity.
+        handle: EntityHandle,
+        /// The destination region.
+        region: RegionId,
+        /// Where to put it in the destination.
+        position: Pos3,
+    },
 }
 
 impl FromClient {
@@ -166,6 +180,12 @@ impl FromClient {
             FromClient::Message(body) => {
                 out.push(KIND_MESSAGE);
                 out.extend_from_slice(body);
+            }
+            FromClient::Teleport { handle, region, position } => {
+                out.push(KIND_TELEPORT);
+                out.extend_from_slice(&handle.raw().to_le_bytes());
+                out.extend_from_slice(&region.raw().to_le_bytes());
+                put_pos(*position, out);
             }
         }
     }
@@ -214,6 +234,14 @@ impl FromClient {
                 Ok(FromClient::Despawn { handle })
             }
             KIND_MESSAGE => Ok(FromClient::Message(body.to_vec())),
+            KIND_TELEPORT => {
+                let mut c = Cursor::new(body, "client teleport");
+                let handle = EntityHandle::from_raw(c.u32()?);
+                let region = RegionId::from_raw(c.u32()?);
+                let position = get_pos(&mut c)?;
+                c.finish()?;
+                Ok(FromClient::Teleport { handle, region, position })
+            }
             got => Err(NetError::Unexpected { expected: "a client command", got }),
         }
     }
@@ -261,6 +289,22 @@ pub enum ToClient<'a> {
     },
     /// The game's own, which umwelt does not read.
     Message(&'a [u8]),
+    /// An entity arrived in its destination region. The handle is the same one
+    /// the client has always held. Preceded by a `Spawned` that carries the new
+    /// region and entity id.
+    Teleported {
+        /// The handle that asked.
+        handle: EntityHandle,
+        /// Where it ended up.
+        region: RegionId,
+    },
+    /// A teleport did not complete. The entity stays in its origin region.
+    TeleportFailed {
+        /// The handle that asked.
+        handle: EntityHandle,
+        /// The destination that was refused or unreachable.
+        region: RegionId,
+    },
 }
 
 impl ToClient<'_> {
@@ -304,6 +348,16 @@ impl ToClient<'_> {
             ToClient::Message(body) => {
                 out.push(KIND_MESSAGE);
                 out.extend_from_slice(body);
+            }
+            ToClient::Teleported { handle, region } => {
+                out.push(KIND_TELEPORTED);
+                out.extend_from_slice(&handle.raw().to_le_bytes());
+                out.extend_from_slice(&region.raw().to_le_bytes());
+            }
+            ToClient::TeleportFailed { handle, region } => {
+                out.push(KIND_TELEPORT_FAILED);
+                out.extend_from_slice(&handle.raw().to_le_bytes());
+                out.extend_from_slice(&region.raw().to_le_bytes());
             }
         }
     }
@@ -349,6 +403,20 @@ impl ToClient<'_> {
                 Ok(ToClient::State { handle, packet: &body[4..] })
             }
             KIND_MESSAGE => Ok(ToClient::Message(body)),
+            KIND_TELEPORTED => {
+                let mut c = Cursor::new(body, "teleported");
+                let handle = EntityHandle::from_raw(c.u32()?);
+                let region = RegionId::from_raw(c.u32()?);
+                c.finish()?;
+                Ok(ToClient::Teleported { handle, region })
+            }
+            KIND_TELEPORT_FAILED => {
+                let mut c = Cursor::new(body, "teleport failed");
+                let handle = EntityHandle::from_raw(c.u32()?);
+                let region = RegionId::from_raw(c.u32()?);
+                c.finish()?;
+                Ok(ToClient::TeleportFailed { handle, region })
+            }
             got => Err(NetError::Unexpected { expected: "an edge message", got }),
         }
     }
@@ -455,6 +523,11 @@ mod tests {
             FromClient::Despawn { handle: h(4_000_000_000) },
             FromClient::Message(b"the game's own".to_vec()),
             FromClient::Message(Vec::new()),
+            FromClient::Teleport {
+                handle: h(5),
+                region: RegionId::from_raw(42),
+                position: pos(),
+            },
         ]
     }
 
@@ -474,6 +547,14 @@ mod tests {
             ToClient::State { handle: h(7), packet: b"a packet" },
             ToClient::State { handle: h(7), packet: b"" },
             ToClient::Message(b"the game's own"),
+            ToClient::Teleported {
+                handle: h(5),
+                region: RegionId::from_raw(42),
+            },
+            ToClient::TeleportFailed {
+                handle: h(5),
+                region: RegionId::from_raw(42),
+            },
         ]
     }
 

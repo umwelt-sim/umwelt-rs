@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::game::EdgeGame;
+use crate::game::{EdgeGame, TeleportDecision};
 use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
 use crate::net::control::{self, EdgeHeartbeat};
 use crate::net::edge::handle::{
@@ -130,6 +130,7 @@ impl EdgeServer {
             client_ids: Mint::new(),
             entity_keys: Mint::new(),
             counters: Counters::default(),
+            teleport_state: Mutex::new(HashMap::new()),
         });
         // The handle exists before the game, and the game before the server, so
         // neither has to be constructed twice.
@@ -421,6 +422,73 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
         },
         FromClient::Message(body) => {
             shared.with_game(|game| game.message_received(client, &body))
+        }
+        FromClient::Teleport { handle, region: dest, position } => {
+            // Look up the entity this handle names. Each lock is taken and
+            // released separately — holding both at once risks deadlocking
+            // against the region reader, which takes them in the other order.
+            let Some(key) = key_of(shared, client, handle) else {
+                shared.count_refused();
+                return;
+            };
+            let (kind, from) = {
+                let entities = shared.entities();
+                let Some(entity) = entities.by_key.get(&key) else {
+                    shared.count_refused();
+                    return;
+                };
+                (entity.kind, entity.region)
+            };
+            if from == dest {
+                // Same region — a move, not a teleport.
+                shared.count_refused();
+                return;
+            }
+            // Ask the consumer's game whether to allow it.
+            let mut decision = TeleportDecision::Allow;
+            shared.with_game(|game| {
+                decision = game.teleporting(key, client, from, dest, position);
+            });
+            match decision {
+                TeleportDecision::Deny => {
+                    let _ = shared.post(
+                        client,
+                        ToClient::TeleportFailed { handle, region: dest },
+                    );
+                }
+                TeleportDecision::Allow | TeleportDecision::Carry(_) => {
+                    // Spawn in the destination. The new entity replaces the
+                    // old one: when the destination confirms, the handle is
+                    // remapped and the origin copy is despawned.
+                    let new_key = match shared.ask(
+                        Some(client), None, dest, position, kind,
+                    ) {
+                        Ok(k) => k,
+                        Err(_) => {
+                            let _ = shared.post(
+                                client,
+                                ToClient::TeleportFailed { handle, region: dest },
+                            );
+                            return;
+                        }
+                    };
+                    // Link the new entity to the old one.
+                    shared
+                        .entities()
+                        .by_key
+                        .get_mut(&new_key)
+                        .expect("just created")
+                        .replaces = Some(key);
+                    // Stash game state for delivery on arrival.
+                    if let TeleportDecision::Carry(state) = decision {
+                        shared
+                            .teleport_state
+                            .lock()
+                            .expect("not poisoned")
+                            .insert(new_key, state);
+                    }
+                }
+            }
         }
     }
 }

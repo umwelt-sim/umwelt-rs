@@ -24,7 +24,24 @@ use std::net::SocketAddr;
 use crate::entity::EntityId;
 use crate::id::{ClientId, EntityHandle, EntityKey, RegionId};
 use crate::packet::TickObservation;
+use crate::pos::Pos3;
 use crate::sim::Step;
+
+/// What the edge's game decides when a client asks to teleport.
+///
+/// Returned by [`EdgeGame::teleporting`]. The default is to allow with no
+/// carried state. A consumer that needs to transfer inventory, health, or any
+/// other game state serializes it into [`Carry`](Self::Carry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TeleportDecision {
+    /// Allow the teleport with no game state.
+    Allow,
+    /// Allow the teleport and carry these bytes to the destination. The
+    /// destination's [`EdgeGame::teleport_arrived`] receives them.
+    Carry(Vec<u8>),
+    /// Deny the request. The entity stays where it is and the client is told.
+    Deny,
+}
 
 /// The logic and rules for a durable, server-side game. The [`Game::step`]
 /// function is called once per tick (default is **20Hz**).
@@ -143,6 +160,37 @@ pub trait EdgeGame: Send + 'static {
     /// for departure isn't passed here.
     fn removed(&mut self, entity: EntityKey, client: Option<ClientId>) {}
 
+    /// A client asked to teleport an entity to another region. Return
+    /// [`TeleportDecision::Allow`] or [`TeleportDecision::Carry`] to proceed,
+    /// or [`TeleportDecision::Deny`] to refuse.
+    ///
+    /// `Carry` serializes game state — inventory, health, whatever the game
+    /// needs on the other side — as opaque bytes. The destination's
+    /// [`teleport_arrived`](Self::teleport_arrived) receives them.
+    fn teleporting(
+        &mut self,
+        entity: EntityKey,
+        client: ClientId,
+        from: RegionId,
+        to: RegionId,
+        at: Pos3,
+    ) -> TeleportDecision {
+        TeleportDecision::Allow
+    }
+
+    /// A teleported entity arrived in its destination region. `state` is what
+    /// [`teleporting`](Self::teleporting) packed into
+    /// [`TeleportDecision::Carry`], or empty if it returned `Allow`.
+    fn teleport_arrived(
+        &mut self,
+        entity: EntityKey,
+        client: ClientId,
+        from: RegionId,
+        to: RegionId,
+        state: &[u8],
+    ) {
+    }
+
     /// Opaque bytes in the relayed message body. Umwelt never reads
     /// or interprets these bytes.
     ///
@@ -250,6 +298,17 @@ pub trait ClientGame: Send + 'static {
         observation: &TickObservation<'_>,
     ) {
     }
+
+    /// An entity arrived in its destination region after a
+    /// [`teleport`](crate::ClientHandle::teleport). Same handle the client has
+    /// always held. [`spawned`](Self::spawned) fires first with the new region
+    /// and entity id, so the game has both when this arrives.
+    fn teleported(&mut self, handle: EntityHandle, region: RegionId) {}
+
+    /// A teleport did not complete — the destination was unreachable, the
+    /// spawn was refused, or the edge's game denied the request. The entity
+    /// stays in its origin region.
+    fn teleport_failed(&mut self, handle: EntityHandle, region: RegionId) {}
 
     /// The game's own bytes, which umwelt did not read.
     ///

@@ -98,6 +98,11 @@ pub(crate) struct Entity {
     /// sent under it in the meantime; an entity given back before the region
     /// answered at all is forgotten outright instead.
     pub(crate) doomed: bool,
+    /// The entity this one replaces, set when a teleport spawns the
+    /// destination copy. When this entity's `Presence::Added` arrives, the
+    /// handle is remapped from the old key to this one and the old entity is
+    /// despawned from its origin region.
+    pub(crate) replaces: Option<EntityKey>,
 }
 
 #[derive(Default)]
@@ -148,6 +153,10 @@ pub(crate) struct Shared {
     pub(crate) client_ids: Mint,
     pub(crate) entity_keys: Mint,
     pub(crate) counters: Counters,
+    /// Game state carried during a teleport, keyed by the destination entity's
+    /// key. Inserted when the teleport is initiated, consumed when the
+    /// destination's `Presence::Added` arrives.
+    pub(crate) teleport_state: Mutex<HashMap<EntityKey, Vec<u8>>>,
 }
 
 impl Shared {
@@ -328,6 +337,7 @@ impl Shared {
                 id: None,
                 pending: None,
                 doomed: false,
+                replaces: None,
             },
         );
         if let Some(client) = client {
@@ -610,28 +620,47 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
     match what {
         Presence::Added { entity, token } => {
             let key = EntityKey::from_raw(token);
-            let mut entities = shared.entities();
-            let Some(held) = entities.by_key.get_mut(&key) else {
-                // A token this edge never spent, or one whose entity it has
-                // already forgotten. Give the entity back rather than leaving
-                // it in a region nobody is managing.
-                drop(entities);
-                shared.tell_region(Outgoing::Despawn(region, entity));
-                return;
-            };
-            held.id = Some(entity);
-            let (client, handle, pending) =
-                (held.client, held.handle, held.pending.take());
-            entities.by_id.insert((region, entity), key);
-            drop(entities);
 
-            if let Some(to) = pending {
-                shared.queue_move(region, entity, to);
+            // Extract everything needed from the entity before releasing
+            // the lock on `entities`, so borrow-checker is happy.
+            let (client, handle, pending, replaces) = {
+                let mut entities = shared.entities();
+                let Some(held) = entities.by_key.get_mut(&key) else {
+                    // A token this edge never spent, or one whose entity it
+                    // has already forgotten. Give the entity back rather than
+                    // leaving it in a region nobody is managing.
+                    drop(entities);
+                    shared.tell_region(Outgoing::Despawn(region, entity));
+                    return;
+                };
+                held.id = Some(entity);
+                let out = (
+                    held.client,
+                    held.handle,
+                    held.pending.take(),
+                    held.replaces.take(),
+                );
+                entities.by_id.insert((region, entity), key);
+                out
+            };
+
+            if let Some(old_key) = replaces {
+                complete_teleport(
+                    shared, key, entity, region, client, pending, old_key,
+                );
+            } else {
+                // Normal spawn, not a teleport.
+                if let Some(to) = pending {
+                    shared.queue_move(region, entity, to);
+                }
+                if let (Some(client), Some(handle)) = (client, handle) {
+                    let _ = shared.post(
+                        client,
+                        ToClient::Spawned { handle, region, entity },
+                    );
+                }
+                shared.with_game(|game| game.spawned(key, client, region, entity));
             }
-            if let (Some(client), Some(handle)) = (client, handle) {
-                let _ = shared.post(client, ToClient::Spawned { handle, region, entity });
-            }
-            shared.with_game(|game| game.spawned(key, client, region, entity));
         }
         Presence::Removed { entity } => {
             let Some(key) = shared.entities().by_id.get(&(region, entity)).copied()
@@ -648,6 +677,109 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
             }
         }
     }
+}
+
+/// The second half of a teleport: the destination region reported the new
+/// entity. Remaps the client's handle from the old key to the new one,
+/// despawns the origin copy, and tells the client and the edge game.
+fn complete_teleport(
+    shared: &Arc<Shared>,
+    new_key: EntityKey,
+    new_entity: EntityId,
+    dest: RegionId,
+    client: Option<ClientId>,
+    pending: Option<Pos3>,
+    old_key: EntityKey,
+) {
+    // Read the old entity's details under the entities lock, then update
+    // both keys atomically.
+    let (handle, from_region, old_id, old_observed) = {
+        let mut entities = shared.entities();
+        let Some(old) = entities.by_key.get(&old_key) else {
+            // The old entity is already gone — the client disconnected or
+            // the entity was despawned while the teleport was in flight.
+            // Clean up the new one.
+            drop(entities);
+            shared.tell_region(Outgoing::Despawn(dest, new_entity));
+            shared.forget(new_key);
+            return;
+        };
+        let handle = old.handle;
+        let from_region = old.region;
+        let old_id = old.id;
+        let old_observed = old.kind.observes();
+
+        // Move the handle onto the new entity.
+        if let Some(handle) = handle {
+            entities
+                .by_key
+                .get_mut(&new_key)
+                .expect("just confirmed in on_presence")
+                .handle = Some(handle);
+        }
+        // Remove the old entity from by_id so the origin's
+        // Presence::Removed (which arrives later) finds nothing.
+        if let Some(old_id) = old_id {
+            entities.by_id.remove(&(from_region, old_id));
+        }
+        // Remove the old entity from by_key.
+        entities.by_key.remove(&old_key);
+        drop(entities);
+        (handle, from_region, old_id, old_observed)
+    };
+
+    // Update the client's handle mapping: handle → new_key, remove old_key.
+    if let (Some(client), Some(handle)) = (client, handle) {
+        let mut clients = shared.clients();
+        if let Some(held) = clients.get_mut(&client) {
+            held.handles.insert(handle, new_key);
+            held.keys.remove(&old_key);
+        }
+        drop(clients);
+    }
+
+    // Despawn the origin copy from its region.
+    if let Some(old_id) = old_id {
+        shared
+            .moves
+            .lock()
+            .expect("not poisoned")
+            .remove(&(from_region, old_id));
+        shared.tell_region(Outgoing::Despawn(from_region, old_id));
+    }
+
+    // Flush any pending position to the new entity.
+    if let Some(to) = pending {
+        shared.queue_move(dest, new_entity, to);
+    }
+
+    // Adjust observer count: the old entity is gone without going through
+    // `forget`, so we decrement here if it observed.
+    if old_observed {
+        shared.counters.observers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    // Tell the client: Spawned first (so it has the new entity id), then
+    // Teleported.
+    if let (Some(client), Some(handle)) = (client, handle) {
+        let _ =
+            shared.post(client, ToClient::Spawned { handle, region: dest, entity: new_entity });
+        let _ = shared.post(client, ToClient::Teleported { handle, region: dest });
+    }
+
+    // Notify the edge game.
+    let state = shared
+        .teleport_state
+        .lock()
+        .expect("not poisoned")
+        .remove(&new_key)
+        .unwrap_or_default();
+    shared.with_game(|game| {
+        game.spawned(new_key, client, dest, new_entity);
+        if let Some(client) = client {
+            game.teleport_arrived(new_key, client, from_region, dest, &state);
+        }
+    });
 }
 
 /// Fires `disconnected` once the last of a leaving client's entities is gone.

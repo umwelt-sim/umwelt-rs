@@ -33,7 +33,7 @@ pub mod internals;
 pub use config::{ConfigError, WorldConfig, WorldConfigBuilder};
 pub use entity::{EntityId, EntityKind, Live, LiveIter, LiveSet};
 pub use fixed::{DistSq, Fixed};
-pub use game::{ClientGame, EdgeGame, Game};
+pub use game::{ClientGame, EdgeGame, Game, TeleportDecision};
 pub use id::{ClientId, EntityHandle, EntityKey, RegionId};
 pub use net::{
     ClientHandle, EdgeClient, EdgeHandle, EdgeServer, NetError, ProtocolVersion,

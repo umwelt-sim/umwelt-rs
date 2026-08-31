@@ -1,8 +1,9 @@
 //! A game client's side of the link.
 //!
 //! [`EdgeClient`] is what a game developer holds, and [`ClientHandle`] is what
-//! it sends through. A game asks for entities, moves them, moves them between
-//! regions, gives them back, and sends whatever its own protocol carries; what
+//! it sends through. A game asks for entities, moves them, teleports them
+//! between regions, gives them back, and sends whatever its own protocol
+//! carries; what
 //! comes back reaches a [`ClientGame`].
 //!
 //! For the commands umwelt owns, which one rides a reliable stream and which
@@ -61,33 +62,27 @@ struct Shared {
 /// One entity this client is holding.
 #[derive(Clone, Copy, Debug)]
 struct Held {
-    /// What it is, kept so a migration can ask for the same thing elsewhere.
-    kind: EntityKind,
     /// Where the edge put it, once it has said. Used only to pick a codec.
     region: Option<RegionId>,
     /// Whether a move has been sent for it yet. The first goes on the ordered
     /// stream, behind the spawn that named the handle, where it cannot overtake
     /// it; the rest ride datagrams.
     walked: bool,
-    /// The handle this one is replacing, if [`ClientHandle::migrate`] asked for
-    /// it. Given back the moment this one exists.
-    replacing: Option<EntityHandle>,
 }
 
 impl Shared {
-    /// Asks for an entity, optionally in place of one this client holds.
+    /// Asks for an entity.
     fn ask(
         &self,
         region: RegionId,
         at: Pos3,
         kind: EntityKind,
-        replacing: Option<EntityHandle>,
     ) -> Result<EntityHandle, NetError> {
         let handle = EntityHandle::from_raw(self.handles.fetch_add(1, Ordering::Relaxed));
         self.live
             .lock()
             .expect("not poisoned")
-            .insert(handle, Held { kind, region: None, walked: false, replacing });
+            .insert(handle, Held { region: None, walked: false });
         reliable(self, &FromClient::Spawn { handle, region, position: at, kind })?;
         Ok(handle)
     }
@@ -261,45 +256,34 @@ impl ClientHandle {
         at: Pos3,
         kind: EntityKind,
     ) -> Result<EntityHandle, NetError> {
-        self.live()?.ask(region, at, kind, None)
+        self.live()?.ask(region, at, kind)
     }
 
-    /// Moves an entity to another region.
+    /// Teleports an entity to another region.
     ///
-    /// Asks the destination for it and gives the origin's copy back the moment
-    /// the destination has it. Spawn first, despawn second: ordered the other
-    /// way there is a window where the entity exists nowhere, and nothing
-    /// needs that window.
+    /// The handle stays valid throughout. Moves sent during the transition are
+    /// held at the edge and forwarded when the destination confirms.
     ///
-    /// Returns the handle it goes by from here on, valid at once — a move sent
-    /// under it is held until the region answers. The old handle stops working
-    /// when the move completes, and
-    /// [`ClientGame::removed`](crate::ClientGame::removed) fires for it.
+    /// The entity gets a new id in the destination, because ids are unique
+    /// within a region. The new id reaches
+    /// [`ClientGame::spawned`](crate::ClientGame::spawned), followed by
+    /// [`ClientGame::teleported`](crate::ClientGame::teleported). On failure,
+    /// [`ClientGame::teleport_failed`](crate::ClientGame::teleport_failed)
+    /// fires and the entity stays where it was.
     ///
-    /// The entity gets a new id, because ids are unique within a region and the
-    /// destination allocates its own. Anything a game keys by the old one is
-    /// rekeyed against what
-    /// [`ClientGame::spawned`](crate::ClientGame::spawned) reports for the
-    /// handle this returns.
-    ///
-    /// This is not offered to an *edge*: waiting for the destination there
-    /// would mean eating messages meant for the edge's own loop. Here the
-    /// receive loop belongs to this crate, so the wait costs nobody anything.
-    pub fn migrate(
+    /// The edge orchestrates the spawn-in-destination and despawn-from-origin
+    /// sequence. The client does not need to manage id swaps.
+    pub fn teleport(
         &self,
         handle: EntityHandle,
         to: RegionId,
         at: Pos3,
-    ) -> Result<EntityHandle, NetError> {
+    ) -> Result<(), NetError> {
         let shared = self.live()?;
-        let kind = shared
-            .live
-            .lock()
-            .expect("not poisoned")
-            .get(&handle)
-            .map(|held| held.kind)
-            .ok_or(NetError::Unknown("handle"))?;
-        shared.ask(to, at, kind, Some(handle))
+        if !shared.live.lock().expect("not poisoned").contains_key(&handle) {
+            return Err(NetError::Unknown("handle"));
+        }
+        reliable(&shared, &FromClient::Teleport { handle, region: to, position: at })
     }
 
     /// Sends a new absolute position.
@@ -484,17 +468,10 @@ fn deliver(shared: &Shared, body: &[u8]) {
     // Kept here so a state packet can be decoded without the wire having to
     // repeat the region on every one. The game is told it too, since it is the
     // only tier that sees more than one region at a time.
-    let mut replaced = None;
-    if let ToClient::Spawned { handle, region, .. } = message
-        && let Some(held) = shared.live.lock().expect("not poisoned").get_mut(&handle)
-    {
-        held.region = Some(region);
-        // The destination has it, so the origin's
-        // copy goes back, and only now.
-        replaced = held.replacing.take();
-    }
-    if let Some(old) = replaced {
-        shared.give_back(old);
+    if let ToClient::Spawned { handle, region, .. } = message {
+        if let Some(held) = shared.live.lock().expect("not poisoned").get_mut(&handle) {
+            held.region = Some(region);
+        }
     }
     shared.with_game(|game| match message {
         ToClient::Spawned { handle, region, entity } => {
@@ -503,6 +480,10 @@ fn deliver(shared: &Shared, body: &[u8]) {
         ToClient::Removed { handle } => {
             shared.live.lock().expect("not poisoned").remove(&handle);
             game.removed(handle)
+        }
+        ToClient::Teleported { handle, region } => game.teleported(handle, region),
+        ToClient::TeleportFailed { handle, region } => {
+            game.teleport_failed(handle, region)
         }
         ToClient::Message(body) => game.message_received(body),
         ToClient::Region(_) | ToClient::State { .. } => unreachable!("handled above"),

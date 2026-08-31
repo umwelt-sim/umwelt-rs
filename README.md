@@ -40,6 +40,47 @@ modern equipment should be able to reach much higher numbers.
 
 The size of a region and the cells within it is also configurable, so the `640 m across` number can change with region size.
 
+### How Observers Learn About the World
+
+A single packet carries ~98 entity updates, but a player can be surrounded by
+thousands of entities. The key is that the library builds a complete picture
+over successive ticks, not in a single burst.
+
+Each entity accumulates **drift**, the total distance it has moved since this
+player last heard about it. Every tick, the library scores every entity within
+view radius by `drift × distance_weight`, then fills one packet with the
+highest-scoring candidates. Once an entity's update is sent, its drift for that
+player resets to zero.
+
+The result is a natural refresh cycle:
+
+- **Nearby entities** carry high distance weight, so even a small amount of
+  drift wins them a slot. A neighbor walking past you refreshes almost every
+  tick.
+- **Distant entities** carry low distance weight and need to accumulate more
+  drift before they outscore something closer. They cycle through your updates
+  every few ticks instead of every tick.
+- **Stationary entities** stop accumulating drift entirely. Once the player has
+  been told about them, they cost zero bandwidth until they move again.
+
+The player's client keeps a **ghost table** of every entity it has been told
+about — up to 256 by default, far more than the ~98 that fit in one packet.
+Over a handful of ticks the client learns about the full nearby population.
+From then on, each packet refreshes the ones that have moved the most since
+last update, and the client holds the rest at their last-known positions.
+
+The ghost table size is set per simulation at construction and applies
+uniformly to every observer in the region. The default is 256; raise it for
+denser scenarios at the cost of more per-viewer CPU and memory. In extreme
+crowds where the ghost cap covers a smaller physical radius than the camera
+can see, the game client can tighten its camera, add environmental effects
+like fog or dust, or otherwise match its viewport to the awareness boundary
+so the cutoff never appears as a hard edge on screen.
+
+The visual effect is that nearby entities track smoothly, distant entities
+update in small jumps proportional to their distance, and the world feels
+populated well beyond what a single packet can carry.
+
 ## Architecture
 
 <p align="center">

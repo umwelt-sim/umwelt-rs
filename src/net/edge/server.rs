@@ -423,6 +423,20 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
         FromClient::Message(body) => {
             shared.with_game(|game| game.message_received(client, &body))
         }
+        FromClient::EntityMessage { handle, body } => {
+            let Some(key) = key_of(shared, client, handle) else {
+                shared.count_refused();
+                return;
+            };
+            let resolved = shared
+                .entities()
+                .by_key
+                .get(&key)
+                .and_then(|e| Some((e.region, e.id?)));
+            if let Some((region, id)) = resolved {
+                shared.tell_region(Outgoing::Message(region, id, body));
+            }
+        }
         FromClient::Teleport { handle, region: dest, position } => {
             // Look up the entity this handle names. Each lock is taken and
             // released separately — holding both at once risks deadlocking

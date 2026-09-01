@@ -353,14 +353,34 @@ impl ClientHandle {
         }
     }
 
-    /// The game's own bytes, reliable and ordered. umwelt does not read them.
+    /// The game's own bytes, delivered to
+    /// [`EdgeGame::message_received`](crate::EdgeGame::message_received).
+    /// Reliable and ordered. umwelt does not read them.
     pub fn send(&self, body: &[u8]) -> Result<(), NetError> {
         reliable(&*self.live()?, &FromClient::Message(body.to_vec()))
     }
 
     /// The game's own bytes on a datagram, for anything latest-only.
+    /// Delivered to
+    /// [`EdgeGame::message_received`](crate::EdgeGame::message_received).
     pub fn send_datagram(&self, body: &[u8]) -> Result<(), NetError> {
         datagram(&*self.live()?, &FromClient::Message(body.to_vec()))
+    }
+
+    /// The game's own bytes, addressed to the region an entity lives in.
+    ///
+    /// The edge resolves the handle and relays automatically. The message
+    /// arrives at [`Game::message_received`](crate::Game::message_received)
+    /// with the entity's id as the sender. Reliable and ordered.
+    pub fn entity_send(
+        &self,
+        handle: EntityHandle,
+        body: &[u8],
+    ) -> Result<(), NetError> {
+        reliable(
+            &*self.live()?,
+            &FromClient::EntityMessage { handle, body: body.to_vec() },
+        )
     }
 
     fn live(&self) -> Result<Arc<Shared>, NetError> {

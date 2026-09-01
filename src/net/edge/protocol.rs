@@ -39,6 +39,7 @@ pub(crate) const KIND_MOVES: u8 = 9;
 pub(crate) const KIND_TELEPORT: u8 = 10;
 pub(crate) const KIND_TELEPORTED: u8 = 11;
 pub(crate) const KIND_TELEPORT_FAILED: u8 = 12;
+pub(crate) const KIND_ENTITY_MESSAGE: u8 = 13;
 
 /// The largest body either end will frame on a stream.
 ///
@@ -126,8 +127,20 @@ pub enum FromClient {
         /// Which entity.
         handle: EntityHandle,
     },
-    /// The game's own, which umwelt does not read.
+    /// The game's own bytes, delivered to
+    /// [`EdgeGame::message_received`](crate::EdgeGame::message_received).
+    /// umwelt does not read them.
     Message(Vec<u8>),
+    /// The game's own bytes, addressed to the region an entity lives in.
+    /// The edge resolves the handle and relays automatically; the message
+    /// arrives at [`Game::message_received`](crate::Game::message_received)
+    /// with the entity's id as the sender.
+    EntityMessage {
+        /// Which entity this message is from.
+        handle: EntityHandle,
+        /// The game's own bytes.
+        body: Vec<u8>,
+    },
     /// Asks the edge to teleport an entity to another region. The handle stays
     /// valid throughout — moves sent during the transition are held at the edge
     /// and forwarded when the destination confirms.
@@ -179,6 +192,11 @@ impl FromClient {
             }
             FromClient::Message(body) => {
                 out.push(KIND_MESSAGE);
+                out.extend_from_slice(body);
+            }
+            FromClient::EntityMessage { handle, body } => {
+                out.push(KIND_ENTITY_MESSAGE);
+                out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(body);
             }
             FromClient::Teleport { handle, region, position } => {
@@ -233,6 +251,12 @@ impl FromClient {
                 Ok(FromClient::Despawn { handle })
             }
             KIND_MESSAGE => Ok(FromClient::Message(body.to_vec())),
+            KIND_ENTITY_MESSAGE => {
+                let mut c = Cursor::new(body, "client entity message");
+                let handle = EntityHandle::from_raw(c.u32()?);
+                let body = c.rest().to_vec();
+                Ok(FromClient::EntityMessage { handle, body })
+            }
             KIND_TELEPORT => {
                 let mut c = Cursor::new(body, "client teleport");
                 let handle = EntityHandle::from_raw(c.u32()?);
@@ -522,6 +546,11 @@ mod tests {
             FromClient::Despawn { handle: h(4_000_000_000) },
             FromClient::Message(b"the game's own".to_vec()),
             FromClient::Message(Vec::new()),
+            FromClient::EntityMessage {
+                handle: h(3),
+                body: b"plant lettuce".to_vec(),
+            },
+            FromClient::EntityMessage { handle: h(3), body: Vec::new() },
             FromClient::Teleport {
                 handle: h(5),
                 region: RegionId::from_raw(42),
@@ -580,8 +609,9 @@ mod tests {
         let mut buf = Vec::new();
         for m in up() {
             // A `Message` is bytes with no shape, so any prefix of one is a
-            // shorter valid message. Everything else has fields to run out of.
-            if matches!(m, FromClient::Message(_)) {
+            // shorter valid message. `EntityMessage` has a fixed handle before
+            // a variable tail, so the same applies past the handle.
+            if matches!(m, FromClient::Message(_) | FromClient::EntityMessage { .. }) {
                 continue;
             }
             m.encode(&mut buf);
@@ -598,7 +628,7 @@ mod tests {
     fn trailing_bytes_are_refused() {
         let mut buf = Vec::new();
         for m in up() {
-            if matches!(m, FromClient::Message(_)) {
+            if matches!(m, FromClient::Message(_) | FromClient::EntityMessage { .. }) {
                 continue;
             }
             m.encode(&mut buf);

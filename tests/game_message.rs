@@ -3,17 +3,18 @@
 //! **Requires a running `nats-server`.** Point `NATS_URL` elsewhere if the
 //! broker is not on the default port.
 //!
-//! What it establishes: a game client sends an opaque message, the edge's game
-//! forwards it to the region the sender's entity lives in, and the region's
-//! game receives it with the correct entity id and unmodified body.
+//! What it establishes: a game client calls `entity_send`, the edge
+//! automatically relays the message to the region, and the region's game
+//! receives it with the correct entity id and unmodified body. No custom
+//! `EdgeGame` code is needed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{EdgeHandle, EdgeSink, Edges, Inbound};
-use umwelt::{ClientGame, ClientHandle, ClientId, ClientLimits, EdgeClient, EdgeGame, EdgeServer};
-use umwelt::{EntityId, EntityKey, EntityKind, Flow, Game, Handoff, Overrun};
+use umwelt::net::{EdgeSink, Edges, Inbound};
+use umwelt::{ClientGame, ClientHandle, ClientLimits, EdgeClient, EdgeGame, EdgeServer};
+use umwelt::{EntityId, EntityKind, Flow, Game, Handoff, Overrun};
 use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
@@ -55,34 +56,10 @@ impl Game for Recorder {
     }
 }
 
-// -- edge game: forwards client messages to the region ----------------------
+// -- edge game: no custom forwarding needed ---------------------------------
 
-struct Forwarder {
-    handle: EdgeHandle,
-    /// The first entity this edge spawned for each client.
-    entities: Arc<Mutex<Vec<(ClientId, EntityKey)>>>,
-}
-
-impl EdgeGame for Forwarder {
-    fn spawned(
-        &mut self,
-        entity: EntityKey,
-        client: Option<ClientId>,
-        _region: RegionId,
-        _id: EntityId,
-    ) {
-        if let Some(client) = client {
-            self.entities.lock().expect("not poisoned").push((client, entity));
-        }
-    }
-
-    fn message_received(&mut self, client: ClientId, body: &[u8]) {
-        let entities = self.entities.lock().expect("not poisoned");
-        if let Some(&(_, key)) = entities.iter().find(|(c, _)| *c == client) {
-            let _ = self.handle.send_to_region(key, body);
-        }
-    }
-}
+struct NoOp;
+impl EdgeGame for NoOp {}
 
 // -- client game: does nothing, the sending side needs no callbacks ----------
 
@@ -231,13 +208,8 @@ fn a_game_message_travels_from_client_to_sim() {
     let quic = edge_endpoint(runtime.handle());
     let at = quic.local_addr().expect("bound");
 
-    let edge_entities: Arc<Mutex<Vec<(ClientId, EntityKey)>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let edge = EdgeServer::new(nats, runtime.handle().clone(), quic, |handle| Forwarder {
-        handle,
-        entities: Arc::clone(&edge_entities),
-    })
-    .expect("the edge starts");
+    let edge = EdgeServer::new(nats, runtime.handle().clone(), quic, |_handle| NoOp)
+        .expect("the edge starts");
 
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -275,24 +247,19 @@ fn a_game_message_travels_from_client_to_sim() {
                 .expect("opens a stream");
         let sending: ClientHandle = client.handle();
 
-        let _handle = sending
+        let handle = sending
             .spawn(region, Pos3::from_meters(200, 200, 0), EntityKind::observer(0))
             .expect("asks for an entity");
 
-        // Wait for the entity to be registered in the edge's forwarder.
-        wait_until("the edge to know the entity", &stop, || {
-            !edge_entities.lock().expect("not poisoned").is_empty()
-        });
-
-        // Wait for the entity to be claimed in the region, so drain_messages
-        // can validate edge ownership.
+        // Wait for the entity to be claimed in the region, so the edge can
+        // resolve the handle to a region + entity id.
         wait_until("the entity to be claimed in the region", &stop, || {
             edges.entity_count(umwelt::net::EdgeId::from_raw(0)) > 0
         });
 
-        // Send the message.
+        // Send the message via entity_send — the edge relays automatically.
         let payload = b"plant lettuce at 12,34";
-        sending.send(payload).expect("sends a game message");
+        sending.entity_send(handle, payload).expect("sends a game message");
 
         // Wait for it to arrive.
         wait_until("the message to arrive at the sim", &stop, || {

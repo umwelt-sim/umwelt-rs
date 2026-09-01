@@ -772,6 +772,15 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         Some(Pos3::new(self.xs[i], self.ys[i], self.zs[i]))
     }
 
+    /// The game-defined tag on a live entity, or `None` if it is not alive.
+    #[inline]
+    pub fn tag(&self, id: EntityId) -> Option<u16> {
+        if !self.live.contains(id) {
+            return None;
+        }
+        Some(self.tags[id.index()])
+    }
+
     /// Viewer slots ever allocated, registered or not.
     #[inline]
     pub fn viewer_slots(&self) -> usize {

@@ -158,7 +158,7 @@ impl FromClient {
                 out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(&region.raw().to_le_bytes());
                 put_pos(*position, out);
-                out.push(kind.as_u8());
+                kind.encode_wire(out);
             }
             FromClient::Move { handle, position } => {
                 out.push(KIND_MOVE);
@@ -200,8 +200,7 @@ impl FromClient {
                 let handle = EntityHandle::from_raw(c.u32()?);
                 let region = RegionId::from_raw(c.u32()?);
                 let position = get_pos(&mut c)?;
-                let kind = EntityKind::from_u8(c.u8()?)
-                    .ok_or(NetError::Malformed("client spawn kind"))?;
+                let kind = EntityKind::decode_wire(&mut c)?;
                 c.finish()?;
                 Ok(FromClient::Spawn { handle, region, position, kind })
             }
@@ -509,13 +508,13 @@ mod tests {
                 handle: h(7),
                 region: RegionId::from_raw(9),
                 position: pos(),
-                kind: EntityKind::Observer,
+                kind: EntityKind::observer(0),
             },
             FromClient::Spawn {
                 handle: h(0),
                 region: RegionId::from_raw(4_000_000_000),
                 position: pos(),
-                kind: EntityKind::Unattended,
+                kind: EntityKind::unattended(0),
             },
             FromClient::Move { handle: h(9), position: pos() },
             FromClient::Moves(vec![(h(1), pos()), (h(2), pos()), (h(3), pos())]),
@@ -648,10 +647,10 @@ mod tests {
             handle: h(1),
             region: RegionId::from_raw(1),
             position: pos(),
-            kind: EntityKind::Observer,
+            kind: EntityKind::observer(0),
         }
         .encode(&mut buf);
-        assert_eq!(buf.len(), 1 + 4 + 4 + POS_BYTES + 1, "a region and a kind byte");
+        assert_eq!(buf.len(), 1 + 4 + 4 + POS_BYTES + 3, "a region and a 3-byte kind");
         FromClient::Despawn { handle: h(1) }.encode(&mut buf);
         assert_eq!(buf.len(), 1 + 4);
     }

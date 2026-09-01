@@ -39,6 +39,8 @@ pub struct CellOccupants<'a> {
     pub ys: &'a [Fixed],
     /// Up, in the same order as `ids`.
     pub zs: &'a [Fixed],
+    /// Game-defined tag, in the same order as `ids`.
+    pub tags: &'a [u16],
     /// Index of `ids[0]` within the snapshot's entity arrays.
     base: u32,
 }
@@ -89,6 +91,7 @@ pub struct CellSnapshot {
     xs: Vec<Fixed>,
     ys: Vec<Fixed>,
     zs: Vec<Fixed>,
+    tags: Vec<u16>,
     /// Length `cells + 1`. Cell `c` occupies `starts[c]..starts[c + 1]`.
     starts: Vec<u32>,
     /// Write head per cell during an update. A field rather than a local so
@@ -109,6 +112,7 @@ pub struct CellSnapshot {
     scratch_xs: Vec<Fixed>,
     scratch_ys: Vec<Fixed>,
     scratch_zs: Vec<Fixed>,
+    scratch_tags: Vec<u16>,
     sub_cursor: Vec<u32>,
     /// Sub-cell visit order, nearest first, for every possible origin.
     /// `sub_order[o * buckets .. (o + 1) * buckets]` is the order from origin
@@ -131,6 +135,7 @@ pub struct SubCells<'a> {
     xs: &'a [Fixed],
     ys: &'a [Fixed],
     zs: &'a [Fixed],
+    tags: &'a [u16],
 }
 
 impl<'a> SubCells<'a> {
@@ -152,6 +157,7 @@ impl<'a> SubCells<'a> {
             xs: &self.xs[lo..hi],
             ys: &self.ys[lo..hi],
             zs: &self.zs[lo..hi],
+            tags: &self.tags[lo..hi],
             base: lo as u32,
         }
     }
@@ -167,6 +173,7 @@ impl<'a> SubCells<'a> {
             xs: &self.xs[lo..hi],
             ys: &self.ys[lo..hi],
             zs: &self.zs[lo..hi],
+            tags: &self.tags[lo..hi],
             base: lo as u32,
         }
     }
@@ -226,6 +233,7 @@ impl CellSnapshot {
             xs: Vec::new(),
             ys: Vec::new(),
             zs: Vec::new(),
+            tags: Vec::new(),
             starts: vec![0; cells + 1],
             cursor: vec![0; cells],
             cells,
@@ -238,6 +246,7 @@ impl CellSnapshot {
             scratch_xs: Vec::new(),
             scratch_ys: Vec::new(),
             scratch_zs: Vec::new(),
+            scratch_tags: Vec::new(),
             sub_cursor: vec![0; (sub_axis * sub_axis) as usize],
             sub_order: build_sub_order(sub_axis),
             cell_order: build_cell_order(cfg.cell_radius()),
@@ -311,6 +320,7 @@ impl CellSnapshot {
             xs: &self.xs,
             ys: &self.ys,
             zs: &self.zs,
+            tags: &self.tags,
         })
     }
 
@@ -357,6 +367,7 @@ impl CellSnapshot {
             xs: &self.xs[lo..hi],
             ys: &self.ys[lo..hi],
             zs: &self.zs[lo..hi],
+            tags: &self.tags[lo..hi],
             base: lo as u32,
         }
     }
@@ -373,6 +384,13 @@ impl CellSnapshot {
     #[inline]
     pub fn pos_at(&self, i: usize) -> Pos3 {
         Pos3::new(self.xs[i], self.ys[i], self.zs[i])
+    }
+
+    /// The game-defined tag at `i` in the snapshot's entity arrays, as yielded
+    /// by [`CellOccupants::snapshot_index`].
+    #[inline]
+    pub fn tag_at(&self, i: usize) -> u16 {
+        self.tags[i]
     }
 
     /// How many entities occupy one cell.
@@ -395,9 +413,17 @@ impl CellSnapshot {
     ///
     /// If the three slices differ in length, or if `live` covers fewer ids
     /// than the arrays hold.
-    pub fn update(&mut self, xs: &[Fixed], ys: &[Fixed], zs: &[Fixed], live: &LiveSet) {
+    pub fn update(
+        &mut self,
+        xs: &[Fixed],
+        ys: &[Fixed],
+        zs: &[Fixed],
+        tags: &[u16],
+        live: &LiveSet,
+    ) {
         assert_eq!(xs.len(), ys.len(), "position arrays must be parallel");
         assert_eq!(xs.len(), zs.len(), "position arrays must be parallel");
+        assert_eq!(xs.len(), tags.len(), "position and tag arrays must be parallel");
         assert!(
             live.id_space() >= xs.len(),
             "live set covers {} ids, position arrays hold {}",
@@ -412,10 +438,12 @@ impl CellSnapshot {
         self.xs.clear();
         self.ys.clear();
         self.zs.clear();
+        self.tags.clear();
         self.ids.resize(n, EntityId::from_raw(0));
         self.xs.resize(n, Fixed::ZERO);
         self.ys.resize(n, Fixed::ZERO);
         self.zs.resize(n, Fixed::ZERO);
+        self.tags.resize(n, 0);
 
         // Pass 1: tally into starts[c + 1], so the running total below produces
         // each cell's start offset with no shifting afterward.
@@ -451,6 +479,7 @@ impl CellSnapshot {
             self.xs[d] = xs[i];
             self.ys[d] = ys[i];
             self.zs[d] = zs[i];
+            self.tags[d] = tags[i];
         }
 
         self.rebuild_subdivisions();
@@ -512,6 +541,7 @@ impl CellSnapshot {
         self.scratch_xs.resize(n, Fixed::ZERO);
         self.scratch_ys.resize(n, Fixed::ZERO);
         self.scratch_zs.resize(n, Fixed::ZERO);
+        self.scratch_tags.resize(n, 0);
         self.sub_cursor.copy_from_slice(&self.sub_starts[base..base + buckets]);
         for i in lo..hi {
             let ox = (self.xs[i].raw() & cell_mask) >> sub_shift;
@@ -523,11 +553,13 @@ impl CellSnapshot {
             self.scratch_xs[d] = self.xs[i];
             self.scratch_ys[d] = self.ys[i];
             self.scratch_zs[d] = self.zs[i];
+            self.scratch_tags[d] = self.tags[i];
         }
         self.ids[lo..hi].copy_from_slice(&self.scratch_ids[..n]);
         self.xs[lo..hi].copy_from_slice(&self.scratch_xs[..n]);
         self.ys[lo..hi].copy_from_slice(&self.scratch_ys[..n]);
         self.zs[lo..hi].copy_from_slice(&self.scratch_zs[..n]);
+        self.tags[lo..hi].copy_from_slice(&self.scratch_tags[..n]);
     }
 }
 
@@ -586,11 +618,12 @@ mod tests {
         l
     }
 
-    fn axes(pts: &[Pos3]) -> (Vec<Fixed>, Vec<Fixed>, Vec<Fixed>) {
+    fn axes(pts: &[Pos3]) -> (Vec<Fixed>, Vec<Fixed>, Vec<Fixed>, Vec<u16>) {
         (
             pts.iter().map(|p| p.x).collect(),
             pts.iter().map(|p| p.y).collect(),
             pts.iter().map(|p| p.z).collect(),
+            vec![0u16; pts.len()],
         )
     }
 
@@ -613,10 +646,10 @@ mod tests {
             Pos3::from_meters(4095, 4095, 5),
             Pos3::from_meters(300, 700, 5),
         ];
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         for (i, p) in pts.iter().enumerate() {
             let cid = cfg.cell_id(cfg.cell_of(p.horizontal()));
@@ -632,10 +665,10 @@ mod tests {
     fn counts_sum_to_the_population() {
         let cfg = WorldConfig::default();
         let pts = scatter(2000, 0x1234_5678_9abc_def0);
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         let summed: usize =
             (0..snap.cell_count()).map(|c| snap.count(CellId::from_raw(c as u32))).sum();
@@ -647,10 +680,10 @@ mod tests {
     fn positions_travel_with_their_ids() {
         let cfg = WorldConfig::default();
         let pts = scatter(1000, 0xfeed_face_dead_beef);
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         for c in 0..snap.cell_count() {
             let cell = snap.entities_for_cell(CellId::from_raw(c as u32));
@@ -664,10 +697,10 @@ mod tests {
     fn cells_come_out_sorted_by_id() {
         let cfg = WorldConfig::default();
         let pts = scatter(4000, 0x0bad_c0de_0bad_c0de);
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         for c in 0..snap.cell_count() {
             let cell = snap.entities_for_cell(CellId::from_raw(c as u32));
@@ -682,10 +715,10 @@ mod tests {
     fn empty_cells_are_empty() {
         let cfg = WorldConfig::default();
         let pts = [Pos3::from_meters(10, 10, 0)];
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         let occupied = cfg.cell_id(cfg.cell_of(Pos2::from_meters(10, 10)));
         let mut empties = 0;
@@ -704,17 +737,17 @@ mod tests {
     fn rebuild_follows_movement() {
         let cfg = WorldConfig::default();
         let mut pts = vec![Pos3::from_meters(10, 10, 0)];
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         let before = cfg.cell_id(cfg.cell_of(Pos2::from_meters(10, 10)));
         assert_eq!(snap.count(before), 1);
 
         pts[0] = Pos3::from_meters(2000, 2000, 0);
-        let (xs, ys, zs) = axes(&pts);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        let (xs, ys, zs, tags) = axes(&pts);
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         let after = cfg.cell_id(cfg.cell_of(Pos2::from_meters(2000, 2000)));
         assert_ne!(before, after);
@@ -750,9 +783,9 @@ mod tests {
         axis: u32,
         threshold: u32,
     ) -> CellSnapshot {
-        let (xs, ys, zs) = axes(pts);
+        let (xs, ys, zs, tags) = axes(pts);
         let mut snap = CellSnapshot::with_subdivision(cfg, axis, threshold);
-        snap.update(&xs, &ys, &zs, &all_live(pts.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(pts.len()));
         snap
     }
 
@@ -1073,17 +1106,17 @@ mod tests {
             Pos3::from_meters(100, 100, 0),
             Pos3::from_meters(100, 100, 0),
         ];
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
         let cid = cfg.cell_id(cfg.cell_of(Pos2::from_meters(100, 100)));
 
         let mut live = all_live(3);
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &live);
+        snap.update(&xs, &ys, &zs, &tags, &live);
         assert_eq!(snap.count(cid), 3);
         assert_eq!(snap.len(), 3);
 
         live.remove(EntityId::from_raw(1));
-        snap.update(&xs, &ys, &zs, &live);
+        snap.update(&xs, &ys, &zs, &tags, &live);
 
         assert_eq!(snap.count(cid), 2, "the despawned entity is still in the cell");
         assert_eq!(snap.len(), 2);
@@ -1096,7 +1129,7 @@ mod tests {
         let cfg = WorldConfig::default();
         let pts: Vec<Pos3> =
             (0..64).map(|i| Pos3::from_meters(100 + i, 100, 0)).collect();
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut live = all_live(pts.len());
         for dead in [0u32, 5, 63] {
@@ -1104,7 +1137,7 @@ mod tests {
         }
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &live);
+        snap.update(&xs, &ys, &zs, &tags, &live);
 
         assert_eq!(snap.len(), 61);
         for c in 0..snap.cell_count() {
@@ -1126,10 +1159,10 @@ mod tests {
         let cfg = WorldConfig::default();
         let pts: Vec<Pos3> =
             (0..5000).map(|i| Pos3::from_meters(2048 + (i % 100), 2048, 0)).collect();
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
 
         let hot = cfg.cell_id(cfg.cell_of(Pos2::from_meters(2048, 2048)));
         assert_eq!(snap.count(hot), 5000);
@@ -1139,14 +1172,14 @@ mod tests {
     fn rebuild_stops_allocating_after_warmup() {
         let cfg = WorldConfig::default();
         let pts = scatter(3000, 0xabcd_ef01_2345_6789);
-        let (xs, ys, zs) = axes(&pts);
+        let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
         let settled = snap.ids.capacity();
 
         for _tick in 0..50 {
-            snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+            snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
         }
         assert_eq!(snap.ids.capacity(), settled);
     }

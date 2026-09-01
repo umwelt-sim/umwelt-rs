@@ -265,7 +265,7 @@ impl Inbound {
                             refuse(&mut out, &stats);
                             continue;
                         }
-                        let id = step.spawn(want.position);
+                        let id = step.spawn(want.position, want.kind.tag());
                         if self.edges.claim(edge, id).is_err() {
                             // The edge went away between sending and now.
                             step.despawn(id);

@@ -151,7 +151,7 @@ impl Shared {
 /// let avatar = sending.spawn(
 ///     RegionId::from_raw(7),
 ///     Pos3::from_meters(2048, 2048, 0),
-///     EntityKind::Observer,
+///     EntityKind::observer(0),
 /// )?;
 /// sending.move_entity(avatar, Pos3::from_meters(2049, 2048, 0))?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())

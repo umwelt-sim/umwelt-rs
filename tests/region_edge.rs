@@ -182,13 +182,13 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                 let mut asked: Vec<Spawn> = (0..OBSERVERS)
                     .map(|n| Spawn {
                         position: home(e, n),
-                        kind: EntityKind::Observer,
+                        kind: EntityKind::observer(0),
                         token: n as u64,
                     })
                     .collect();
                 asked.extend((0..UNATTENDED).map(|n| Spawn {
                     position: home(e, OBSERVERS + n),
-                    kind: EntityKind::Unattended,
+                    kind: EntityKind::unattended(0),
                     token: (OBSERVERS + n) as u64,
                 }));
                 link.spawn(region, &asked).expect("asks for its crowd");
@@ -261,7 +261,7 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                                 // A packet is named by the avatar it was built
                                 // for, and that avatar always sees itself: it is
                                 // at distance zero from itself.
-                                for (id, pos) in reader.updates() {
+                                for (id, pos, _tag) in reader.updates() {
                                     if id == entity
                                         && pos.x.floor_meters() > 100 + e as i32 * 40
                                     {

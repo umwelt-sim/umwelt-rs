@@ -197,9 +197,9 @@ impl ServerInfo {
 /// large spawn or move batch arrive as several messages rather than one.
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 
-/// Bytes one spawn request takes: three raw [`Fixed`](crate::Fixed) axes, what
-/// kind of thing is being spawned, and the caller's token.
-const SPAWN_BYTES: usize = 21;
+/// Bytes one spawn request takes: three raw [`Fixed`](crate::Fixed) axes, the
+/// role byte, the game-defined tag, and the caller's token.
+const SPAWN_BYTES: usize = 23;
 
 /// Bytes one move takes: an id, and three raw [`Fixed`](crate::Fixed) axes.
 ///
@@ -225,20 +225,23 @@ pub const MAX_MOVES_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / MOVE_BYTES;
 pub const MAX_DESPAWN_PER_MESSAGE: usize = (MAX_MESSAGE_BYTES - 5) / 4;
 
 impl EntityKind {
-    /// The byte that carries it.
-    #[inline]
-    pub const fn as_u8(self) -> u8 {
-        self as u8
+    /// Three bytes on the wire: role, then tag as little-endian u16.
+    pub(crate) fn encode_wire(self, out: &mut Vec<u8>) {
+        out.push(self.role());
+        out.extend_from_slice(&self.tag().to_le_bytes());
     }
 
-    /// From the byte, or `None` for one this version does not know.
-    pub const fn from_u8(raw: u8) -> Option<EntityKind> {
-        match raw {
-            0 => Some(EntityKind::Unattended),
-            1 => Some(EntityKind::Observer),
-            _ => None,
+    /// Reads three bytes: role, then tag as little-endian u16.
+    pub(crate) fn decode_wire(c: &mut crate::net::wire::Cursor<'_>) -> Result<EntityKind, NetError> {
+        let role = c.u8()?;
+        let tag = c.u16()?;
+        match role {
+            0 => Ok(EntityKind::unattended(tag)),
+            1 => Ok(EntityKind::observer(tag)),
+            _ => Err(NetError::Malformed("entity kind role")),
         }
     }
+
 }
 
 /// One entity an edge is asking for.
@@ -275,9 +278,9 @@ pub struct SpawnEntities {
 }
 
 impl SpawnEntities {
-    /// Every entity an observer, which is what a crowd of players is. Each is
-    /// tokened with its index in `positions`, which is enough to match up one
-    /// batch and no use across two.
+    /// Every entity an observer with tag 0, which is what a crowd of players
+    /// is. Each is tokened with its index in `positions`, which is enough to
+    /// match up one batch and no use across two.
     pub fn observers(positions: &[Pos3]) -> SpawnEntities {
         SpawnEntities {
             spawns: positions
@@ -285,15 +288,16 @@ impl SpawnEntities {
                 .enumerate()
                 .map(|(n, p)| Spawn {
                     position: *p,
-                    kind: EntityKind::Observer,
+                    kind: EntityKind::observer(0),
                     token: n as u64,
                 })
                 .collect(),
         }
     }
 
-    /// Every entity unattended, which is what a flight of projectiles or a
-    /// herd of wildlife is. Tokened like [`observers`](Self::observers).
+    /// Every entity unattended with tag 0, which is what a flight of
+    /// projectiles or a herd of wildlife is. Tokened like
+    /// [`observers`](Self::observers).
     pub fn unattended(positions: &[Pos3]) -> SpawnEntities {
         SpawnEntities {
             spawns: positions
@@ -301,7 +305,7 @@ impl SpawnEntities {
                 .enumerate()
                 .map(|(n, p)| Spawn {
                     position: *p,
-                    kind: EntityKind::Unattended,
+                    kind: EntityKind::unattended(0),
                     token: n as u64,
                 })
                 .collect(),
@@ -316,7 +320,7 @@ impl SpawnEntities {
             out.extend_from_slice(&s.position.x.raw().to_le_bytes());
             out.extend_from_slice(&s.position.y.raw().to_le_bytes());
             out.extend_from_slice(&s.position.z.raw().to_le_bytes());
-            out.push(s.kind.as_u8());
+            s.kind.encode_wire(out);
             out.extend_from_slice(&s.token.to_le_bytes());
         }
     }
@@ -334,8 +338,7 @@ impl SpawnEntities {
                 crate::Fixed::from_raw(c.i32()?),
                 crate::Fixed::from_raw(c.i32()?),
             );
-            let kind = EntityKind::from_u8(c.u8()?)
-                .ok_or(NetError::Malformed("spawn entity kind"))?;
+            let kind = EntityKind::decode_wire(&mut c)?;
             spawns.push(Spawn { position, kind, token: c.u64()? });
         }
         c.finish()?;
@@ -607,8 +610,8 @@ mod tests {
     fn a_spawn_request_round_trips() {
         let m = SpawnEntities {
             spawns: vec![
-                want(1, EntityKind::Observer, 0xDEAD_BEEF_CAFE_F00D),
-                want(4095, EntityKind::Unattended, 0),
+                want(1, EntityKind::observer(0), 0xDEAD_BEEF_CAFE_F00D),
+                want(4095, EntityKind::unattended(0), 0),
             ],
         };
         let mut buf = Vec::new();
@@ -624,24 +627,35 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_entity_kind_is_refused() {
+    fn an_unknown_entity_kind_role_is_refused() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 12]);
-        buf.push(9);
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 12]); // position
+        buf.push(9); // invalid role
+        buf.extend_from_slice(&0u16.to_le_bytes()); // tag
+        buf.extend_from_slice(&0u64.to_le_bytes()); // token
         assert!(matches!(
             SpawnEntities::decode(&buf),
-            Err(NetError::Malformed("spawn entity kind"))
+            Err(NetError::Malformed("entity kind role"))
         ));
     }
 
     #[test]
     fn every_entity_kind_round_trips() {
-        for kind in [EntityKind::Unattended, EntityKind::Observer] {
-            assert_eq!(EntityKind::from_u8(kind.as_u8()), Some(kind));
+        for kind in [
+            EntityKind::unattended(0),
+            EntityKind::observer(0),
+            EntityKind::unattended(42),
+            EntityKind::observer(65535),
+        ] {
+            let m = SpawnEntities {
+                spawns: vec![want(1, kind, 0)],
+            };
+            let mut buf = Vec::new();
+            m.encode(&mut buf);
+            let back = SpawnEntities::decode(&buf[1..]).expect("well formed");
+            assert_eq!(back.spawns[0].kind, kind);
         }
-        assert_eq!(EntityKind::from_u8(2), None);
     }
 
     #[test]
@@ -657,7 +671,7 @@ mod tests {
     #[test]
     fn a_full_spawn_request_fits_one_message() {
         let m = SpawnEntities {
-            spawns: vec![want(0, EntityKind::Observer, 7); MAX_SPAWN_PER_MESSAGE],
+            spawns: vec![want(0, EntityKind::observer(0), 7); MAX_SPAWN_PER_MESSAGE],
         };
         let mut buf = Vec::new();
         m.encode(&mut buf);

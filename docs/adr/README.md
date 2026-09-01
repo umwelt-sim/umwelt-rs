@@ -16,6 +16,7 @@ work lands. If a decision is reversed, a new record supersedes it and says so.
 | [0006](0006-the-edge-server.md) | The edge server | Accepted, not built |
 | [0007](0007-library-scheduled-heartbeats.md) | Library-scheduled heartbeats, on both tiers | Accepted, not built |
 | [0008](0008-first-class-inter-region-teleport.md) | First-class inter-region teleport | Proposed |
+| [0009](0009-entity-kind-carries-a-game-tag.md) | EntityKind carries a game-defined tag | Accepted |
 
 ## Format
 

@@ -48,6 +48,7 @@ struct Entities {
     xs: Vec<Fixed>,
     ys: Vec<Fixed>,
     zs: Vec<Fixed>,
+    tags: Vec<u16>,
     live: LiveSet,
 }
 
@@ -57,6 +58,7 @@ impl Entities {
             xs: Vec::with_capacity(n),
             ys: Vec::with_capacity(n),
             zs: Vec::with_capacity(n),
+            tags: Vec::with_capacity(n),
             live: LiveSet::with_capacity(n),
         }
     }
@@ -66,6 +68,7 @@ impl Entities {
         self.xs.push(p.x);
         self.ys.push(p.y);
         self.zs.push(p.z);
+        self.tags.push(0);
         self.live.insert(id);
     }
 }
@@ -126,7 +129,7 @@ fn hot_cell(
 
 fn snapshot_of(cfg: &WorldConfig, e: &Entities) -> CellSnapshot {
     let mut s = CellSnapshot::new(cfg);
-    s.update(&e.xs, &e.ys, &e.zs, &e.live);
+    s.update(&e.xs, &e.ys, &e.zs, &e.tags, &e.live);
     s
 }
 
@@ -398,6 +401,7 @@ fn bench_subdivision(c: &mut Criterion) {
                     black_box(&entities.xs),
                     black_box(&entities.ys),
                     black_box(&entities.zs),
+                    black_box(&entities.tags),
                     &entities.live,
                 )
             })

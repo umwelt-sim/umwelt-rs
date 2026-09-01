@@ -124,7 +124,7 @@ impl Game for Crowd {
     fn step(&mut self, w: &mut Step<'_>) {
         if !self.pending.is_empty() {
             for p in std::mem::take(&mut self.pending) {
-                w.spawn(p);
+                w.spawn(p, 0);
             }
             return;
         }

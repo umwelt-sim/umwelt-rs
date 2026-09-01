@@ -110,7 +110,7 @@ impl PacketWriter {
         updates: I,
     ) -> &[u8]
     where
-        I: IntoIterator<Item = (EntityId, Pos3)>,
+        I: IntoIterator<Item = (EntityId, Pos3, u16)>,
     {
         self.buf.clear();
         // Reserved, then rewritten once the counts are known.
@@ -121,8 +121,8 @@ impl PacketWriter {
         }
 
         let mut updated = 0usize;
-        for (id, pos) in updates {
-            self.codec.encode(id, pos, &mut self.buf);
+        for (id, pos, tag) in updates {
+            self.codec.encode(id, pos, tag, &mut self.buf);
             updated += 1;
         }
 
@@ -216,9 +216,9 @@ impl<'a> TickObservation<'a> {
         })
     }
 
-    /// Positions the client should adopt. An entity it does not hold is one it
-    /// is being told about for the first time.
-    pub fn updates(&self) -> impl Iterator<Item = (EntityId, Pos3)> + '_ {
+    /// Positions and tags the client should adopt. An entity it does not hold
+    /// is one it is being told about for the first time.
+    pub fn updates(&self) -> impl Iterator<Item = (EntityId, Pos3, u16)> + '_ {
         let base = self.header.despawns as usize * DESPAWN_BYTES;
         let stride = self.codec.record_bytes();
         (0..self.header.updates as usize).map(move |k| {
@@ -275,7 +275,7 @@ mod tests {
         let mut w = PacketWriter::new(c.clone(), 1200);
         let gone = [id(4), id(9)];
         let moved = vec![
-            (id(1), Pos3::from_meters(100, 200, 5)),
+            (id(1), Pos3::from_meters(100, 200, 5), 0u16),
             (
                 id(2),
                 Pos3::new(
@@ -283,8 +283,9 @@ mod tests {
                     Fixed::ZERO,
                     Fixed::from_meters(3),
                 ),
+                42,
             ),
-            (id(3), Pos3::from_meters(4095, 4095, 1023)),
+            (id(3), Pos3::from_meters(4095, 4095, 1023), 999),
         ];
 
         let bytes = w.build(77, 5, &gone, moved.clone());
@@ -302,7 +303,7 @@ mod tests {
     fn an_empty_payload_is_just_a_header() {
         let c = codec();
         let mut w = PacketWriter::new(c.clone(), 1200);
-        let bytes = w.build(1, 1, &[], std::iter::empty());
+        let bytes = w.build(1, 1, &[], std::iter::empty::<(EntityId, Pos3, u16)>());
         assert_eq!(bytes.len(), PacketHeader::BYTES);
         let r = TickObservation::new(&c, bytes).expect("well formed");
         assert_eq!(r.despawns().count(), 0);
@@ -314,28 +315,28 @@ mod tests {
         let c = codec();
         let mut w = PacketWriter::new(c.clone(), 1200);
         let gone: Vec<EntityId> = (0..5).map(id).collect();
-        let moved: Vec<(EntityId, Pos3)> =
-            (0..30).map(|k| (id(100 + k), Pos3::from_meters(k as i32, 0, 0))).collect();
-        assert_eq!(w.build(1, 1, &gone, moved).len(), 16 + 5 * 4 + 30 * 12);
+        let moved: Vec<(EntityId, Pos3, u16)> =
+            (0..30).map(|k| (id(100 + k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
+        // 16 header + 5 × 4 despawns + 30 × 14 records = 16 + 20 + 420 = 456
+        assert_eq!(w.build(1, 1, &gone, moved).len(), 16 + 5 * 4 + 30 * 14);
     }
 
     #[test]
     fn a_full_packet_of_records_fits_the_budget() {
-        // The arithmetic the design document quotes: 1200 - 16 = 1184, and
-        // 1184 / 12 = 98.
+        // 1200 - 16 = 1184, and 1184 / 14 = 84 with 8 bytes left over.
         let c = codec();
         let mut w = PacketWriter::new(c.clone(), 1200);
-        let moved: Vec<(EntityId, Pos3)> =
-            (0..98).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0))).collect();
-        assert_eq!(w.build(1, 1, &[], moved).len(), 1192);
-        assert!(w.build(1, 1, &[], Vec::new()).len() <= 1200);
+        let moved: Vec<(EntityId, Pos3, u16)> =
+            (0..84).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
+        assert_eq!(w.build(1, 1, &[], moved).len(), 16 + 84 * 14);
+        assert!(w.build(1, 1, &[], Vec::<(EntityId, Pos3, u16)>::new()).len() <= 1200);
     }
 
     #[test]
     fn a_truncated_payload_is_refused() {
         let c = codec();
         let mut w = PacketWriter::new(c.clone(), 1200);
-        let moved = vec![(id(1), Pos3::from_meters(1, 2, 3))];
+        let moved = vec![(id(1), Pos3::from_meters(1, 2, 3), 0u16)];
         let bytes = w.build(1, 1, &[id(9)], moved).to_vec();
         for cut in 1..bytes.len() {
             assert!(
@@ -349,8 +350,8 @@ mod tests {
     fn the_buffer_is_reused_across_payloads() {
         let c = codec();
         let mut w = PacketWriter::new(c.clone(), 1200);
-        let moved: Vec<(EntityId, Pos3)> =
-            (0..98).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0))).collect();
+        let moved: Vec<(EntityId, Pos3, u16)> =
+            (0..84).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
         w.build(1, 1, &[], moved.clone());
         let cap = w.buf.capacity();
         for tick in 2..200u32 {

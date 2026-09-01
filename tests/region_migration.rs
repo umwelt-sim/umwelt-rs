@@ -241,7 +241,7 @@ impl Edge {
                     return;
                 };
                 let forgot: Vec<EntityId> = reader.despawns().collect();
-                let seen: Vec<EntityId> = reader.updates().map(|(id, _)| id).collect();
+                let seen: Vec<EntityId> = reader.updates().map(|(id, _, _)| id).collect();
                 for id in forgot {
                     self.forgot.insert((region, entity, id));
                 }
@@ -330,26 +330,26 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         // The origin's population: a bystander who stays put, filler to push
         // the origin's ids past anything the destination will allocate, and the
         // traveler.
-        edge.ask(origin_id, ORIGIN_BYSTANDER, EntityKind::Observer, origin_home(0));
+        edge.ask(origin_id, ORIGIN_BYSTANDER, EntityKind::observer(0), origin_home(0));
         for k in 0..FILLER {
             edge.ask(
                 origin_id,
                 ORIGIN_FILLER + k,
-                EntityKind::Unattended,
+                EntityKind::unattended(0),
                 origin_home(1 + k),
             );
         }
         edge.ask(
             origin_id,
             ORIGIN_TRAVELER,
-            EntityKind::Observer,
+            EntityKind::observer(0),
             origin_home(1 + FILLER),
         );
         // And one bystander waiting in the destination.
         edge.ask(
             destination_id,
             DESTINATION_BYSTANDER,
-            EntityKind::Observer,
+            EntityKind::observer(0),
             destination_home(0),
         );
 
@@ -377,7 +377,7 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         edge.ask(
             destination_id,
             DESTINATION_TRAVELER,
-            EntityKind::Observer,
+            EntityKind::observer(0),
             destination_home(1),
         );
 

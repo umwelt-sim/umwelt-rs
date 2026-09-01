@@ -333,8 +333,9 @@ mod tests {
         let xs: Vec<_> = pts.iter().map(|p| p.x).collect();
         let ys: Vec<_> = pts.iter().map(|p| p.y).collect();
         let zs: Vec<_> = pts.iter().map(|p| p.z).collect();
+        let tags = vec![0u16; xs.len()];
         let mut snap = CellSnapshot::new(cfg);
-        snap.update(&xs, &ys, &zs, &all_live(xs.len()));
+        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
         snap
     }
 

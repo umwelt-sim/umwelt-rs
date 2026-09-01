@@ -69,6 +69,7 @@ pub struct Step<'a> {
     xs: &'a mut Vec<Fixed>,
     ys: &'a mut Vec<Fixed>,
     zs: &'a mut Vec<Fixed>,
+    tags: &'a mut Vec<u16>,
     live: &'a mut LiveSet,
     /// Ids despawned this tick, whoever asked. Recorded because a despawn the
     /// game performs is otherwise invisible to anything outside the game, and
@@ -184,15 +185,34 @@ impl Step<'_> {
         )
     }
 
-    /// Appends an entity. Slots are never reused, so the id is new.
-    pub fn spawn(&mut self, pos: Pos3) -> EntityId {
+    /// Appends an entity with a game-defined tag. Slots are never reused, so
+    /// the id is new.
+    pub fn spawn(&mut self, pos: Pos3, tag: u16) -> EntityId {
         debug_assert!(self.cfg.contains(pos), "spawned outside the region at {pos:?}");
         let id = EntityId::from_raw(self.xs.len() as u32);
         self.xs.push(pos.x);
         self.ys.push(pos.y);
         self.zs.push(pos.z);
+        self.tags.push(tag);
         self.live.insert(id);
         id
+    }
+
+    /// Overwrites the game-defined tag on a live entity. An id that is not
+    /// alive is ignored.
+    pub fn set_tag(&mut self, id: EntityId, tag: u16) {
+        if self.live.contains(id) {
+            self.tags[id.index()] = tag;
+        }
+    }
+
+    /// The game-defined tag on a live entity, or `None` if it is not alive.
+    #[inline]
+    pub fn tag(&self, id: EntityId) -> Option<u16> {
+        if !self.live.contains(id) {
+            return None;
+        }
+        Some(self.tags[id.index()])
     }
 
     /// Removes an entity from the snapshot. The slot is not reclaimed.
@@ -350,7 +370,8 @@ fn serve<S: PayloadSink>(
         despawns,
         selection.records().iter().map(|r| {
             let e = cands[r.index()];
-            (e.id, snap.pos_at(e.snapshot_index as usize))
+            let si = e.snapshot_index as usize;
+            (e.id, snap.pos_at(si), snap.tag_at(si))
         }),
     );
 
@@ -458,9 +479,9 @@ impl TickSpan {
 ///     fn step(&mut self, world: &mut Step<'_>) {
 ///         if !self.arrived {
 ///             self.arrived = true;
-///             self.watcher = Some(world.spawn(Pos3::from_meters(2048, 2048, 0)));
+///             self.watcher = Some(world.spawn(Pos3::from_meters(2048, 2048, 0), 0));
 ///             for n in 0..64 {
-///                 world.spawn(Pos3::from_meters(2048 + n, 2048, 0));
+///                 world.spawn(Pos3::from_meters(2048 + n, 2048, 0), 0);
 ///             }
 ///             return;
 ///         }
@@ -493,6 +514,7 @@ pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     xs: Vec<Fixed>,
     ys: Vec<Fixed>,
     zs: Vec<Fixed>,
+    tags: Vec<u16>,
     live: LiveSet,
     /// Cleared at the start of every tick and filled by [`Step::despawn`].
     despawned: Vec<EntityId>,
@@ -552,6 +574,7 @@ impl<G: Game> WorldSimulation<G, NullSink> {
             xs: Vec::new(),
             ys: Vec::new(),
             zs: Vec::new(),
+            tags: Vec::new(),
             live: LiveSet::new(),
             despawned: Vec::new(),
             odo: Odometer::new(),
@@ -589,6 +612,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             xs: self.xs,
             ys: self.ys,
             zs: self.zs,
+            tags: self.tags,
             live: self.live,
             despawned: self.despawned,
             odo: self.odo,
@@ -828,6 +852,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
                 xs: &mut self.xs,
                 ys: &mut self.ys,
                 zs: &mut self.zs,
+                tags: &mut self.tags,
                 live: &mut self.live,
                 despawned: &mut self.despawned,
                 cfg: &self.cfg,
@@ -837,7 +862,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         }
 
         self.odo.accumulate(&self.xs, &self.ys, &self.zs, &self.live);
-        self.snap.update(&self.xs, &self.ys, &self.zs, &self.live);
+        self.snap.update(&self.xs, &self.ys, &self.zs, &self.tags, &self.live);
 
         let frame = Frame {
             sink: &self.sink,
@@ -955,6 +980,7 @@ mod tests {
             xs: &mut sim.xs,
             ys: &mut sim.ys,
             zs: &mut sim.zs,
+            tags: &mut sim.tags,
             live: &mut sim.live,
             despawned: &mut sim.despawned,
             cfg: &sim.cfg,
@@ -964,7 +990,7 @@ mod tests {
         for k in 0..n as i32 {
             let x = 2048 + (k % side) * 4;
             let y = 2048 + (k / side) * 4;
-            ids.push(step.spawn(Pos3::from_meters(x, y, 0)));
+            ids.push(step.spawn(Pos3::from_meters(x, y, 0), 0));
         }
         ids
     }
@@ -1139,12 +1165,13 @@ mod tests {
             xs: &mut s.xs,
             ys: &mut s.ys,
             zs: &mut s.zs,
+            tags: &mut s.tags,
             live: &mut s.live,
             despawned: &mut s.despawned,
             cfg: &s.cfg,
             tick: 0,
         };
-        step.spawn(Pos3::from_meters(2050, 2050, 0));
+        step.spawn(Pos3::from_meters(2050, 2050, 0), 0);
 
         let stats = s.tick();
         assert_eq!(stats.records, 1, "a newcomer is a status change");
@@ -1172,7 +1199,7 @@ mod tests {
                 .iter()
                 .map(|k| o.candidates.as_slice()[k.index()].id)
                 .collect();
-            let got: Vec<EntityId> = r.updates().map(|(id, _)| id).collect();
+            let got: Vec<EntityId> = r.updates().map(|(id, _, _)| id).collect();
             assert_eq!(got, want, "a payload must carry the selection, in order");
             assert_eq!(r.header().updates as usize, want.len());
             assert!(!want.is_empty());
@@ -1211,14 +1238,14 @@ mod tests {
         }
 
         let codec = RecordCodec::new(&WorldConfig::default());
-        let seen: Mutex<Vec<(EntityId, Pos3)>> = Mutex::new(Vec::new());
+        let seen: Mutex<Vec<(EntityId, Pos3, u16)>> = Mutex::new(Vec::new());
         s.tick_with(&|o: Outbound<'_>| {
             let r = TickObservation::new(&codec, o.bytes).expect("well formed");
             *seen.lock().unwrap() = r.updates().collect();
         });
         let seen = seen.into_inner().unwrap();
         assert!(!seen.is_empty());
-        for (id, pos) in seen {
+        for (id, pos, _tag) in seen {
             assert_eq!(Some(pos), s.position(id), "the wire is lossless at this config");
         }
     }
@@ -1470,6 +1497,7 @@ mod tests {
             xs: &mut sim.xs,
             ys: &mut sim.ys,
             zs: &mut sim.zs,
+            tags: &mut sim.tags,
             live: &mut sim.live,
             despawned: &mut sim.despawned,
             cfg: &sim.cfg,
@@ -1482,7 +1510,7 @@ mod tests {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
         let at = Pos3::from_meters(2048, 2049, 3);
-        let id = step.spawn(at);
+        let id = step.spawn(at, 0);
         assert_eq!(step.position(id), Some(at));
         assert!(step.contains(id));
     }
@@ -1491,7 +1519,7 @@ mod tests {
     fn a_despawned_entity_has_no_position() {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
-        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0), 0);
         step.despawn(id);
         assert_eq!(step.position(id), None);
         assert!(!step.contains(id));
@@ -1508,7 +1536,7 @@ mod tests {
     fn move_to_puts_an_entity_where_it_was_told() {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
-        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0), 0);
         let to = Pos3::from_meters(2100, 2000, 12);
         step.move_to(id, to);
         assert_eq!(step.position(id), Some(to));
@@ -1518,8 +1546,8 @@ mod tests {
     fn move_to_leaves_a_despawned_entity_alone() {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
-        let gone = step.spawn(Pos3::from_meters(2048, 2048, 0));
-        let neighbor = step.spawn(Pos3::from_meters(2049, 2048, 0));
+        let gone = step.spawn(Pos3::from_meters(2048, 2048, 0), 0);
+        let neighbor = step.spawn(Pos3::from_meters(2049, 2048, 0), 0);
         step.despawn(gone);
         step.move_to(gone, Pos3::from_meters(2100, 2100, 0));
         assert_eq!(step.position(gone), None);
@@ -1530,7 +1558,7 @@ mod tests {
     fn translate_offsets_from_where_the_entity_is() {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
-        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0), 0);
         step.translate(
             id,
             Fixed::from_millimeters(0, 250),
@@ -1551,7 +1579,7 @@ mod tests {
     fn translate_accumulates_across_calls() {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
-        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0), 0);
         for _ in 0..4 {
             step.translate(id, Fixed::from_millimeters(0, 250), Fixed::ZERO, Fixed::ZERO);
         }
@@ -1562,7 +1590,7 @@ mod tests {
     fn translate_leaves_a_despawned_entity_alone() {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
-        let id = step.spawn(Pos3::from_meters(2048, 2048, 0));
+        let id = step.spawn(Pos3::from_meters(2048, 2048, 0), 0);
         step.despawn(id);
         step.translate(id, Fixed::from_meters(1), Fixed::ZERO, Fixed::ZERO);
         assert_eq!(step.position(id), None);
@@ -1573,7 +1601,7 @@ mod tests {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
         let ids: Vec<EntityId> =
-            (0..3).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0))).collect();
+            (0..3).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0), 0)).collect();
         step.despawn(ids[1]);
 
         // The point of handing it back: readable while the slices are held.
@@ -1591,7 +1619,7 @@ mod tests {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
         let ids: Vec<EntityId> =
-            (0..3).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0))).collect();
+            (0..3).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0), 0)).collect();
         step.despawn(ids[1]);
         assert_eq!(step.id_space(), 3, "a despawned slot still has to be covered");
         assert_eq!(step.entity_count(), 2);
@@ -1602,7 +1630,7 @@ mod tests {
         let mut s = sim(Walk::still());
         let mut step = step_over(&mut s);
         let ids: Vec<EntityId> =
-            (0..5).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0))).collect();
+            (0..5).map(|k| step.spawn(Pos3::from_meters(2048 + k, 2048, 0), 0)).collect();
         step.despawn(ids[1]);
         step.despawn(ids[3]);
         assert_eq!(step.entities().collect::<Vec<_>>(), vec![ids[0], ids[2], ids[4]]);

@@ -42,46 +42,70 @@ impl fmt::Display for EntityId {
     }
 }
 
-/// What is behind an entity, which decides whether it observes.
+/// What an entity is and whether it observes, plus a game-defined tag that
+/// travels in every observation record.
 ///
-/// An entity has a position and can be seen by whoever is near it. Some
-/// entities are viewers, in which case they are "subscribers" to entity 
-/// position updates within their subscribed range.
-/// 
-/// Measured at a constant 8,192 entities, a viewer costs about 1.6 µs a tick against
-/// 0.4 ms of work paid per entity regardless of who observes.
+/// The role decides whether a viewer is registered: an observer gets one, an
+/// unattended entity does not. The tag is a `u16` the game defines and umwelt
+/// does not interpret — a client maps it to an asset, a model, a sprite index,
+/// or whatever its rendering needs.
+///
+/// Measured at a constant 8,192 entities, a viewer costs about 1.6 µs a tick
+/// against 0.4 ms of work paid per entity regardless of who observes.
 ///
 /// Static scenery has no kind here, because it is never spawned. A rock that
-/// never moves is already in the client's content package and doesn't need to be
-/// transmitted or managed in the server's simulation.
+/// never moves is already in the client's content package and doesn't need to
+/// be transmitted or managed in the server's simulation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum EntityKind {
-    /// An entity that doesn't care about its environment. Simulated and replicated 
-    /// to whoever can see it, observes nothing itself, and no viewer is registered. Projectiles,
-    /// wildlife, NPCs, a vehicle with no driver, a developer hard at work on a side project
-    /// in a dark corner.
-    #[default]
-    Unattended = 0,
-    /// A game client backs this entity. The region registers a viewer watching it,
-    /// so it is sent a budgeted approximation of what it can see. Observers receive
-    /// entity position and spawn updates within range.
-    Observer = 1,
+pub struct EntityKind {
+    role: u8,
+    tag: u16,
 }
 
+/// The observer/unattended distinction, without the tag.
+const ROLE_UNATTENDED: u8 = 0;
+const ROLE_OBSERVER: u8 = 1;
+
 impl EntityKind {
+    /// An unattended entity carrying a game-defined tag. No viewer is
+    /// registered. Projectiles, wildlife, NPCs, resource nodes.
+    #[inline]
+    pub const fn unattended(tag: u16) -> EntityKind {
+        EntityKind { role: ROLE_UNATTENDED, tag }
+    }
+
+    /// An observer carrying a game-defined tag. A viewer is registered, so it
+    /// receives a budgeted approximation of what it can see.
+    #[inline]
+    pub const fn observer(tag: u16) -> EntityKind {
+        EntityKind { role: ROLE_OBSERVER, tag }
+    }
+
     /// Whether a viewer is registered for it.
     #[inline]
     pub const fn observes(self) -> bool {
-        matches!(self, EntityKind::Observer)
+        self.role == ROLE_OBSERVER
+    }
+
+    /// The game-defined tag. Umwelt does not interpret it.
+    #[inline]
+    pub const fn tag(self) -> u16 {
+        self.tag
+    }
+
+    /// The role byte: 0 for unattended, 1 for observer.
+    #[inline]
+    pub(crate) const fn role(self) -> u8 {
+        self.role
     }
 }
 
 impl fmt::Display for EntityKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EntityKind::Unattended => write!(f, "unattended"),
-            EntityKind::Observer => write!(f, "observer"),
+        match self.role {
+            ROLE_UNATTENDED => write!(f, "unattended({})", self.tag),
+            ROLE_OBSERVER => write!(f, "observer({})", self.tag),
+            _ => write!(f, "unknown({})", self.tag),
         }
     }
 }

@@ -380,7 +380,7 @@ fn a_client_teleports_an_entity_between_regions() {
 
         // Spawn an entity in the origin.
         let avatar = sending
-            .spawn(origin_id, Pos3::from_meters(200, 200, 0), EntityKind::Observer)
+            .spawn(origin_id, Pos3::from_meters(200, 200, 0), EntityKind::observer(0))
             .expect("asks for an entity");
 
         // Wait for the origin to confirm.

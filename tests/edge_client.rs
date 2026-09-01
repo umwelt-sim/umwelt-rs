@@ -103,7 +103,7 @@ impl ClientGame for Watcher {
         // Already decoded: no codec here, and no world the region was built
         // with. A packet reaching this client is one built for an avatar it
         // owns, and an avatar always sees itself.
-        for (_, pos) in observation.updates() {
+        for (_, pos, _) in observation.updates() {
             if pos.x.floor_meters() > 200 {
                 self.confirmed.fetch_add(1, Ordering::Relaxed);
             }
@@ -341,7 +341,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
         let handles: Vec<EntityHandle> = (0..WANTED)
             .map(|n| {
                 sending
-                    .spawn(region, home(n), EntityKind::Observer)
+                    .spawn(region, home(n), EntityKind::observer(0))
                     .expect("asks for an entity")
             })
             .collect();

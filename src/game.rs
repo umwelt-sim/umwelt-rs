@@ -81,6 +81,20 @@ pub trait Game {
     /// [`Step`] struct provides appropriate access to this buffer.
     ///
     fn step(&mut self, world: &mut Step<'_>);
+
+    /// Opaque bytes from a game client, relayed through an edge.
+    ///
+    /// Called once per message, before [`step`](Self::step), with the entity
+    /// the sender controls. The game stores what it needs and acts on it
+    /// during the next `step`. `body` is whatever the client put into
+    /// [`ClientHandle::send`](crate::ClientHandle::send); umwelt does not
+    /// read or interpret it.
+    ///
+    /// `from` is the sender's entity in this region. An edge that does not
+    /// manage the entity is refused before this is called, so the identity is
+    /// trustworthy.
+    #[allow(unused_variables)]
+    fn message_received(&mut self, from: EntityId, body: &[u8]) {}
 }
 
 /// Trait that must be implemented by edges. By default, game developers do

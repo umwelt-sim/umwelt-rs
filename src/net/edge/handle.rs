@@ -129,6 +129,7 @@ pub(crate) enum Transport {
 pub(crate) enum Outgoing {
     Spawn(RegionId, Spawn),
     Despawn(RegionId, EntityId),
+    Message(RegionId, EntityId, Vec<u8>),
 }
 
 /// Everything an edge server holds, shared with every handle to it.
@@ -551,6 +552,17 @@ impl EdgeHandle {
     pub fn send_to_entity(&self, entity: EntityKey, body: &[u8]) -> Result<(), NetError> {
         let client = self.client_of(entity).ok_or(NetError::Unknown("entity"))?;
         self.send(client, body)
+    }
+
+    /// Forwards a game message to the region an entity lives in.
+    ///
+    /// The region delivers it to [`Game::message`](crate::Game::message)
+    /// with the entity's id as the sender. The body is the game's own
+    /// bytes, at most 4091 bytes.
+    pub fn send_to_region(&self, entity: EntityKey, body: &[u8]) -> Result<(), NetError> {
+        let (region, id) = self.entity_id(entity).ok_or(NetError::Unknown("entity"))?;
+        self.live()?.tell_region(Outgoing::Message(region, id, body.to_vec()));
+        Ok(())
     }
 
     /// Closes a client's connection. Its entities are swept as if it had gone

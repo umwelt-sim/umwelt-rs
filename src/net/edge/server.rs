@@ -557,12 +557,16 @@ fn publish_to_regions(
         };
         let mut spawns: HashMap<RegionId, Vec<Spawn>> = HashMap::new();
         let mut gone: HashMap<RegionId, Vec<crate::EntityId>> = HashMap::new();
+        let mut messages: Vec<(RegionId, crate::EntityId, Vec<u8>)> = Vec::new();
         for one in first.into_iter().chain(queue.try_iter()) {
             match one {
                 Outgoing::Spawn(region, spawn) => {
                     spawns.entry(region).or_default().push(spawn)
                 }
                 Outgoing::Despawn(region, id) => gone.entry(region).or_default().push(id),
+                Outgoing::Message(region, entity, body) => {
+                    messages.push((region, entity, body))
+                }
             }
         }
         // Spawns first: a despawn in the same batch can only name an entity
@@ -573,6 +577,9 @@ fn publish_to_regions(
         }
         for (region, batch) in gone {
             let _ = shared.link.despawn(region, &batch);
+        }
+        for (region, entity, body) in messages {
+            let _ = shared.link.game_message(region, entity, &body);
         }
         shared.flush_moves();
     }

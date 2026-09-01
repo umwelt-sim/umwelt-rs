@@ -28,9 +28,9 @@ use crate::id::RegionId;
 use crate::net::error::NetError;
 use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{
-    DespawnEntities, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE, MAX_MOVES_PER_MESSAGE,
-    MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION, Presence, ServerInfo, Spawn,
-    SpawnEntities,
+    DespawnEntities, GameMessage, KIND_KEEPALIVE, MAX_DESPAWN_PER_MESSAGE,
+    MAX_GAME_MESSAGE_BODY, MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities,
+    PROTOCOL_VERSION, Presence, ServerInfo, Spawn, SpawnEntities,
 };
 use crate::net::region::subjects;
 use crate::net::version::ServerVersion;
@@ -202,6 +202,24 @@ impl RegionClient {
                 body
             }),
         )
+    }
+
+    /// Forwards a game message to the region. The entity is the sender's
+    /// entity in this region.
+    ///
+    /// The body is the game's own bytes, at most [`MAX_GAME_MESSAGE_BODY`].
+    pub fn game_message(
+        &self,
+        region: RegionId,
+        entity: EntityId,
+        body: &[u8],
+    ) -> Result<(), NetError> {
+        if body.len() > MAX_GAME_MESSAGE_BODY {
+            return Err(NetError::Malformed("game message body too large"));
+        }
+        let mut buf = Vec::new();
+        GameMessage { entity, body: body.to_vec() }.encode(&mut buf);
+        self.send_all(region, std::iter::once(buf))
     }
 
     /// Says nothing except that this edge is still here.

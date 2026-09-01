@@ -46,8 +46,8 @@ use crate::net::control::RegionLoad;
 use crate::net::error::NetError;
 use crate::net::region::edges::{EdgeId, EdgeStats, Edges};
 use crate::net::region::protocol::{
-    DespawnEntities, KIND_DESPAWN_ENTITIES, KIND_KEEPALIVE, KIND_MOVE_ENTITIES,
-    KIND_SPAWN_ENTITIES, MoveEntities, Presence, Spawn, SpawnEntities,
+    DespawnEntities, GameMessage, KIND_DESPAWN_ENTITIES, KIND_GAME_MESSAGE, KIND_KEEPALIVE,
+    KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MoveEntities, Presence, Spawn, SpawnEntities,
 };
 use crate::net::region::subjects;
 use crate::pos::Pos3;
@@ -117,6 +117,10 @@ struct Load {
 pub struct Inbound {
     edges: Arc<Edges>,
     queue: Mutex<Vec<Command>>,
+    /// Game messages waiting to be delivered via [`Game::message`]. Separate
+    /// from the command queue because they are delivered before
+    /// [`Game::step`], not inside [`apply`](Self::apply).
+    messages: Mutex<Vec<(EdgeId, EntityId, Vec<u8>)>>,
     /// Spawned during the last apply, waiting to be answered for. An observer
     /// also gets a viewer; an unattended entity is only reported back.
     fresh: Mutex<Vec<(EdgeId, EntityId, EntityKind, u64)>>,
@@ -138,6 +142,7 @@ impl Inbound {
         Inbound {
             edges,
             queue: Mutex::new(Vec::new()),
+            messages: Mutex::new(Vec::new()),
             fresh: Mutex::new(Vec::new()),
             gone: Mutex::new(Vec::new()),
             watchers: Mutex::new(Vec::new()),
@@ -177,6 +182,28 @@ impl Inbound {
         self.refused.load(Ordering::Relaxed)
     }
 
+    /// Game messages queued since the last drain, validated against edge
+    /// ownership. A message from an entity the sending edge does not manage
+    /// is refused and counted.
+    ///
+    /// Call between ticks, before [`WorldSimulation::tick`], so the game has
+    /// seen every message before its [`step`](Game::step) runs.
+    pub fn drain_messages(&self) -> Vec<(EntityId, Vec<u8>)> {
+        let raw = std::mem::take(&mut *self.messages.lock().expect("not poisoned"));
+        let mut out = Vec::with_capacity(raw.len());
+        for (edge, entity, body) in raw {
+            if self.edges.edge_for(entity) == Some(edge) {
+                out.push((entity, body));
+            } else {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                if let Some(stats) = self.edges.stats(edge) {
+                    stats.refused.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        out
+    }
+
     /// The edges relaying for this region.
     #[inline]
     pub fn edges(&self) -> &Arc<Edges> {
@@ -203,6 +230,25 @@ impl Inbound {
             }
             KIND_DESPAWN_ENTITIES => DespawnEntities::decode(body)
                 .map(|m| Command::Despawn { edge, ids: m.ids }),
+            KIND_GAME_MESSAGE => {
+                match GameMessage::decode(body) {
+                    Ok(m) => {
+                        self.messages.lock().expect("not poisoned")
+                            .push((edge, m.entity, m.body));
+                        self.received.fetch_add(1, Ordering::Relaxed);
+                        if let Some(stats) = self.edges.stats(edge) {
+                            stats.messages.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        if let Some(stats) = self.edges.stats(edge) {
+                            stats.refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                return;
+            }
             // Says only that the edge is still there, which admitting it
             // already recorded.
             KIND_KEEPALIVE => return,

@@ -685,6 +685,15 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         &self.game
     }
 
+    /// Delivers a game message to the game before the next tick.
+    ///
+    /// Calls [`Game::message_received`] immediately. Call this between ticks
+    /// for each message drained from [`Inbound::drain_messages`], so the
+    /// game has seen every message before [`step`](Game::step) runs.
+    pub fn deliver_message(&mut self, from: EntityId, body: &[u8]) {
+        self.game.message_received(from, body);
+    }
+
     /// The cell-ordered view the last tick was served from.
     #[doc(hidden)]
     #[inline]

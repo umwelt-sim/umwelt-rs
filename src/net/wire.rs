@@ -58,6 +58,12 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
+    /// Everything after the cursor, consuming the rest. For a variable-length
+    /// tail like a game message body.
+    pub(crate) fn rest(self) -> &'a [u8] {
+        &self.buf[self.at..]
+    }
+
     /// Trailing bytes mean the two ends disagree about the format, so this is a
     /// decode failure rather than something to ignore.
     pub(crate) fn finish(self) -> Result<(), NetError> {

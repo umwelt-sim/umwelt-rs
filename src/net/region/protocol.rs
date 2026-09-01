@@ -23,6 +23,7 @@ pub(crate) const KIND_SPAWN_ENTITIES: u8 = 1;
 pub(crate) const KIND_MOVE_ENTITIES: u8 = 2;
 pub(crate) const KIND_DESPAWN_ENTITIES: u8 = 3;
 pub(crate) const KIND_KEEPALIVE: u8 = 4;
+pub(crate) const KIND_GAME_MESSAGE: u8 = 5;
 
 /// Names a frame kind for an error message, without echoing the peer's bytes.
 pub(crate) fn kind_name(kind: u8) -> &'static str {
@@ -31,6 +32,7 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
         KIND_MOVE_ENTITIES => "move entities",
         KIND_DESPAWN_ENTITIES => "despawn entities",
         KIND_KEEPALIVE => "keepalive",
+        KIND_GAME_MESSAGE => "game message",
         _ => "unknown",
     }
 }
@@ -209,6 +211,10 @@ const SPAWN_BYTES: usize = 23;
 /// needs to see. Applying it to an inbound command would add a small position
 /// error on every round trip through the region.
 const MOVE_BYTES: usize = 16;
+
+/// Most bytes a game message body may carry. The five overhead bytes are the
+/// kind and the entity id.
+pub const MAX_GAME_MESSAGE_BODY: usize = MAX_MESSAGE_BYTES - 5;
 
 /// Most entities one [`SpawnEntities`] may ask for. The five bytes are the kind
 /// and the count.
@@ -489,6 +495,37 @@ impl DespawnEntities {
         }
         c.finish()?;
         Ok(DespawnEntities { ids })
+    }
+}
+
+/// Opaque bytes from a game client, forwarded by an edge to the region.
+///
+/// The entity is the sender's entity in this region. The region validates that
+/// the sending edge manages it before delivering the message to the game.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GameMessage {
+    /// The sender's entity in this region.
+    pub entity: EntityId,
+    /// The game's own bytes. At most [`MAX_GAME_MESSAGE_BODY`].
+    pub body: Vec<u8>,
+}
+
+impl GameMessage {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.push(KIND_GAME_MESSAGE);
+        out.extend_from_slice(&self.entity.raw().to_le_bytes());
+        out.extend_from_slice(&self.body);
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<GameMessage, NetError> {
+        let mut c = Cursor::new(body, "game message");
+        let entity = EntityId::from_raw(c.u32()?);
+        let rest = c.rest();
+        if rest.len() > MAX_GAME_MESSAGE_BODY {
+            return Err(NetError::Malformed("game message body too large"));
+        }
+        Ok(GameMessage { entity, body: rest.to_vec() })
     }
 }
 
@@ -797,6 +834,7 @@ mod tests {
             KIND_MOVE_ENTITIES,
             KIND_DESPAWN_ENTITIES,
             KIND_KEEPALIVE,
+            KIND_GAME_MESSAGE,
         ] {
             assert_ne!(kind_name(kind), "unknown", "kind {kind} needs a name");
         }

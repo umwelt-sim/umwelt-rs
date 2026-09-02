@@ -261,9 +261,9 @@ impl Edges {
     /// Drops every edge silent for longer than `after`, orphaning what it
     /// managed.
     ///
-    /// A closed socket used to say an edge had gone. Nothing says so now, so
-    /// silence does. An edge holding entities sends a keepalive when it has
-    /// nothing else to say, and one under load sends moves every tick.
+    /// Over NATS there is no connection close to say an edge has gone, so
+    /// silence does. The edge server sends a keepalive when it has nothing
+    /// else to say, and one under load sends moves every tick.
     ///
     /// Returns how many were dropped.
     pub fn expire(&self, after: Duration) -> usize {

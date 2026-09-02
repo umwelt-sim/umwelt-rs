@@ -430,10 +430,19 @@ impl Shared {
         }
     }
 
-    /// The regions this edge currently holds entities in.
+    /// The regions this edge currently holds live entities in.
+    ///
+    /// Entities marked for removal are excluded: their despawn has already been
+    /// sent, and keeping the region alive while waiting for the confirmation
+    /// would prevent the silence-based timeout from cleaning up a stopped sim.
     pub(crate) fn regions(&self) -> Vec<RegionId> {
-        let mut seen: Vec<RegionId> =
-            self.entities().by_key.values().map(|e| e.region).collect();
+        let mut seen: Vec<RegionId> = self
+            .entities()
+            .by_key
+            .values()
+            .filter(|e| !e.doomed)
+            .map(|e| e.region)
+            .collect();
         seen.sort_unstable();
         seen.dedup();
         seen

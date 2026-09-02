@@ -61,6 +61,20 @@ impl Odometer {
         self.total[id.index()]
     }
 
+    /// Adds `amount` to an entity's reading without any position change.
+    ///
+    /// Useful when something other than movement makes a client's copy stale,
+    /// such as a tag change. The amount should be comparable to position
+    /// drift so the entity scores alongside movers.
+    ///
+    /// # Panics
+    ///
+    /// If `id` names a slot this odometer has never covered.
+    #[inline]
+    pub fn bump(&mut self, id: EntityId, amount: u32) {
+        self.total[id.index()] = self.total[id.index()].wrapping_add(amount);
+    }
+
     /// Every reading, indexed by entity id.
     #[inline]
     pub fn as_slice(&self) -> &[u32] {
@@ -316,5 +330,21 @@ mod tests {
             w.accumulate(&mut odo);
         }
         assert_eq!(odo.as_slice().as_ptr(), ptr, "steady state must not reallocate");
+    }
+
+    #[test]
+    fn a_bump_increases_the_reading_without_movement() {
+        let mut w = World::new();
+        let a = w.spawn(100, 200, 0);
+        let mut odo = Odometer::new();
+        w.accumulate(&mut odo);
+        assert_eq!(odo.reading(a), 0);
+
+        odo.bump(a, 500);
+        assert_eq!(odo.reading(a), 500, "bump must add to the reading");
+
+        // A subsequent accumulate with no movement adds nothing on top.
+        w.accumulate(&mut odo);
+        assert_eq!(odo.reading(a), 500, "accumulate must not erase a bump");
     }
 }

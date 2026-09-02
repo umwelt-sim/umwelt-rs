@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -51,6 +51,14 @@ const MOVE_FLUSH: Duration = Duration::from_millis(5);
 
 /// How long the region reader waits before checking whether it should stop.
 const DRAIN_POLL: Duration = Duration::from_millis(200);
+
+/// How often the edge tells a region it is still here when there is nothing
+/// else to send.
+///
+/// A region drops an edge silent past its timeout, orphaning every entity the
+/// edge managed. This is shorter than any reasonable timeout so the edge
+/// stays alive even when its clients are idle.
+const REGION_KEEPALIVE: Duration = Duration::from_secs(2);
 
 /// How often an edge says what it is carrying, until told otherwise.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
@@ -563,6 +571,7 @@ fn publish_to_regions(
     stop: &AtomicBool,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
+    let mut last_keepalive = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let first = match queue.recv_timeout(MOVE_FLUSH) {
             Ok(one) => Some(one),
@@ -596,6 +605,15 @@ fn publish_to_regions(
             let _ = shared.link.game_message(region, entity, &body);
         }
         shared.flush_moves();
+
+        // Keep regions alive when the edge has nothing else to say.
+        let now = Instant::now();
+        if now.duration_since(last_keepalive) >= REGION_KEEPALIVE {
+            for region in shared.regions() {
+                let _ = shared.link.keepalive(region);
+            }
+            last_keepalive = now;
+        }
     }
 }
 

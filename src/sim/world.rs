@@ -515,6 +515,10 @@ pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     ys: Vec<Fixed>,
     zs: Vec<Fixed>,
     tags: Vec<u16>,
+    /// Tags at the end of the previous tick. Compared against `tags` after each
+    /// step to detect tag-only changes that would otherwise be invisible to the
+    /// position-based odometer.
+    prev_tags: Vec<u16>,
     live: LiveSet,
     /// Cleared at the start of every tick and filled by [`Step::despawn`].
     despawned: Vec<EntityId>,
@@ -575,6 +579,7 @@ impl<G: Game> WorldSimulation<G, NullSink> {
             ys: Vec::new(),
             zs: Vec::new(),
             tags: Vec::new(),
+            prev_tags: Vec::new(),
             live: LiveSet::new(),
             despawned: Vec::new(),
             odo: Odometer::new(),
@@ -613,6 +618,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             ys: self.ys,
             zs: self.zs,
             tags: self.tags,
+            prev_tags: self.prev_tags,
             live: self.live,
             despawned: self.despawned,
             odo: self.odo,
@@ -880,6 +886,21 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         }
 
         self.odo.accumulate(&self.xs, &self.ys, &self.zs, &self.live);
+
+        // Detect tag-only changes that the position-based odometer would miss.
+        // A changed tag bumps the entity's reading so it scores alongside movers
+        // and reaches the viewer with its new tag. Runs after accumulate so the
+        // odometer has already grown to cover any entities the step spawned.
+        let tag_bump = self.policy.unseen_drift;
+        self.prev_tags.resize(self.tags.len(), 0);
+        for id in self.live.iter() {
+            let i = id.index();
+            if self.tags[i] != self.prev_tags[i] {
+                self.odo.bump(id, tag_bump);
+            }
+        }
+        self.prev_tags.clear();
+        self.prev_tags.extend_from_slice(&self.tags);
         self.snap.update(&self.xs, &self.ys, &self.zs, &self.tags, &self.live);
 
         let frame = Frame {
@@ -1084,6 +1105,54 @@ mod tests {
             assert_eq!(stats.viewers, 1, "the viewer is still being served");
             assert_eq!(stats.records, 0, "nothing moved, so there is nothing to say");
         }
+    }
+
+    /// A game that spawns one entity on a specific tick.
+    struct SpawnOnTick {
+        at_tick: u32,
+        spawned: bool,
+    }
+
+    impl Game for SpawnOnTick {
+        fn step(&mut self, w: &mut Step<'_>) {
+            if !self.spawned && w.tick() >= self.at_tick {
+                w.spawn(Pos3::from_meters(2048, 2048, 0), 7);
+                self.spawned = true;
+            }
+        }
+    }
+
+    #[test]
+    fn a_spawn_during_step_does_not_panic_on_tag_comparison() {
+        let mut s = WorldSimulation::new(
+            WorldConfig::default(),
+            SpawnOnTick { at_tick: 3, spawned: false },
+        );
+        // A few ticks with no entities, then one appears mid-step.
+        for _ in 0..5 {
+            s.tick();
+        }
+        assert_eq!(s.entity_count(), 1);
+    }
+
+    #[test]
+    fn a_tag_change_in_a_still_world_resumes_sending() {
+        let mut s = sim(Walk::still());
+        let ids = populate(&mut s, 20);
+        s.register_viewer(ids[0], ClientLimits::default());
+
+        // Drain the initial backlog so the world goes quiet.
+        for _ in 0..10 {
+            s.tick();
+        }
+        assert_eq!(s.tick().records, 0, "precondition: nothing is moving");
+
+        // Change a neighbor's tag without moving it.
+        let target = ids[1];
+        s.tags[target.index()] = 42;
+
+        let stats = s.tick();
+        assert!(stats.records > 0, "a tag change must produce at least one record");
     }
 
     #[test]

@@ -1,9 +1,8 @@
 //! Scoring and budget selection.
 //!
-//! A viewer's ghost set is the leading `ghost_cap` candidates in gather order,
-//! which runs nearest first. Within that set, one pass scores each by how far
-//! the client's copy has drifted, one sort ranks them, and the packet takes as
-//! many as fit.
+//! A viewer's ghost set is the nearest `ghost_cap` candidates. Within that set,
+//! one pass scores each by how far the client's copy has drifted, one sort
+//! ranks them, and the packet takes as many as fit.
 //!
 //! Relevance and staleness do different jobs here. Distance decides what a
 //! client knows about, because it changes slowly and so the ghost set holds
@@ -124,9 +123,9 @@ impl Default for Weights {
 /// Per-viewer replication policy, constant across ticks.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
-    /// Entities a viewer's client knows about: this many, taken from the front
-    /// of the gather's walk. Bounds the ghost table's footprint, which the
-    /// benchmarks measure as the dominant per-viewer cost.
+    /// Entities a viewer's client knows about: the nearest this many. Bounds
+    /// the ghost table's footprint, which the benchmarks measure as the
+    /// dominant per-viewer cost.
     ///
     /// Gathering more candidates than this discards the excess, so a walk cap
     /// above it is wasted work.
@@ -201,6 +200,11 @@ impl Ranked {
 pub struct Selection {
     ranked: Vec<Ranked>,
     departed: Vec<EntityId>,
+    /// Candidates in the ghost set, as indices into what the gather found.
+    keep: Vec<u32>,
+    /// Candidates in the one bucket the cap lands inside, the only ones whose
+    /// distances have to be compared against each other.
+    edge: Vec<u32>,
     sent: usize,
 }
 
@@ -215,6 +219,8 @@ impl Selection {
         Selection {
             ranked: Vec::with_capacity(candidates),
             departed: Vec::with_capacity(candidates),
+            keep: Vec::with_capacity(candidates),
+            edge: Vec::new(),
             sent: 0,
         }
     }
@@ -244,6 +250,8 @@ impl Selection {
     pub fn clear(&mut self) {
         self.ranked.clear();
         self.departed.clear();
+        self.keep.clear();
+        self.edge.clear();
         self.sent = 0;
     }
 }
@@ -252,15 +260,9 @@ impl Selection {
 ///
 /// `slots` is how many records fit this tick's packet.
 ///
-/// The ghost set is the leading `ghost_cap` of `candidates`, and it holds still
-/// from tick to tick. The gather walks outward from the viewer and stops only
-/// once a bucket is exhausted, so these are the nearest `ghost_cap` entities
-/// unless the bucket that crosses the cap holds more than the room left in it.
-///
-/// That bucket's occupants are taken in entity id order. They all sit in one
-/// sub-cell, so the set can pass over a nearer entity within the sub-cell's
-/// diagonal. Selecting by distance instead costs a 14% longer tick with 8000
-/// entities within 10 m of each other.
+/// The ghost set is the nearest `ghost_cap` of `candidates`, chosen by
+/// [`nearest`], and it holds still from tick to tick because distance changes
+/// slowly.
 ///
 /// Every member of the ghost set is stamped, so only an entity that has left
 /// the set ages out and departs. An update that scored zero consumes no slot.
@@ -280,16 +282,17 @@ pub fn select(
 ) {
     out.clear();
     let cands = candidates.as_slice();
-    let n = cands.len().min(policy.ghost_cap);
+    nearest(candidates.dists(), policy.ghost_cap, &mut out.edge, &mut out.keep);
 
-    for (k, e) in cands[..n].iter().enumerate() {
+    for &k in &out.keep {
+        let e = &cands[k as usize];
         let (drift, flag) = match ghosts.mark(e.id) {
             Some(mark) => (odometer.reading(e.id).wrapping_sub(mark), 0),
             None => (policy.unseen_drift, NEW_BIT),
         };
         out.ranked.push(Ranked {
             score: score_of(drift, e.dist_sq, &policy.weights),
-            at: k as u32 | flag,
+            at: k | flag,
         });
     }
 
@@ -308,6 +311,43 @@ pub fn select(
     }
 
     ghosts.evict(tick, policy.grace, &mut out.departed);
+}
+
+/// Picks the nearest `cap` candidates, as indices into what the gather found.
+///
+/// The gather walks cells outward but does not order the occupants within one,
+/// and it stops only once a bucket is exhausted. So a viewer standing in a
+/// crowd is handed every occupant of that bucket in the order it stored them,
+/// which is by entity id. Taking the leading `cap` of those picks by storage
+/// order: every viewer in the crowd is given the same lowest ids however far
+/// away they are, and a viewer whose own id is above the cap is never told
+/// where it is.
+///
+/// The cut is found on the gather's packed distances rather than on the entries
+/// themselves, so the partition moves eight bytes per candidate instead of
+/// stepping over sixteen, and the entries are then read only for the ones that
+/// made it. `edge` holds the copy the partition consumes.
+///
+/// Ties at the cut break on walk order, so a replay chooses the same set.
+fn nearest(dists: &[u32], cap: usize, edge: &mut Vec<u32>, keep: &mut Vec<u32>) {
+    keep.clear();
+    if dists.len() <= cap {
+        keep.extend(0..dists.len() as u32);
+        return;
+    }
+
+    edge.clear();
+    edge.extend_from_slice(dists);
+    let (nearer, &mut cut, _) = edge.select_nth_unstable(cap - 1);
+    // Everything past the split is at least `cut`, so the candidates strictly
+    // nearer are all in the near half and can be counted there.
+    let mut ties = cap - nearer.iter().filter(|&&d| d < cut).count();
+
+    for (i, &d) in dists.iter().enumerate() {
+        if d < cut || (d == cut && ties > 0 && { ties -= 1; true }) {
+            keep.push(i as u32);
+        }
+    }
 }
 
 /// `drift x weight(band)`, saturating.
@@ -573,6 +613,127 @@ mod tests {
             gone |= sel.departed().contains(&EntityId::from_raw(2));
         }
         assert!(gone, "a ghost that leaves the set must be reported as departed");
+    }
+
+    /// The gather stops only once a bucket is exhausted, so a viewer in a crowd
+    /// is handed every occupant of that bucket in the order it stored them.
+    /// Walk order runs far to near here, which is what taking the leading
+    /// `ghost_cap` would get wrong.
+    #[test]
+    fn the_ghost_set_is_the_nearest_candidates_not_the_first_walked() {
+        let n = 64usize;
+        let cap = 8usize;
+        let w = World::new(n);
+        let items: Vec<(u32, i32)> = (0..n).map(|i| (i as u32, (n - i) as i32)).collect();
+        let cands = candidates(&items);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = policy(cap, 1000);
+
+        select(1, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+
+        let mut got: Vec<u32> = sel.ranked().iter().map(|r| id_at(&cands, r)).collect();
+        got.sort_unstable();
+        let want: Vec<u32> = ((n - cap) as u32..n as u32).collect();
+        assert_eq!(got, want, "the nearest eight are the last eight walked");
+    }
+
+    /// A cell stores its occupants by entity id, so an overflowing one would
+    /// hand every viewer in the crowd the same lowest ids however far off they
+    /// are.
+    #[test]
+    fn a_crowd_stored_in_id_order_does_not_hand_the_set_to_low_ids() {
+        let n = 512usize;
+        let cap = 32usize;
+        let w = World::new(n);
+        let items: Vec<(u32, i32)> = (0..n).map(|i| (i as u32, (n - i) as i32)).collect();
+        let cands = candidates(&items);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = policy(cap, 1000);
+
+        select(1, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+
+        let lowest = sel.ranked().iter().map(|r| id_at(&cands, r)).min().expect("a set");
+        assert_eq!(lowest, (n - cap) as u32, "every member comes from the near end");
+    }
+
+    /// A viewer joining a crowd takes an id above everyone already there. It
+    /// stands at no distance from itself, so it belongs in its own set however
+    /// late it arrived, and a client never told where it is cannot draw itself.
+    #[test]
+    fn a_viewer_that_joined_last_is_in_its_own_ghost_set() {
+        let n = 500usize;
+        let cap = 256usize;
+        let w = World::new(n + 1);
+        // The crowd stands five meters off, the newcomer at no distance at all,
+        // and the walk yields them by id, so the newcomer comes last.
+        let mut items: Vec<(u32, i32)> = (0..n).map(|i| (i as u32, 5)).collect();
+        items.push((n as u32, 0));
+        let cands = candidates(&items);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = policy(cap, 1000);
+
+        select(1, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+
+        assert!(
+            sel.ranked().iter().any(|r| id_at(&cands, r) == n as u32),
+            "the viewer must be told where it is"
+        );
+    }
+
+    /// Candidates the same distance away are equally near, so the tie breaks on
+    /// walk order, which a replay reproduces.
+    #[test]
+    fn candidates_at_equal_distance_break_on_walk_order() {
+        let n = 16usize;
+        let cap = 4usize;
+        let w = World::new(n);
+        let items: Vec<(u32, i32)> = (0..n).rev().map(|i| (i as u32, 5)).collect();
+        let cands = candidates(&items);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = policy(cap, 1000);
+
+        select(1, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+
+        let mut at: Vec<usize> = sel.ranked().iter().map(|r| r.index()).collect();
+        at.sort_unstable();
+        assert_eq!(at, vec![0, 1, 2, 3], "the first four walked take the tie");
+    }
+
+    /// Under the cap the selection runs at all, so nothing is dropped.
+    #[test]
+    fn a_walk_under_the_cap_keeps_every_candidate() {
+        let w = World::new(8);
+        let cands = candidates(&[(5, 40), (2, 10), (7, 25), (1, 3)]);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = policy(64, 1000);
+
+        select(1, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+        assert_eq!(sel.ranked().len(), 4, "every candidate is in the set");
+    }
+
+    /// Distances spread over many octaves land in many buckets, so the cut has
+    /// to be found by walking them rather than by assuming one holds everything.
+    #[test]
+    fn a_set_spread_across_octaves_still_takes_the_nearest() {
+        let cap = 16usize;
+        let w = World::new(64);
+        // 1, 2, 3 ... 64 meters, walked from the far end.
+        let items: Vec<(u32, i32)> = (0..64).map(|i| (i as u32, 64 - i as i32)).collect();
+        let cands = candidates(&items);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = policy(cap, 1000);
+
+        select(1, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+
+        let mut got: Vec<u32> = sel.ranked().iter().map(|r| id_at(&cands, r)).collect();
+        got.sort_unstable();
+        assert_eq!(got, (48..64).collect::<Vec<u32>>(), "the sixteen nearest");
     }
 
     #[test]

@@ -40,6 +40,20 @@ impl DiscoveredEntity {
     }
 }
 
+/// Bits dropped from a squared distance to pack it into 32 bits.
+///
+/// The largest separation inside a 256 m view radius squares to about 6.9e10,
+/// which needs 37 bits. Eight of them are worth 256 raw units of squared
+/// distance, which at a meter apart is a part in four thousand. Two candidates
+/// closer together than that compare equal and fall to walk order.
+const DIST_SHIFT: u32 = 8;
+
+/// A squared distance cut down to 32 bits, keeping its order.
+#[inline]
+pub(crate) fn packed_dist(dist_sq: u64) -> u32 {
+    (dist_sq >> DIST_SHIFT) as u32
+}
+
 /// Entities gathered for one viewer, in cell-walk order.
 ///
 /// Cell-walk order is not relevance order. Callers needing the nearest entities
@@ -54,29 +68,48 @@ impl DiscoveredEntity {
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveredEntities {
     items: Vec<DiscoveredEntity>,
+    /// The same squared distances, packed on their own and cut down to 32 bits.
+    /// A pass choosing the nearest reads these without stepping over the rest
+    /// of each entry, and at half the width it moves half the bytes.
+    dists: Vec<u32>,
 }
 
 impl DiscoveredEntities {
     /// Empty, allocating nothing until something is pushed.
     pub fn new() -> DiscoveredEntities {
-        DiscoveredEntities { items: Vec::new() }
+        DiscoveredEntities {
+            items: Vec::new(),
+            dists: Vec::new(),
+        }
     }
 
     /// Empty, with room for `n` before it grows. What a worker reuses.
     pub fn with_capacity(n: usize) -> DiscoveredEntities {
-        DiscoveredEntities { items: Vec::with_capacity(n) }
+        DiscoveredEntities {
+            items: Vec::with_capacity(n),
+            dists: Vec::with_capacity(n),
+        }
     }
 
     /// Appends one, keeping cell-walk order.
     #[inline]
     pub fn push(&mut self, found: DiscoveredEntity) {
+        self.dists.push(packed_dist(found.dist_sq.raw()));
         self.items.push(found);
     }
 
     /// Empties the buffer without releasing its allocation.
     #[inline]
     pub fn clear(&mut self) {
+        self.dists.clear();
         self.items.clear();
+    }
+
+    /// The gathered squared distances, packed by [`packed_dist`], in the same
+    /// order as [`as_slice`](Self::as_slice).
+    #[inline]
+    pub(crate) fn dists(&self) -> &[u32] {
+        &self.dists
     }
 
     /// How many were gathered.
@@ -101,12 +134,6 @@ impl DiscoveredEntities {
     #[inline]
     pub fn as_slice(&self) -> &[DiscoveredEntity] {
         &self.items
-    }
-
-    /// The same, for a caller that sorts in place.
-    #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [DiscoveredEntity] {
-        &mut self.items
     }
 
     /// Iterator over what was gathered, in cell-walk order.

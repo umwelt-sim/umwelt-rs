@@ -1,8 +1,9 @@
 //! Scoring and budget selection.
 //!
-//! A viewer's ghost set is the nearest `ghost_cap` candidates. Within that set,
-//! one pass scores each by how far the client's copy has drifted, one sort
-//! ranks them, and the packet takes as many as fit.
+//! A viewer's ghost set is the leading `ghost_cap` candidates in gather order,
+//! which runs nearest first. Within that set, one pass scores each by how far
+//! the client's copy has drifted, one sort ranks them, and the packet takes as
+//! many as fit.
 //!
 //! Relevance and staleness do different jobs here. Distance decides what a
 //! client knows about, because it changes slowly and so the ghost set holds
@@ -123,9 +124,9 @@ impl Default for Weights {
 /// Per-viewer replication policy, constant across ticks.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
-    /// Entities a viewer's client knows about: the nearest this many
-    /// candidates. Bounds the ghost table's footprint, which the benchmarks
-    /// measure as the dominant per-viewer cost.
+    /// Entities a viewer's client knows about: this many, taken from the front
+    /// of the gather's walk. Bounds the ghost table's footprint, which the
+    /// benchmarks measure as the dominant per-viewer cost.
     ///
     /// Gathering more candidates than this discards the excess, so a walk cap
     /// above it is wasted work.
@@ -251,9 +252,15 @@ impl Selection {
 ///
 /// `slots` is how many records fit this tick's packet.
 ///
-/// The ghost set is the leading `ghost_cap` of `candidates`. The gather walks
-/// outward from the viewer, so that is the nearest `ghost_cap` entities, and it
-/// holds still from tick to tick.
+/// The ghost set is the leading `ghost_cap` of `candidates`, and it holds still
+/// from tick to tick. The gather walks outward from the viewer and stops only
+/// once a bucket is exhausted, so these are the nearest `ghost_cap` entities
+/// unless the bucket that crosses the cap holds more than the room left in it.
+///
+/// That bucket's occupants are taken in entity id order. They all sit in one
+/// sub-cell, so the set can pass over a nearer entity within the sub-cell's
+/// diagonal. Selecting by distance instead costs a 14% longer tick with 8000
+/// entities within 10 m of each other.
 ///
 /// Every member of the ghost set is stamped, so only an entity that has left
 /// the set ages out and departs. An update that scored zero consumes no slot.

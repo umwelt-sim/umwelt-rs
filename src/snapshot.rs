@@ -18,15 +18,15 @@ use crate::pos::{CellCoord, CellId, Pos2, Pos3};
 const NOT_SUBDIVIDED: u32 = u32::MAX;
 
 /// Sub-cells per axis within a subdivided cell. Power of two.
-pub const DEFAULT_SUB_AXIS: u32 = 8;
+pub const DEFAULT_SUB_AXIS: u32 = 32;
 
 /// Population at or above which a cell is subdivided.
 pub const DEFAULT_SUB_THRESHOLD: u32 = 512;
 
-/// Largest permitted `sub_axis`. Bounded because the visit-order table is
-/// `sub_axis^4` bytes and its entries are `u8`, so `sub_axis * sub_axis` must
-/// fit in one.
-pub const MAX_SUB_AXIS: u32 = 16;
+/// Largest permitted `sub_axis`. Bounded because the visit-order table holds
+/// `sub_axis^4` entries of `u16`, so `sub_axis * sub_axis` must fit in one and
+/// the table must stay a sane size: 32 costs 2.1 MB, 64 would cost 33 MB.
+pub const MAX_SUB_AXIS: u32 = 32;
 
 /// One cell's entities. Parallel slices, all of the same length.
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +117,7 @@ pub struct CellSnapshot {
     /// Sub-cell visit order, nearest first, for every possible origin.
     /// `sub_order[o * buckets .. (o + 1) * buckets]` is the order from origin
     /// `o`. Built once at construction; independent of entity data.
-    sub_order: Vec<u8>,
+    sub_order: Vec<u16>,
     /// Cell offsets from a viewer's own cell, nearest first. A viewer sits at
     /// the center of its subscription, so one order serves every viewer.
     cell_order: Vec<(i8, i8)>,
@@ -270,7 +270,7 @@ impl CellSnapshot {
     /// outside `cell` clamps to the nearest edge sub-cell, which gives the
     /// correct near edge and an approximate order behind it.
     #[inline]
-    pub fn sub_cell_order(&self, cell: CellCoord, viewer: Pos2) -> &[u8] {
+    pub fn sub_cell_order(&self, cell: CellCoord, viewer: Pos2) -> &[u16] {
         let buckets = (self.sub_axis * self.sub_axis) as usize;
         let (ox, oy) = self.sub_origin(cell, viewer);
         let o = (oy * self.sub_axis + ox) as usize;
@@ -582,10 +582,10 @@ fn build_cell_order(cell_radius: u32) -> Vec<(i8, i8)> {
 /// Sub-cell centers are all offset identically within their cells, so ordering
 /// by coordinate difference is the same as ordering by center distance. Ties
 /// resolve by linear index, which a stable sort preserves.
-fn build_sub_order(axis: u32) -> Vec<u8> {
+fn build_sub_order(axis: u32) -> Vec<u16> {
     let buckets = (axis * axis) as usize;
     let mut table = Vec::with_capacity(buckets * buckets);
-    let mut scratch: Vec<(u32, u8)> = Vec::with_capacity(buckets);
+    let mut scratch: Vec<(u32, u16)> = Vec::with_capacity(buckets);
     for oy in 0..axis as i32 {
         for ox in 0..axis as i32 {
             scratch.clear();
@@ -594,7 +594,7 @@ fn build_sub_order(axis: u32) -> Vec<u8> {
                     let dx = sx - ox;
                     let dy = sy - oy;
                     let d2 = (dx * dx + dy * dy) as u32;
-                    scratch.push((d2, (sy * axis as i32 + sx) as u8));
+                    scratch.push((d2, (sy * axis as i32 + sx) as u16));
                 }
             }
             scratch.sort_by_key(|&(d2, _)| d2);
@@ -849,7 +849,7 @@ mod tests {
             for ox in 0..8i32 {
                 let v = sub_corner(&cfg, cell, 8, ox as u32, oy as u32);
                 let order = snap.sub_cell_order(cell, v);
-                let d2 = |b: u8| -> i32 {
+                let d2 = |b: u16| -> i32 {
                     let (sx, sy) = ((b % 8) as i32, (b / 8) as i32);
                     (sx - ox) * (sx - ox) + (sy - oy) * (sy - oy)
                 };
@@ -929,7 +929,7 @@ mod tests {
         // Take sub-cells until 512 entities are gathered, then check that the
         // furthest one taken is no further than the nearest one skipped.
         let order = snap.sub_cell_order(coord, viewer);
-        let d2 = |b: u8| -> i32 {
+        let d2 = |b: u16| -> i32 {
             let (sx, sy) = ((b % 8) as i32, (b / 8) as i32);
             sx * sx + sy * sy
         };

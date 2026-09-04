@@ -125,6 +125,27 @@ impl<'a> IntoIterator for &'a DiscoveredEntities {
     }
 }
 
+/// What one gather walked, for diagnosing where its cost went.
+///
+/// The cap is checked between cells and between sub-cells, never inside one,
+/// so the entities examined can exceed it by the population of whichever
+/// bucket was walked last. These counts say by how much and over how many
+/// buckets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GatherWalk {
+    /// Cells entered, subdivided or not.
+    pub cells: u32,
+    /// Sub-cells entered, across all subdivided cells.
+    pub sub_cells: u32,
+    /// Cells walked whole because they were under the subdivision threshold.
+    pub whole_cells: u32,
+    /// Entities distance-tested, including those that failed and never
+    /// reached `out`.
+    pub examined: u32,
+    /// The largest single bucket walked. The cap can overshoot by this much.
+    pub biggest_bucket: u32,
+}
+
 impl CellSnapshot {
     /// Appends the entities within view of `viewer` to `out`.
     ///
@@ -141,8 +162,8 @@ impl CellSnapshot {
         viewer: Pos3,
         sub: Subscription,
         out: &mut DiscoveredEntities,
-    ) {
-        self.gather_into_capped(viewer, sub, usize::MAX, out);
+    ) -> GatherWalk {
+        self.gather_into_capped(viewer, sub, usize::MAX, out)
     }
 
     /// [`Self::gather_into`], stopping once `out` holds `cap` entries.
@@ -165,7 +186,8 @@ impl CellSnapshot {
         sub: Subscription,
         cap: usize,
         out: &mut DiscoveredEntities,
-    ) {
+    ) -> GatherWalk {
+        let mut walk = GatherWalk::default();
         let cfg = self.config();
         let radius_sq = DistSq::from_radius(cfg.horizontal_view_radius());
         let viewer_h = viewer.horizontal();
@@ -184,29 +206,33 @@ impl CellSnapshot {
             let coord = CellCoord::new(cx as u16, cy as u16);
             let cid = cfg.cell_id(coord);
 
+            walk.cells += 1;
             match self.sub_cells(cid) {
                 Some(grid) => {
                     for &b in self.sub_cell_order(coord, viewer_h) {
-                        take(
-                            viewer,
-                            viewer_h,
-                            radius_sq,
-                            grid.occupants_at(b as usize),
-                            out,
-                        );
+                        let bucket = grid.occupants_at(b as usize);
+                        walk.sub_cells += 1;
+                        walk.examined += bucket.len() as u32;
+                        walk.biggest_bucket = walk.biggest_bucket.max(bucket.len() as u32);
+                        take(viewer, viewer_h, radius_sq, bucket, out);
                         if out.len() >= cap {
-                            return;
+                            return walk;
                         }
                     }
                 }
                 None => {
-                    take(viewer, viewer_h, radius_sq, self.entities_for_cell(cid), out);
+                    let bucket = self.entities_for_cell(cid);
+                    walk.whole_cells += 1;
+                    walk.examined += bucket.len() as u32;
+                    walk.biggest_bucket = walk.biggest_bucket.max(bucket.len() as u32);
+                    take(viewer, viewer_h, radius_sq, bucket, out);
                     if out.len() >= cap {
-                        return;
+                        return walk;
                     }
                 }
             }
         }
+        walk
     }
 }
 

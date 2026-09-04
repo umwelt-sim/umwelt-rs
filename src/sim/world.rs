@@ -236,6 +236,17 @@ pub struct TickStats {
     pub viewers: u64,
     /// Candidates the gathers produced, before scoring.
     pub candidates: u64,
+    /// Sub-cells the gathers entered. Against `gathers` it is how many buckets
+    /// a viewer walks before its cap stops it.
+    pub sub_cells_walked: u64,
+    /// Cells walked whole because they were under the subdivision threshold.
+    pub whole_cells_walked: u64,
+    /// Entities distance-tested, including those that failed the radius and
+    /// never became candidates.
+    pub examined: u64,
+    /// Largest single bucket any gather walked this tick. The walk cap can be
+    /// overshot by this much, because it is only checked between buckets.
+    pub biggest_bucket: u64,
     /// Records that fit packets.
     pub records: u64,
     /// Records that told a client about an entity for the first time.
@@ -275,6 +286,10 @@ impl TickStats {
     fn merge(&mut self, o: TickStats) {
         self.viewers += o.viewers;
         self.candidates += o.candidates;
+        self.sub_cells_walked += o.sub_cells_walked;
+        self.whole_cells_walked += o.whole_cells_walked;
+        self.examined += o.examined;
+        self.biggest_bucket = self.biggest_bucket.max(o.biggest_bucket);
         self.records += o.records;
         self.new_ghosts += o.new_ghosts;
         self.departed += o.departed;
@@ -346,7 +361,7 @@ fn serve<S: PayloadSink>(
     v.sub = Some(sub);
 
     w.found.clear();
-    f.snap.gather_into_capped(at, sub, f.walk_cap, &mut w.found);
+    let walk = f.snap.gather_into_capped(at, sub, f.walk_cap, &mut w.found);
 
     // No event queue exists yet, so nothing is held back for one.
     let state = v.budget.state_bytes_available(0);
@@ -396,6 +411,10 @@ fn serve<S: PayloadSink>(
 
     stats.viewers += 1;
     stats.candidates += found.len() as u64;
+    stats.sub_cells_walked += walk.sub_cells as u64;
+    stats.whole_cells_walked += walk.whole_cells as u64;
+    stats.examined += walk.examined as u64;
+    stats.biggest_bucket = stats.biggest_bucket.max(walk.biggest_bucket as u64);
     stats.records += selection.records().len() as u64;
     stats.new_ghosts += selection.records().iter().filter(|r| r.is_new()).count() as u64;
     stats.departed += selection.departed().len() as u64;

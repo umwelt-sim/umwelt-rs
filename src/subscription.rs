@@ -4,12 +4,9 @@
 //! own cell, clipped to the region. A move that stays inside a cell leaves it
 //! unchanged; a move that crosses one changes it by at most a row and a column,
 //! which is what makes rebuilding it cheap enough to do every tick.
-//!
-//! [`CellList`] is that box flattened into the walk order a gather uses.
 
-use crate::config::{MAX_SUB_GRID_CELLS, WorldConfig};
+use crate::config::WorldConfig;
 use crate::pos::CellCoord;
-use core::fmt;
 
 /// The bounding box describing the region to which a viewer is subscribed.
 /// This is more efficient than storing the list of cells to which a viewer
@@ -86,123 +83,6 @@ impl Subscription {
     }
 }
 
-/// A stored, ordered list of cells. This is an allocation-free structure backed
-/// by a fixed-sized array. It is also not `Copy`.
-///
-/// [`Subscription`] covers the cases where cells are only iterated or tested
-/// for membership. `CellList` is for cases needing a stored, comparable list,
-/// such as the reference implementation of a subscription delta.
-#[derive(Clone)]
-pub struct CellList {
-    cells: [CellCoord; MAX_SUB_GRID_CELLS],
-    len: u16,
-}
-
-impl CellList {
-    /// Empty.
-    #[inline]
-    pub const fn new() -> Self {
-        Self { cells: [CellCoord::new(0, 0); MAX_SUB_GRID_CELLS], len: 0 }
-    }
-
-    /// Cells in the list.
-    #[inline]
-    pub const fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    /// Whether the list is empty.
-    #[inline]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// The cells, in walk order.
-    #[inline]
-    pub fn as_slice(&self) -> &[CellCoord] {
-        &self.cells[..self.len as usize]
-    }
-
-    /// Over the cells, in walk order.
-    #[inline]
-    pub fn iter(&self) -> core::slice::Iter<'_, CellCoord> {
-        self.as_slice().iter()
-    }
-
-    /// Linear scan, bounded by [`MAX_SUB_GRID_CELLS`].
-    #[inline]
-    pub fn contains(&self, c: CellCoord) -> bool {
-        self.as_slice().contains(&c)
-    }
-
-    /// Appends a cell.
-    ///
-    /// # Panics
-    ///
-    /// If the set is already at [`MAX_SUB_GRID_CELLS`]. `WorldConfigBuilder`
-    /// rejects a `cell_radius` above `MAX_CELL_RADIUS`, so a set built from a
-    /// subscription derived from a valid config cannot reach this.
-    #[inline]
-    pub fn push(&mut self, c: CellCoord) {
-        assert!(
-            (self.len as usize) < MAX_SUB_GRID_CELLS,
-            "CellSet overflow: cell_radius exceeds MAX_CELL_RADIUS"
-        );
-        self.cells[self.len as usize] = c;
-        self.len += 1;
-    }
-
-    /// Drops every cell.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-}
-
-impl Default for CellList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FromIterator<CellCoord> for CellList {
-    fn from_iter<I: IntoIterator<Item = CellCoord>>(iter: I) -> Self {
-        let mut set = CellList::new();
-        for c in iter {
-            set.push(c);
-        }
-        set
-    }
-}
-
-impl From<Subscription> for CellList {
-    fn from(sub: Subscription) -> Self {
-        sub.cells().collect()
-    }
-}
-
-impl PartialEq for CellList {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl Eq for CellList {}
-
-impl fmt::Debug for CellList {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.as_slice()).finish()
-    }
-}
-
-impl<'a> IntoIterator for &'a CellList {
-    type Item = &'a CellCoord;
-    type IntoIter = core::slice::Iter<'a, CellCoord>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,27 +155,6 @@ mod tests {
             for x in 0..cfg.cells_per_axis() as u16 {
                 let c = CellCoord::new(x, y);
                 assert_eq!(sub.contains(c), center.chebyshev(c) <= radius);
-            }
-        }
-    }
-
-    #[test]
-    fn set_from_subscription_matches_cells() {
-        let cfg = WorldConfig::default();
-        let sub = Subscription::at_center(&cfg, CellCoord::new(10, 10));
-        let set = CellList::from(sub);
-        let cells: Vec<_> = sub.cells().collect();
-        assert_eq!(set.as_slice(), cells.as_slice());
-    }
-
-    #[test]
-    fn set_never_exceeds_capacity() {
-        let cfg = WorldConfig::default();
-        for y in 0..cfg.cells_per_axis() as u16 {
-            for x in 0..cfg.cells_per_axis() as u16 {
-                let set =
-                    CellList::from(Subscription::at_center(&cfg, CellCoord::new(x, y)));
-                assert!(set.len() <= MAX_SUB_GRID_CELLS);
             }
         }
     }

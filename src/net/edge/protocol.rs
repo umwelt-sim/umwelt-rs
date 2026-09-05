@@ -41,6 +41,29 @@ pub(crate) const KIND_TELEPORTED: u8 = 11;
 pub(crate) const KIND_TELEPORT_FAILED: u8 = 12;
 pub(crate) const KIND_ENTITY_MESSAGE: u8 = 13;
 
+/// Names a kind for an error message, without echoing the peer's bytes.
+///
+/// This link's own table. `net::region` numbers its messages separately, and
+/// the same byte names something different there.
+pub(crate) fn kind_name(kind: u8) -> &'static str {
+    match kind {
+        KIND_SPAWN => "spawn",
+        KIND_MOVE => "move",
+        KIND_DESPAWN => "despawn",
+        KIND_SPAWNED => "spawned",
+        KIND_REMOVED => "removed",
+        KIND_STATE => "state",
+        KIND_MESSAGE => "message",
+        KIND_REGION => "region",
+        KIND_MOVES => "moves",
+        KIND_TELEPORT => "teleport",
+        KIND_TELEPORTED => "teleported",
+        KIND_TELEPORT_FAILED => "teleport failed",
+        KIND_ENTITY_MESSAGE => "entity message",
+        _ => "unknown",
+    }
+}
+
 /// The largest body either end will frame on a stream.
 ///
 /// A client that announces a longer one is disconnected rather than trusted: a
@@ -265,7 +288,11 @@ impl FromClient {
                 c.finish()?;
                 Ok(FromClient::Teleport { handle, region, position })
             }
-            got => Err(NetError::Unexpected { expected: "a client command", got }),
+            got => Err(NetError::Unexpected {
+                expected: "a client command",
+                got,
+                name: kind_name(got),
+            }),
         }
     }
 }
@@ -440,7 +467,11 @@ impl ToClient<'_> {
                 c.finish()?;
                 Ok(ToClient::TeleportFailed { handle, region })
             }
-            got => Err(NetError::Unexpected { expected: "an edge message", got }),
+            got => Err(NetError::Unexpected {
+                expected: "an edge message",
+                got,
+                name: kind_name(got),
+            }),
         }
     }
 }
@@ -683,6 +714,27 @@ mod tests {
         assert_eq!(buf.len(), 1 + 4 + 4 + POS_BYTES + 3, "a region and a 3-byte kind");
         FromClient::Despawn { handle: h(1) }.encode(&mut buf);
         assert_eq!(buf.len(), 1 + 4);
+    }
+
+    /// The two links number their messages separately, so an error about a
+    /// byte that arrived here must name it from this table. Kind 4 is
+    /// `spawned` on this link and `keepalive` on the region link; kind 5 is
+    /// `removed` here and `game message` there.
+    #[test]
+    fn an_unexpected_kind_is_named_by_this_links_table() {
+        let refused = ToClient::decode(&[KIND_SPAWN]).expect_err("a client kind");
+        let NetError::Unexpected { got, name, .. } = refused else {
+            panic!("expected an unexpected-kind error, got {refused:?}");
+        };
+        assert_eq!(got, KIND_SPAWN);
+        assert_eq!(name, "spawn");
+
+        assert_eq!(kind_name(KIND_SPAWNED), "spawned");
+        assert_eq!(kind_name(KIND_REMOVED), "removed");
+        assert_eq!(kind_name(200), "unknown");
+        for kind in 1..=KIND_ENTITY_MESSAGE {
+            assert_ne!(kind_name(kind), "unknown", "kind {kind} needs a name");
+        }
     }
 
     #[test]

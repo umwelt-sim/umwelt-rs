@@ -12,12 +12,16 @@
 
 use crate::config::WorldConfig;
 use crate::entity::EntityId;
+use crate::fixed::Fixed;
 use crate::pos::Pos3;
 
 /// Encodes and decodes entity records.
-#[derive(Debug, Clone)]
+///
+/// Holds the two bit widths and nothing else: a position travels at full
+/// internal precision, so encoding is a shift and a mask rather than anything
+/// the rest of a [`WorldConfig`] has a say in.
+#[derive(Debug, Clone, Copy)]
 pub struct RecordCodec {
-    cfg: WorldConfig,
     h_bits: u32,
     v_bits: u32,
     pos_bytes: usize,
@@ -53,7 +57,7 @@ impl RecordCodec {
         let v_bits = cfg.vertical_bits();
         let total = 2 * h_bits + v_bits;
         assert!(total <= 128, "position needs {total} bits, more than a u128 holds");
-        RecordCodec { cfg: *cfg, h_bits, v_bits, pos_bytes: total.div_ceil(8) as usize }
+        RecordCodec { h_bits, v_bits, pos_bytes: total.div_ceil(8) as usize }
     }
 
     /// The number of bytes a record occupies: entity id, quantized position,
@@ -74,10 +78,9 @@ impl RecordCodec {
     #[inline]
     pub fn encode(&self, id: EntityId, pos: Pos3, tag: u16, out: &mut Vec<u8>) {
         out.extend_from_slice(&id.raw().to_le_bytes());
-        let (x, y, z) = self.cfg.quantize_pos(pos);
-        let packed = (x as u128)
-            | ((y as u128) << self.h_bits)
-            | ((z as u128) << (2 * self.h_bits));
+        let packed = (pos.x.raw() as u32 as u128)
+            | ((pos.y.raw() as u32 as u128) << self.h_bits)
+            | ((pos.z.raw() as u32 as u128) << (2 * self.h_bits));
         out.extend_from_slice(&packed.to_le_bytes()[..self.pos_bytes]);
         out.extend_from_slice(&tag.to_le_bytes());
     }
@@ -98,15 +101,12 @@ impl RecordCodec {
         let vmask = (1u128 << self.v_bits) - 1;
         let tag_start = 4 + self.pos_bytes;
         let tag = u16::from_le_bytes([buf[tag_start], buf[tag_start + 1]]);
-        Some((
-            id,
-            self.cfg.dequantize_pos(
-                (packed & hmask) as u32,
-                ((packed >> self.h_bits) & hmask) as u32,
-                ((packed >> (2 * self.h_bits)) & vmask) as u32,
-            ),
-            tag,
-        ))
+        let pos = Pos3::new(
+            Fixed::from_raw((packed & hmask) as u32 as i32),
+            Fixed::from_raw(((packed >> self.h_bits) & hmask) as u32 as i32),
+            Fixed::from_raw(((packed >> (2 * self.h_bits)) & vmask) as u32 as i32),
+        );
+        Some((id, pos, tag))
     }
 }
 

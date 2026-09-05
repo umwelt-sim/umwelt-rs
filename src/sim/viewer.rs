@@ -55,9 +55,16 @@ impl fmt::Display for ViewerId {
 }
 
 /// What a client declared about its connection when it registered.
+///
+/// Supplied by the consumer when it registers a viewer, not read off a wire: a
+/// game client never declares these to a region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientLimits {
     /// Largest payload the connection accepts.
+    ///
+    /// Must leave room for a header and at least one entity record;
+    /// [`register_viewer`](crate::WorldSimulation::register_viewer) panics
+    /// otherwise.
     pub payload_bytes: u16,
     /// Ticks between this client's packets. One is every tick.
     ///
@@ -81,9 +88,17 @@ impl Default for ClientLimits {
 
 /// One viewer's replication state.
 ///
-/// Viewers are partitioned across worker threads by contiguous range. These are
-/// not padded to a cache line, so a partition must be cut on a boundary that
-/// keeps two threads off one line.
+/// Viewers are partitioned across worker threads by contiguous range, and each
+/// worker writes its viewers' ghosts, sequence and subscription every tick. At
+/// 96 bytes these do not divide a cache line, so the two workers either side of
+/// a chunk boundary write the same one.
+///
+/// That is left alone deliberately. Padding to 128 was measured and cost 2-3%
+/// across the pipeline benchmarks, single-threaded runs included, because it
+/// spreads the viewer array over a third more cache lines to walk. The sharing
+/// it removes is one line per chunk boundary, so `threads - 1` lines however
+/// many viewers there are, while the padding is paid per viewer. The trade only
+/// pays if a partition ever gets small enough for that constant to matter.
 #[derive(Debug)]
 pub(crate) struct Viewer {
     /// The entity this viewer watches from.

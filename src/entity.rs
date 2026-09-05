@@ -243,9 +243,6 @@ impl LiveSet {
     }
 }
 
-/// Ascending live entities from a [`LiveSet`], produced by [`LiveSet::iter`].
-///
-/// Holds the current word rather than re-reading it, and clears the lowest set
 /// Which entities are alive, readable while their positions are held.
 ///
 /// Handed back by [`Step::positions_mut`](crate::Step::positions_mut). Those
@@ -281,6 +278,9 @@ impl<'a> Live<'a> {
     }
 }
 
+/// Ascending live entities from a [`LiveSet`], produced by [`LiveSet::iter`].
+///
+/// Holds the current word rather than re-reading it, and clears the lowest set
 /// bit per step, so a dense word costs one instruction per live entity and an
 /// empty one costs a single test.
 #[derive(Clone, Debug)]

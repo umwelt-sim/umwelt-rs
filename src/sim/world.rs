@@ -681,12 +681,12 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         let overshoot = self.snap.sub_threshold() as usize;
         let cap = self.walk_cap + overshoot;
         let ghosts = self.policy.ghost_cap;
-        let codec = self.codec.clone();
+        let codec = self.codec;
         let payload = crate::budget::DEFAULT_PAYLOAD_BYTES as usize;
         self.workers.resize_with(self.threads, || Scratch {
             found: DiscoveredEntities::with_capacity(cap),
             selection: Selection::with_capacity(ghosts),
-            writer: PacketWriter::new(codec.clone(), payload),
+            writer: PacketWriter::new(codec, payload),
             despawns: Vec::with_capacity(ghosts),
             stats: TickStats::default(),
         });
@@ -713,7 +713,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// Delivers a game message to the game before the next tick.
     ///
     /// Calls [`Game::message_received`] immediately. Call this between ticks
-    /// for each message drained from [`Inbound::drain_messages`], so the
+    /// for each message drained from
+    /// [`Inbound::drain_messages`](crate::net::Inbound::drain_messages), so the
     /// game has seen every message before [`step`](Game::step) runs.
     pub fn deliver_message(&mut self, from: EntityId, body: &[u8]) {
         self.game.message_received(from, body);
@@ -831,6 +832,14 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     ///
     /// Nothing here opens a connection. The edge maps the returned id to a
     /// socket; the simulation never sees one.
+    ///
+    /// # Panics
+    ///
+    /// If `limits.payload_bytes` does not leave room for a packet header and
+    /// one entity record. `ClientLimits` reaches here from the consumer rather
+    /// than off a wire, so a payload that cannot hold a record is a
+    /// configuration mistake to fail on rather than a viewer to register and
+    /// then never fill.
     pub fn register_viewer(
         &mut self,
         avatar: EntityId,

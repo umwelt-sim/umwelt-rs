@@ -25,9 +25,8 @@
 //! # Axes
 //!
 //! Axis conventions are documented on [`crate::pos`]. Relevant here: `x` and
-//! `y` share an extent, a cell size, and a wire precision. The `z` axis has its
-//! own extent, cell size, and wire precision, and the horizontal
-//! speed cap does not constrain it. It's eaiest to think of the world space as
+//! `y` share an extent and a cell size. The `z` axis has its own extent and its
+//! own wire width, and the horizontal speed cap does not constrain it. It's eaiest to think of the world space as
 //! being organized as a 2D space with vertical cylinders along the Z.
 //!
 //! # Serde
@@ -40,15 +39,9 @@ use crate::fixed::{FIXED_SHIFT, Fixed};
 use crate::pos::{CellCoord, CellId, Pos2, Pos3};
 use core::fmt;
 
-/// Largest supported subscription radius in cells. Bounds the inline capacity
-/// of subscription sets so they never allocate. 4 gives a 9x9 grid.
+/// Largest supported subscription radius in cells. 4 gives a 9x9 grid, which
+/// is what the derived cell size is checked against.
 pub(crate) const MAX_CELL_RADIUS: u32 = 4;
-
-/// Upper bound on cells in one subscription.
-pub(crate) const MAX_SUB_GRID_CELLS: usize = {
-    let axis = (2 * MAX_CELL_RADIUS + 1) as usize;
-    axis * axis
-};
 
 // ---------------------------------------------------------------------------
 // Axis
@@ -172,10 +165,6 @@ pub struct WorldConfig {
     sub_grid_cells: u32,
     tick_ms: u32,
     max_move_per_tick: Fixed,
-    horizontal_quant_shift: u32,
-    horizontal_precision: Fixed,
-    vertical_quant_shift: u32,
-    vertical_precision: Fixed,
 }
 
 impl WorldConfig {
@@ -265,25 +254,6 @@ impl WorldConfig {
     pub const fn max_move_per_tick(&self) -> Fixed {
         self.max_move_per_tick
     }
-    /// Bits dropped from a horizontal coordinate before it goes on the wire.
-    pub const fn horizontal_quant_shift(&self) -> u32 {
-        self.horizontal_quant_shift
-    }
-    /// Worst-case horizontal wire error.
-    ///
-    /// May be finer than requested: bit counts are whole numbers, so the
-    /// derived width rounds in your favor.
-    pub const fn horizontal_precision(&self) -> Fixed {
-        self.horizontal_precision
-    }
-    /// Bits dropped from a `z` value on the way to the wire.
-    pub const fn vertical_quant_shift(&self) -> u32 {
-        self.vertical_quant_shift
-    }
-    /// Worst-case vertical wire error.
-    pub const fn vertical_precision(&self) -> Fixed {
-        self.vertical_precision
-    }
 
     // -- cells ------------------------------------------------------------
 
@@ -351,69 +321,6 @@ impl WorldConfig {
             && pos.z.raw() < self.vertical_extent.raw()
     }
 
-    // -- wire -------------------------------------------------------------
-
-    /// An `x` or `y` value as it travels.
-    #[inline]
-    pub const fn quantize_horizontal(&self, v: Fixed) -> u32 {
-        (v.raw() as u32) >> self.horizontal_quant_shift
-    }
-
-    /// Back from the wire, to within the horizontal precision.
-    #[inline]
-    pub const fn dequantize_horizontal(&self, wire: u32) -> Fixed {
-        Fixed::from_raw((wire << self.horizontal_quant_shift) as i32)
-    }
-
-    /// A `z` value as it travels.
-    #[inline]
-    pub const fn quantize_vertical(&self, v: Fixed) -> u32 {
-        (v.raw() as u32) >> self.vertical_quant_shift
-    }
-
-    /// Back from the wire, to within the vertical precision.
-    #[inline]
-    pub const fn dequantize_vertical(&self, wire: u32) -> Fixed {
-        Fixed::from_raw((wire << self.vertical_quant_shift) as i32)
-    }
-
-    /// Lower precision for a full position for the wire, as `(x, y, z)`.
-    #[inline]
-    pub const fn quantize_pos(&self, pos: Pos3) -> (u32, u32, u32) {
-        (
-            self.quantize_horizontal(pos.x),
-            self.quantize_horizontal(pos.y),
-            self.quantize_vertical(pos.z),
-        )
-    }
-
-    /// Inverse of [`Self::quantize_pos`], landing at the low edge of each
-    /// precision step.
-    #[inline]
-    pub const fn dequantize_pos(&self, x: u32, y: u32, z: u32) -> Pos3 {
-        Pos3::new(
-            self.dequantize_horizontal(x),
-            self.dequantize_horizontal(y),
-            self.dequantize_vertical(z),
-        )
-    }
-
-    /// True when horizontal positions go on the wire at full internal
-    /// precision. Legal, and sometimes wanted, but it means paying full
-    /// precision on every packet.
-    pub const fn is_lossless_horizontal(&self) -> bool {
-        self.horizontal_quant_shift == 0
-    }
-
-    /// Distinct wire positions across one cell. A value of 1 means the wire
-    /// cannot distinguish positions within a cell at all.
-    ///
-    /// Whether a given value is acceptable depends on client rendering and
-    /// interpolation, which this crate cannot see.
-    pub const fn wire_steps_per_cell(&self) -> u32 {
-        (self.cell_size.raw() / self.horizontal_precision.raw()) as u32
-    }
-
     // -- misc -------------------------------------------------------------
 
     /// Stable digest of the fields that affect wire decoding. Exchanged at
@@ -434,20 +341,21 @@ impl WorldConfig {
         h
     }
 
-    /// A copy of the world configuration with `cell_size` overridden, 
-    /// for benchmarking the spatial index at sizes the derivation would not pick.
+    /// A copy of the world configuration with `cell_size` overridden, for
+    /// benchmarking the spatial index at sizes the derivation would not pick.
     ///
-    /// Not part of the normal path. Cell size derives from the view radius and
-    /// a consumer has no reason to set it; this exists so the cell-size sweep
-    /// can be re-run.
+    /// Not a consumer path. Cell size derives from the view radius and nothing
+    /// outside a sweep has a reason to set it, so this is reached through
+    /// `internals` rather than from here, and panics rather than returning an
+    /// error.
     ///
     /// # Panics
     ///
     /// If the size is not positive, not a power of two in raw units, does not
-    /// divide the region evenly, produces a cell radius above four, or is small
-    /// enough that an entity at `max_horizontal_speed` crosses more than one
-    /// boundary per tick.
-    pub fn with_cell_size_m(&self, m: i32) -> WorldConfig {
+    /// divide the region evenly, produces a cell radius above
+    /// [`MAX_CELL_RADIUS`], or is small enough that an entity at
+    /// `max_horizontal_speed` crosses more than one boundary per tick.
+    pub(crate) fn with_cell_size_m(&self, m: i32) -> WorldConfig {
         let cell_size = Fixed::from_meters(m);
         let cell_raw = cell_size.raw() as u32;
         let region_raw = self.region_size.raw() as u32;
@@ -462,10 +370,11 @@ impl WorldConfig {
             "cell size {cell_size} does not divide region {}",
             self.region_size
         );
-        let cell_radius = (self.horizontal_view_radius.raw() as u32).div_ceil(cell_raw);
+        let grid = Grid::derive(region_raw, cell_raw, self.horizontal_view_radius);
         assert!(
-            cell_radius <= MAX_CELL_RADIUS,
-            "cell size {cell_size} gives cell radius {cell_radius}, above {MAX_CELL_RADIUS}"
+            grid.cell_radius <= MAX_CELL_RADIUS,
+            "cell size {cell_size} gives cell radius {}, above {MAX_CELL_RADIUS}",
+            grid.cell_radius
         );
         assert!(
             (self.max_move_per_tick.raw() as u32) < cell_raw,
@@ -473,17 +382,7 @@ impl WorldConfig {
             self.max_move_per_tick
         );
 
-        WorldConfig {
-            cell_size,
-            cell_shift: cell_raw.trailing_zeros(),
-            cell_mask: (cell_raw - 1) as i32,
-            cells_per_axis: region_raw / cell_raw,
-            cells_per_region: (region_raw / cell_raw) * (region_raw / cell_raw),
-            cell_radius,
-            sub_grid_axis: 2 * cell_radius + 1,
-            sub_grid_cells: (2 * cell_radius + 1) * (2 * cell_radius + 1),
-            ..*self
-        }
+        WorldConfig { cell_size, ..grid.apply(*self) }
     }
 
     /// Uniform-distribution estimate of entities in one viewer's subscription.
@@ -511,7 +410,7 @@ const fn fnv(mut h: u64, v: u32) -> u64 {
 
 impl Default for WorldConfig {
     /// 4096 m region, 1024 m vertical, 256 m view radius, 40 m/s cap, 20 Hz.
-    /// Cell size derives to 128 m and wire precision is lossless.    
+    /// Cell size derives to 128 m.
     fn default() -> Self {
         Self::builder()
             .region_size_m(4096)
@@ -568,7 +467,8 @@ impl WorldConfigBuilder {
         self
     }
 
-    /// Ticks per second. Must be a power of two.
+    /// Ticks per second. Must divide evenly into 1000, so a tick lasts a
+    /// whole number of milliseconds.
     pub fn tick_hz(mut self, hz: u32) -> Self {
         self.tick_hz = Some(hz);
         self
@@ -622,9 +522,9 @@ impl WorldConfigBuilder {
             return Err(TickRateIndivisible { tick_hz });
         }
 
-        let cell_radius = (horizontal_view_radius.raw() as u32).div_ceil(cell_raw);
+        let grid = Grid::derive(region_raw, cell_raw, horizontal_view_radius);
         debug_assert!(
-            cell_radius <= MAX_CELL_RADIUS,
+            grid.cell_radius <= MAX_CELL_RADIUS,
             "derived cell size broke the radius bound"
         );
 
@@ -637,23 +537,18 @@ impl WorldConfigBuilder {
             });
         }
 
-        // Wire widths. Precision is one raw unit (1/1024 m) so a position
-        // keeps every bit the simulation computed with and the precision-reduction
-        // shift is zero. 
+        // Wire widths. A position travels at the full precision the
+        // simulation computed with, so an axis needs exactly as many bits as
+        // its extent has raw units.
         //
-        // Coarser precision would save bytes and round off motion: anything
-        // moving less than one step per tick would stand still and then jump.
-        // That threshold is `precision * tick_hz`, which at 1/16 m and 20 Hz is
-        // 1.25 m/s, which is inside the range of a walking human.
+        // Reducing precision was considered and rejected: one global step has
+        // to serve the nearest entity, and anything moving less than a step
+        // per tick would stand still and then jump. That threshold is
+        // `precision * tick_hz`, which at 1/16 m and 20 Hz is 1.25 m/s, inside
+        // the range of a walking human. The cost of not reducing is bounded at
+        // 16 bytes a record for the largest region `Fixed` can express.
         let horizontal_bits = region_raw.trailing_zeros();
-        let horizontal_quant_shift = 0;
-        let horizontal_precision = Fixed::from_raw(1);
         let vertical_bits = vertical_raw.trailing_zeros();
-        let vertical_quant_shift = 0;
-        let vertical_precision = Fixed::from_raw(1);
-
-        let cells_per_axis = region_raw / cell_raw;
-        let sub_grid_axis = 2 * cell_radius + 1;
 
         Ok(WorldConfig {
             region_size,
@@ -664,21 +559,60 @@ impl WorldConfigBuilder {
             tick_hz,
             horizontal_bits,
             vertical_bits,
+            tick_ms: 1_000 / tick_hz,
+            max_move_per_tick,
 
+            cell_shift: grid.cell_shift,
+            cell_mask: grid.cell_mask,
+            cells_per_axis: grid.cells_per_axis,
+            cells_per_region: grid.cells_per_region,
+            cell_radius: grid.cell_radius,
+            sub_grid_axis: grid.sub_grid_axis,
+            sub_grid_cells: grid.sub_grid_cells,
+        })
+    }
+}
+
+/// Everything a cell size implies, derived once so the builder and the
+/// benchmarking override cannot disagree about what a grid is.
+#[derive(Clone, Copy)]
+struct Grid {
+    cell_shift: u32,
+    cell_mask: i32,
+    cells_per_axis: u32,
+    cells_per_region: u32,
+    cell_radius: u32,
+    sub_grid_axis: u32,
+    sub_grid_cells: u32,
+}
+
+impl Grid {
+    fn derive(region_raw: u32, cell_raw: u32, view_radius: Fixed) -> Grid {
+        let cells_per_axis = region_raw / cell_raw;
+        let cell_radius = (view_radius.raw() as u32).div_ceil(cell_raw);
+        let sub_grid_axis = 2 * cell_radius + 1;
+        Grid {
             cell_shift: cell_raw.trailing_zeros(),
-            cell_mask: cell_size.raw() - 1,
+            cell_mask: (cell_raw - 1) as i32,
             cells_per_axis,
             cells_per_region: cells_per_axis * cells_per_axis,
             cell_radius,
             sub_grid_axis,
             sub_grid_cells: sub_grid_axis * sub_grid_axis,
-            tick_ms: 1_000 / tick_hz,
-            max_move_per_tick,
-            horizontal_quant_shift,
-            horizontal_precision,
-            vertical_quant_shift,
-            vertical_precision,
-        })
+        }
+    }
+
+    fn apply(self, cfg: WorldConfig) -> WorldConfig {
+        WorldConfig {
+            cell_shift: self.cell_shift,
+            cell_mask: self.cell_mask,
+            cells_per_axis: self.cells_per_axis,
+            cells_per_region: self.cells_per_region,
+            cell_radius: self.cell_radius,
+            sub_grid_axis: self.sub_grid_axis,
+            sub_grid_cells: self.sub_grid_cells,
+            ..cfg
+        }
     }
 }
 
@@ -715,12 +649,7 @@ mod tests {
         assert_eq!(w.tick_ms(), 50);
         assert_eq!(w.max_move_per_tick(), Fixed::from_meters(2));
         assert_eq!(w.horizontal_bits(), 22);
-        assert_eq!(w.horizontal_quant_shift(), 0);
-        assert_eq!(w.horizontal_precision(), Fixed::from_raw(1));
         assert_eq!(w.vertical_bits(), 20);
-        assert_eq!(w.vertical_quant_shift(), 0);
-        assert_eq!(w.wire_steps_per_cell(), 131_072);
-        assert!(w.is_lossless_horizontal());
     }
 
     #[test]
@@ -754,20 +683,12 @@ mod tests {
     }
 
     #[test]
-    fn precision_error_is_bounded_on_both_axes() {
+    fn an_axis_is_wide_enough_for_every_position_in_it() {
+        // The property that replaced precision reduction: a coordinate is
+        // carried whole, so its extent has to fit in the bits allotted to it.
         let w = WorldConfig::default();
-        for m in 0..1024i32 {
-            let p = Pos3::new(
-                Fixed::from_meters(m) + Fixed::from_raw(511),
-                Fixed::from_meters(m),
-                Fixed::from_meters(m) + Fixed::from_raw(511),
-            );
-            let (qx, qy, qz) = w.quantize_pos(p);
-            let back = w.dequantize_pos(qx, qy, qz);
-            assert!((p.x - back.x).abs() < w.horizontal_precision());
-            assert!((p.z - back.z).abs() < w.vertical_precision());
-            assert_eq!(p.y, back.y);
-        }
+        assert_eq!(1u32 << w.horizontal_bits(), w.region_size().raw() as u32);
+        assert_eq!(1u32 << w.vertical_bits(), w.vertical_extent().raw() as u32);
     }
 
     #[test]

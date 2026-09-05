@@ -12,7 +12,17 @@ pub use crate::packet::PacketWriter;
 pub use crate::select::{NEAR_BAND, Ranked, Selection, select};
 pub use crate::sim::Outbound;
 pub use crate::snapshot::{CellOccupants, CellSnapshot, SubCells};
-pub use crate::subscription::{CellList, Subscription};
+pub use crate::subscription::Subscription;
+
+/// A world with `cell_size` overridden, for re-running the cell-size sweep.
+///
+/// Here rather than on [`WorldConfig`](crate::WorldConfig) because cell size
+/// derives from the view radius and no consumer has a reason to set it. It
+/// panics on a size the grid cannot take, which is right for a sweep and wrong
+/// for anything a consumer calls.
+pub fn with_cell_size_m(cfg: &crate::WorldConfig, m: i32) -> crate::WorldConfig {
+    cfg.with_cell_size_m(m)
+}
 
 /// Reads a payload back into a [`TickObservation`](crate::TickObservation),
 /// which is what a client does with one.

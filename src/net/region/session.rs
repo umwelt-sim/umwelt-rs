@@ -48,6 +48,7 @@ use crate::net::region::edges::{EdgeId, EdgeStats, Edges};
 use crate::net::region::protocol::{
     DespawnEntities, GameMessage, KIND_DESPAWN_ENTITIES, KIND_GAME_MESSAGE, KIND_KEEPALIVE,
     KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MoveEntities, Presence, Spawn, SpawnEntities,
+    kind_name,
 };
 use crate::net::region::subjects;
 use crate::pos::Pos3;
@@ -252,7 +253,11 @@ impl Inbound {
             // Says only that the edge is still there, which admitting it
             // already recorded.
             KIND_KEEPALIVE => return,
-            _ => Err(NetError::Unexpected { expected: "a command", got: kind }),
+            _ => Err(NetError::Unexpected {
+                expected: "a command",
+                got: kind,
+                name: kind_name(kind),
+            }),
         };
         match decoded {
             Ok(command) => {

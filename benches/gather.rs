@@ -476,7 +476,7 @@ fn bench_capped_town_square(c: &mut Criterion) {
 fn bench_cell_size(c: &mut Criterion) {
     let mut group = c.benchmark_group("gather/cell_size");
     for &m in &[64i32, 128, 256, 512] {
-        let cfg = WorldConfig::default().with_cell_size_m(m);
+        let cfg = umwelt::internals::with_cell_size_m(&WorldConfig::default(), m);
         let entities = uniform(&cfg, 8_192, 0xA11CE);
         let snap = snapshot_of(&cfg, &entities);
         let vs = viewers(&cfg, 1_000, 0xBEEF);

@@ -185,6 +185,9 @@ impl Ranked {
     }
 
     /// What it scored. Higher is sent sooner.
+    ///
+    /// Saturates rather than widening; see [`score_of`] for where the ceiling
+    /// is and why it sits there.
     #[inline]
     pub fn score(&self) -> u32 {
         self.score
@@ -260,9 +263,8 @@ impl Selection {
 ///
 /// `slots` is how many records fit this tick's packet.
 ///
-/// The ghost set is the nearest `ghost_cap` of `candidates`, chosen by
-/// [`nearest`], and it holds still from tick to tick because distance changes
-/// slowly.
+/// The ghost set is the nearest `ghost_cap` of `candidates`, and it holds
+/// still from tick to tick because distance changes slowly.
 ///
 /// Every member of the ghost set is stamped, so only an entity that has left
 /// the set ages out and departs. An update that scored zero consumes no slot.
@@ -351,6 +353,25 @@ fn nearest(dists: &[u32], cap: usize, edge: &mut Vec<u32>, keep: &mut Vec<u32>) 
 }
 
 /// `drift x weight(band)`, saturating.
+///
+/// The product needs 44 bits at the largest weight, so it is clamped rather
+/// than carried. Entities past the clamp tie and fall back to walk order,
+/// which is a real loss of ordering and a deliberately accepted one:
+///
+/// - Reaching it takes 1,048,576 raw units of drift against the weight of a
+///   one-metre separation, which is 1024 m of path an entity travelled while
+///   never once winning a slot: 26 seconds at the speed cap.
+/// - An entity that gets there scores `u32::MAX` and is therefore at the top
+///   of the ranking. Ties only arise among entities that are all already
+///   inside the packet budget, so what the tie decides is the order of
+///   records that all get sent.
+/// - A never-seen entity scores `unseen_drift x 4096`, four times under the
+///   clamp, so an introduction never saturates.
+///
+/// Widening [`Ranked`] to carry the full product was measured at roughly 2%
+/// across the pipeline benchmarks, scaling with `ghost_cap`, because it
+/// doubles the entry the per-viewer sort moves. That is the wrong price for an
+/// ordering nobody can observe.
 fn score_of(drift: u32, dist_sq: DistSq, w: &Weights) -> u32 {
     drift.saturating_mul(w.at(band_of(dist_sq)))
 }
@@ -440,6 +461,35 @@ mod tests {
     }
 
     // -- the two properties the whole design exists for ---------------------
+
+    /// Where the score stops distinguishing, and that an introduction stays
+    /// clear of it. Both numbers are quoted in `score_of`'s reasoning for
+    /// clamping rather than widening, so a change to the weight table or to
+    /// `unseen_drift` that moves them should fail here and be re-argued.
+    #[test]
+    fn the_score_ceiling_is_where_it_is_documented_to_be() {
+        let near = DistSq::from_radius(Fixed::from_meters(1));
+        let w = Weights::inverse_distance();
+        let heaviest = w.at(band_of(near));
+        assert_eq!(heaviest, 4096, "the largest weight anchors the ceiling");
+
+        // 1024 m of unsent path is where two entities stop being told apart.
+        let ceiling = (1u64 << 32) / u64::from(heaviest);
+        assert_eq!(ceiling, Fixed::from_meters(1024).raw() as u64);
+        let over = ceiling as u32;
+        assert_eq!(score_of(over, near, &w), u32::MAX);
+        assert_eq!(score_of(over + 1_000, near, &w), u32::MAX, "and ties past it");
+
+        // Anything under it still orders, which is the whole reachable range.
+        assert!(score_of(over - 1, near, &w) < u32::MAX);
+        assert!(score_of(over - 2, near, &w) < score_of(over - 1, near, &w));
+
+        // An introduction scores well clear of the clamp.
+        assert!(
+            u64::from(DEFAULT_UNSEEN_DRIFT) * u64::from(heaviest) * 4 == 1u64 << 32,
+            "an unseen entity should sit exactly four times under the ceiling"
+        );
+    }
 
     #[test]
     fn an_idle_entity_stops_being_sent() {

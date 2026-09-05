@@ -133,6 +133,27 @@ pub(crate) enum Outgoing {
 }
 
 /// Everything an edge server holds, shared with every handle to it.
+///
+/// # Locking
+///
+/// Several independent mutexes rather than one, because the relay path reads
+/// `entities` while client tasks write `clients` and neither should wait on
+/// the other. The rule that keeps that safe is **hold one at a time**: take a
+/// lock, get what is needed out of it, release it, then take the next. Paths
+/// that need two do it in sequence, with an explicit `drop` where scoping does
+/// not already end the borrow.
+///
+/// The one exception is [`tell_the_world`](super::server), which holds
+/// `entities` and `told` together to decide which clients still need a
+/// region's parameters. Nothing takes those two the other way round.
+///
+/// [`with_game`](Self::with_game) is the same rule at its sharpest: a game is
+/// free to call back in through [`EdgeHandle`], so nothing at all may be held
+/// while consumer code runs.
+///
+/// This is a convention rather than something the type system checks, so a new
+/// path that holds two has to be read for it. Breaking it deadlocks the edge
+/// rather than corrupting anything.
 pub(crate) struct Shared {
     pub(crate) link: RegionClient,
     pub(crate) clients: Mutex<HashMap<ClientId, Client>>,
@@ -178,7 +199,8 @@ impl Shared {
     /// Calls into the consumer's game.
     ///
     /// **Nothing else may be locked here.** A game is free to call back into
-    /// [`EdgeHandle`], which takes these locks itself.
+    /// [`EdgeHandle`], which takes these locks itself, and none of them is
+    /// reentrant. See the locking rule on [`Shared`].
     pub(crate) fn with_game(&self, f: impl FnOnce(&mut dyn EdgeGame)) {
         let mut game = self.game.lock().expect("not poisoned");
         f(game.as_mut());
@@ -565,7 +587,8 @@ impl EdgeHandle {
 
     /// Forwards a game message to the region an entity lives in.
     ///
-    /// The region delivers it to [`Game::message`](crate::Game::message)
+    /// The region delivers it to
+    /// [`Game::message_received`](crate::Game::message_received)
     /// with the entity's id as the sender. The body is the game's own
     /// bytes, at most 4091 bytes.
     pub fn send_to_region(&self, entity: EntityKey, body: &[u8]) -> Result<(), NetError> {

@@ -446,9 +446,8 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
             }
         }
         FromClient::Teleport { handle, region: dest, position } => {
-            // Look up the entity this handle names. Each lock is taken and
-            // released separately — holding both at once risks deadlocking
-            // against the region reader, which takes them in the other order.
+            // Look up the entity this handle names. `clients` then
+            // `entities`, one at a time, per the locking rule on `Shared`.
             let Some(key) = key_of(shared, client, handle) else {
                 shared.count_refused();
                 return;

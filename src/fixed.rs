@@ -82,10 +82,11 @@ impl Fixed {
         self.0 as f32 / FIXED_ONE as f32
     }
 
-    /// Magnitude. Saturates rather than wrapping on [`Fixed::MIN`].
+    /// Magnitude. Saturates rather than wrapping on [`Fixed::MIN`], whose
+    /// true magnitude is one past [`Fixed::MAX`].
     #[inline]
     pub const fn abs(self) -> Fixed {
-        Fixed(self.0.abs())
+        Fixed(self.0.saturating_abs())
     }
 
     /// The smaller of two fixed point numbers.
@@ -394,6 +395,16 @@ mod tests {
         let d = DistSq::from_radius(Fixed::from_meters(300));
         let r = d.sqrt_approx();
         assert!((r - Fixed::from_meters(300)).abs() <= Fixed::from_raw(2));
+    }
+
+    #[test]
+    fn abs_of_the_minimum_saturates() {
+        // `i32::abs` panics in debug and returns i32::MIN in release, so the
+        // magnitude of the most negative value has to be clamped rather than
+        // negated.
+        assert_eq!(Fixed::MIN.abs(), Fixed::MAX);
+        assert_eq!(Fixed::from_meters(-3).abs(), Fixed::from_meters(3));
+        assert_eq!(Fixed::MAX.abs(), Fixed::MAX);
     }
 
     #[test]

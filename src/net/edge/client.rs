@@ -99,7 +99,9 @@ impl Shared {
     }
 
     /// **Nothing else may be locked here.** A game is free to call back into
-    /// [`ClientHandle`].
+    /// [`ClientHandle`], which takes `live` and `codecs` itself, and neither
+    /// is reentrant. Settle those before calling in and copy out whatever the
+    /// game is handed.
     fn with_game(&self, f: impl FnOnce(&mut dyn ClientGame)) {
         let mut game = self.game.lock().expect("not poisoned");
         f(game.as_mut());
@@ -476,31 +478,41 @@ fn deliver(shared: &Shared, body: &[u8]) {
         else {
             return;
         };
-        let codecs = shared.codecs.lock().expect("not poisoned");
-        // The world arrives before the first spawn into a region, on the
+        // Copied out rather than borrowed from the map: the observation is
+        // handed to consumer code below, and nothing may be locked while that
+        // runs. The world arrives before the first spawn into a region, on the
         // reliable stream, so a missing codec means a handle this client never
         // spent.
-        let Some(codec) = codecs.get(&region) else { return };
-        let Some(state) = TickObservation::new(codec, packet) else { return };
+        let held = shared.codecs.lock().expect("not poisoned").get(&region).cloned();
+        let Some(codec) = held else { return };
+        let Some(state) = TickObservation::new(&codec, packet) else { return };
         shared.with_game(|game| game.observed(handle, region, &state));
         return;
     }
-    // Kept here so a state packet can be decoded without the wire having to
-    // repeat the region on every one. The game is told it too, since it is the
-    // only tier that sees more than one region at a time.
-    if let ToClient::Spawned { handle, region, .. } = message {
-        if let Some(held) = shared.live.lock().expect("not poisoned").get_mut(&handle) {
-            held.region = Some(region);
+    // Settled before the game is told, so nothing is locked while consumer
+    // code runs and a game calling back in sees the state it was told about
+    // rather than the one before it.
+    match message {
+        // Kept here so a state packet can be decoded without the wire having
+        // to repeat the region on every one. The game is told it too, since it
+        // is the only tier that sees more than one region at a time.
+        ToClient::Spawned { handle, region, .. } => {
+            if let Some(held) =
+                shared.live.lock().expect("not poisoned").get_mut(&handle)
+            {
+                held.region = Some(region);
+            }
         }
+        ToClient::Removed { handle } => {
+            shared.live.lock().expect("not poisoned").remove(&handle);
+        }
+        _ => {}
     }
     shared.with_game(|game| match message {
         ToClient::Spawned { handle, region, entity } => {
             game.spawned(handle, region, entity)
         }
-        ToClient::Removed { handle } => {
-            shared.live.lock().expect("not poisoned").remove(&handle);
-            game.removed(handle)
-        }
+        ToClient::Removed { handle } => game.removed(handle),
         ToClient::Teleported { handle, region } => game.teleported(handle, region),
         ToClient::TeleportFailed { handle, region } => {
             game.teleport_failed(handle, region)

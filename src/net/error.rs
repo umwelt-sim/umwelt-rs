@@ -3,7 +3,6 @@
 use core::fmt;
 
 use crate::config::ConfigError;
-use crate::net::region::protocol::kind_name;
 use crate::net::version::ProtocolVersion;
 
 /// A failure on either link.
@@ -26,12 +25,17 @@ pub enum NetError {
     /// A message arrived but did not decode. The string names what was being
     /// read rather than echoing any of the sender's bytes back.
     Malformed(&'static str),
-    /// A well-formed message of a kind that does not belong on that subject.
+    /// A well-formed message of a kind that does not belong there.
     Unexpected {
-        /// What that subject carries.
+        /// What that subject or frame carries.
         expected: &'static str,
         /// The kind byte that arrived instead.
         got: u8,
+        /// What that byte names, resolved by whichever protocol read it.
+        /// The two links number their messages separately and the same byte
+        /// means different things on each, so the name travels with the error
+        /// rather than being looked up from one link's table afterward.
+        name: &'static str,
     },
     /// A message body past what this side will allocate for it.
     MessageTooLarge {
@@ -75,8 +79,8 @@ impl fmt::Display for NetError {
             Congested => write!(f, "no room to send without queuing stale state"),
             Unknown(what) => write!(f, "no such {what}"),
             Malformed(what) => write!(f, "malformed {what}"),
-            Unexpected { expected, got } => {
-                write!(f, "expected {expected}, got {} (kind {got})", kind_name(*got))
+            Unexpected { expected, got, name } => {
+                write!(f, "expected {expected}, got {name} (kind {got})")
             }
             MessageTooLarge { claimed, max } => {
                 write!(f, "message claims {claimed} bytes, past the {max} byte cap")

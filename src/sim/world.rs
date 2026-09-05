@@ -53,6 +53,18 @@ pub const DEFAULT_GHOST_CAP: usize = 256;
 /// swept apart.
 pub const DEFAULT_WALK_CAP: usize = DEFAULT_GHOST_CAP;
 
+/// Viewers a worker claims at a time.
+///
+/// Small enough that the last run cannot leave one worker holding a
+/// meaningful share of the tick, large enough that the lock guarding the
+/// hand-out is taken once per run rather than once per viewer.
+///
+/// Swept against 64, which is closer to dealing the work out in fixed slices:
+/// at eight threads that gave 9.6% against 12.7% on a spread population and
+/// 8.0% against 11.3% on a crowd, and was worse at two and four threads as
+/// well. Nothing here was measured below 16.
+const GRAIN: usize = 16;
+
 /// Ticks a ghost survives after leaving the ghost set.
 ///
 /// One tick absorbs a rank flapping across the edge of the set without keeping
@@ -965,22 +977,33 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             return w.stats;
         }
 
-        let chunk = viewers.len().div_ceil(threads);
+        // Claimed rather than dealt out. A viewer in a crowd walks its whole
+        // cap and one standing alone walks nothing, so a fixed slice each
+        // leaves a worker holding most of the tick while the rest wait on it.
+        // Workers take the next run of viewers as they finish, which costs one
+        // uncontended lock per run rather than per viewer.
+        let runs = std::sync::Mutex::new(viewers.chunks_mut(GRAIN).enumerate());
         std::thread::scope(|scope| {
-            for (c, (vs, w)) in
-                viewers.chunks_mut(chunk).zip(workers.iter_mut()).enumerate()
-            {
+            for w in workers.iter_mut() {
                 let frame = &frame;
-                let base = c * chunk;
+                let runs = &runs;
                 scope.spawn(move || {
-                    for (k, v) in vs.iter_mut().enumerate() {
-                        serve(
-                            frame,
-                            ViewerId::from_raw((base + k) as u32),
-                            v,
-                            w,
-                            on_viewer,
-                        );
+                    loop {
+                        let Some((c, vs)) =
+                            runs.lock().expect("not poisoned").next()
+                        else {
+                            break;
+                        };
+                        let base = c * GRAIN;
+                        for (k, v) in vs.iter_mut().enumerate() {
+                            serve(
+                                frame,
+                                ViewerId::from_raw((base + k) as u32),
+                                v,
+                                w,
+                                on_viewer,
+                            );
+                        }
                     }
                 });
             }
@@ -1507,6 +1530,64 @@ mod tests {
         assert_eq!(a, b, "the slot is handed on");
         assert_eq!(s.ghost_count(b), 0, "a new client knows nothing");
         assert_eq!(s.viewer_slots(), 1);
+    }
+
+    /// Workers claim runs of viewers rather than being dealt a fixed slice,
+    /// so the id a payload is sent under is computed from the run's base
+    /// instead of the worker's. Getting that arithmetic wrong pairs one
+    /// viewer's state with another's id, which the stats comparison alongside
+    /// this cannot see: the totals come out the same either way.
+    ///
+    /// The gather does not exclude a viewer's own entity, so each viewer must
+    /// find its own avatar among its candidates. Spreading the avatars far
+    /// enough apart that no two share a view makes that unique to the pair.
+    #[test]
+    fn every_viewer_is_served_once_under_its_own_id() {
+        for threads in [1usize, 2, 3, 8, 64] {
+            let mut s = sim(Walk::still());
+            // Far apart: 512 m between avatars against a 256 m view radius.
+            let mut avatars = Vec::new();
+            {
+                let mut step = Step {
+                    xs: &mut s.xs,
+                    ys: &mut s.ys,
+                    zs: &mut s.zs,
+                    tags: &mut s.tags,
+                    live: &mut s.live,
+                    despawned: &mut s.despawned,
+                    cfg: &s.cfg,
+                    tick: 0,
+                };
+                for k in 0..40i32 {
+                    let at = Pos3::from_meters(256 + (k % 8) * 512, 256 + (k / 8) * 512, 0);
+                    avatars.push(step.spawn(at, 0));
+                }
+            }
+            s.set_thread_count(threads);
+            let mut expected = Vec::new();
+            for a in &avatars {
+                expected.push(s.register_viewer(*a, ClientLimits::default()));
+            }
+            let owns: std::collections::HashMap<u32, EntityId> =
+                expected.iter().zip(&avatars).map(|(v, a)| (v.raw(), *a)).collect();
+
+            let seen = Mutex::new(Vec::new());
+            s.tick_with(&|out: Outbound<'_>| {
+                let mine = owns[&out.viewer.raw()];
+                assert!(
+                    out.candidates.iter().any(|c| c.id == mine),
+                    "{:?} was served a view without its own avatar {mine:?}, \
+                     so it was paired with another viewer's state",
+                    out.viewer
+                );
+                seen.lock().expect("not poisoned").push(out.viewer.raw());
+            });
+
+            let mut got = seen.into_inner().expect("not poisoned");
+            got.sort_unstable();
+            let want: Vec<u32> = (0..avatars.len() as u32).collect();
+            assert_eq!(got, want, "at {threads} threads: every viewer exactly once");
+        }
     }
 
     #[test]

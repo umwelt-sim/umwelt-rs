@@ -246,14 +246,21 @@ impl Shared {
         message: ToClient<'_>,
         by: Transport,
     ) -> Result<(), NetError> {
-        // Framed in place: the length prefix is reserved and filled in, rather
-        // than encoding once and copying into a second buffer to prefix it.
-        let mut framed = vec![0u8; 4];
-        message.encode_onto(&mut framed);
-        let body = &framed[4..];
-        let clients = self.clients();
-        let held = clients.get(&client).ok_or(NetError::Unknown("client"))?;
+        // What the connection needs is taken under the lock and the lock is
+        // then dropped. A `quinn::Connection` is a handle, so cloning it is a
+        // refcount, and sending used to happen with the whole client map held:
+        // one client's datagram blocked every other client's traffic behind it.
+        let (conn, out) = {
+            let clients = self.clients();
+            let held = clients.get(&client).ok_or(NetError::Unknown("client"))?;
+            (held.conn.clone(), held.out.clone())
+        };
+
         if by == Transport::Datagram {
+            // A datagram carries exactly one message, so it needs no length in
+            // front of it and is encoded straight into the buffer that goes out.
+            let mut body = Vec::new();
+            message.encode_onto(&mut body);
             // Dropped rather than queued when the connection has no room. State
             // is latest-only, so a packet waiting behind staler ones is worth
             // less than the one after it, and filling a send buffer with them
@@ -263,16 +270,21 @@ impl Shared {
             // anticipated and one discovered: no room left in the send buffer,
             // and a packet larger than the path will carry at all. quinn
             // refuses the second rather than fragmenting.
-            if held.conn.max_datagram_size().is_none_or(|room| room < body.len())
-                || held.conn.datagram_send_buffer_space() < body.len()
+            if conn.max_datagram_size().is_none_or(|room| room < body.len())
+                || conn.datagram_send_buffer_space() < body.len()
             {
                 return Err(NetError::Congested);
             }
-            held.conn.send_datagram(framed.split_off(4).into())?;
+            conn.send_datagram(body.into())?;
         } else {
+            // A stream is a byte sequence, so this one does need the prefix.
+            // Reserved, then filled in, rather than encoding and copying into
+            // a second buffer to put a length in front of it.
+            let mut framed = vec![0u8; 4];
+            message.encode_onto(&mut framed);
             let len = (framed.len() - 4) as u32;
             framed[..4].copy_from_slice(&len.to_le_bytes());
-            held.out.send(framed).map_err(|_| NetError::Unknown("client"))?;
+            out.send(framed).map_err(|_| NetError::Unknown("client"))?;
         }
         Ok(())
     }

@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name = "pipeline"
 harness = false
+
+[[bench]]
+name = "relay"
+harness = false

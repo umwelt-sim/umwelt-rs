@@ -40,6 +40,13 @@ pub fn read_payload<'a>(
 /// The region-to-edge wire, and an edge's side of it.
 pub mod region {
     pub use crate::net::region::client::{Incoming, Offer, RegionClient};
+
+    /// Which subject carries what, and how to read one back. Every inbound
+    /// message on this link pays the parse, so it is benchmarked.
+    pub mod subjects {
+        pub use crate::net::region::subjects::{command, origin, sender, state};
+    }
+
     pub use crate::net::region::protocol::{
         DespawnEntities, MAX_DESPAWN_PER_MESSAGE, MAX_MESSAGE_BYTES,
         MAX_MOVES_PER_MESSAGE, MAX_SPAWN_PER_MESSAGE, MoveEntities, PROTOCOL_VERSION,

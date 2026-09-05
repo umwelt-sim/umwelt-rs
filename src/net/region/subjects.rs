@@ -25,7 +25,7 @@ pub(crate) fn info(region: RegionId) -> String {
 }
 
 /// One observer's assembled packet.
-pub(crate) fn state(region: RegionId, edge: &EdgeName) -> String {
+pub fn state(region: RegionId, edge: &EdgeName) -> String {
     format!("umwelt.{}.edge.{edge}.state", region.raw())
 }
 
@@ -35,7 +35,7 @@ pub(crate) fn presence(region: RegionId, edge: &EdgeName) -> String {
 }
 
 /// Where one edge sends its commands to one region.
-pub(crate) fn command(region: RegionId, edge: &EdgeName) -> String {
+pub fn command(region: RegionId, edge: &EdgeName) -> String {
     format!("umwelt.{}.edge.{edge}.command", region.raw())
 }
 
@@ -49,18 +49,32 @@ pub(crate) fn to_edge(edge: &EdgeName, leaf: &str) -> String {
     format!("umwelt.*.edge.{edge}.{leaf}")
 }
 
+/// The five tokens of an `umwelt.{region}.edge.{edge}.{leaf}` subject.
+///
+/// Walked rather than collected. Every message that crosses either link is
+/// read this way, and gathering the tokens into a `Vec` first, only to match
+/// on them and drop it, is an allocation per message spent on pattern syntax.
+fn tokens(subject: &str) -> Option<[&str; 5]> {
+    let mut it = subject.split('.');
+    let five = [it.next()?, it.next()?, it.next()?, it.next()?, it.next()?];
+    if it.next().is_some() {
+        return None;
+    }
+    Some(five)
+}
+
 /// The edge that sent a command, read out of the subject it arrived on.
-pub(crate) fn sender(subject: &str) -> Result<EdgeName, NetError> {
-    match subject.split('.').collect::<Vec<_>>()[..] {
-        ["umwelt", _, "edge", edge, "command"] => EdgeName::new(edge),
+pub fn sender(subject: &str) -> Result<EdgeName, NetError> {
+    match tokens(subject) {
+        Some(["umwelt", _, "edge", edge, "command"]) => EdgeName::new(edge),
         _ => Err(NetError::BadSubject),
     }
 }
 
 /// The region a state or presence message came from, read out of its subject.
-pub(crate) fn origin(subject: &str) -> Result<RegionId, NetError> {
-    match subject.split('.').collect::<Vec<_>>()[..] {
-        ["umwelt", region, "edge", _, "state" | "presence"] => {
+pub fn origin(subject: &str) -> Result<RegionId, NetError> {
+    match tokens(subject) {
+        Some(["umwelt", region, "edge", _, "state" | "presence"]) => {
             region.parse().map(RegionId::from_raw).map_err(|_| NetError::BadSubject)
         }
         _ => Err(NetError::BadSubject),
@@ -109,6 +123,27 @@ mod tests {
         assert!(sender("umwelt.7.edge.edge-3.state").is_err());
         assert!(sender("umwelt.7.info").is_err());
         assert!(sender("nonsense").is_err());
+    }
+
+    /// The token walk replaced a collect, so the cases that used to fall out
+    /// of matching a slice of the wrong length now have to be refused by hand.
+    #[test]
+    fn a_subject_of_the_wrong_shape_does_not_parse() {
+        for wrong in [
+            "",
+            "umwelt",
+            "umwelt.7.edge.e",                    // four tokens
+            "umwelt.7.edge.e.command.extra",      // six
+            "umwelt.7.edge.e.command.",           // seven-ish, trailing empty
+            ".umwelt.7.edge.e.command",           // leading empty
+            "elsewhere.7.edge.e.command",
+        ] {
+            assert!(sender(wrong).is_err(), "sender accepted {wrong:?}");
+            assert!(origin(wrong).is_err(), "origin accepted {wrong:?}");
+        }
+        // And the shapes that should still work, unchanged.
+        assert_eq!(sender("umwelt.7.edge.e.command").expect("parses").as_str(), "e");
+        assert_eq!(origin("umwelt.7.edge.e.state").expect("parses"), RegionId::from_raw(7));
     }
 
     #[test]

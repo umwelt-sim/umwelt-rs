@@ -500,6 +500,11 @@ fn get_pos(c: &mut Cursor<'_>) -> Result<Pos3, NetError> {
 #[derive(Debug, Default)]
 pub struct Framer {
     buf: Vec<u8>,
+    /// How far into `buf` has been handed out. Taking a message advances this
+    /// rather than removing bytes from the front, because removing them moves
+    /// everything behind down and one read holding many messages would pay
+    /// that per message. The dead prefix is reclaimed once per read instead.
+    at: usize,
 }
 
 impl Framer {
@@ -516,7 +521,14 @@ impl Framer {
     }
 
     /// Adds bytes read off the stream.
+    ///
+    /// Whatever previous reads handed out is dropped here, so the buffer is
+    /// compacted once per read rather than once per message taken from it.
     pub fn push(&mut self, bytes: &[u8]) {
+        if self.at > 0 {
+            self.buf.drain(..self.at);
+            self.at = 0;
+        }
         self.buf.extend_from_slice(bytes);
     }
 
@@ -527,20 +539,25 @@ impl Framer {
     /// [`MAX_MESSAGE_BYTES`], which is not recoverable: the stream cannot be
     /// resynchronized, so the caller drops the connection.
     pub fn take(&mut self) -> Result<Option<Vec<u8>>, NetError> {
-        if self.buf.len() < 4 {
+        let head = self.at;
+        let waiting = self.buf.len() - head;
+        if waiting < 4 {
             return Ok(None);
         }
-        let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
-            as usize;
+        let len = u32::from_le_bytes([
+            self.buf[head],
+            self.buf[head + 1],
+            self.buf[head + 2],
+            self.buf[head + 3],
+        ]) as usize;
         if len > MAX_MESSAGE_BYTES {
             return Err(NetError::Malformed("client frame length"));
         }
-        if self.buf.len() < 4 + len {
+        if waiting < 4 + len {
             return Ok(None);
         }
-        let body = self.buf[4..4 + len].to_vec();
-        self.buf.drain(..4 + len);
-        Ok(Some(body))
+        self.at = head + 4 + len;
+        Ok(Some(self.buf[head + 4..head + 4 + len].to_vec()))
     }
 }
 
@@ -798,6 +815,48 @@ mod tests {
             }
         }
         assert_eq!(got, up());
+    }
+
+    /// Taking a message advances a cursor instead of removing bytes, and the
+    /// dead prefix is dropped on the next push. A burst arriving in one read
+    /// exercises the cursor, and a message straddling the compaction is what
+    /// would corrupt if the prefix were dropped by the wrong amount.
+    #[test]
+    fn a_framer_survives_compaction_with_a_message_straddling_it() {
+        let mut buf = Vec::new();
+        let mut framed = Vec::new();
+        let mut wire = Vec::new();
+        for m in up() {
+            m.encode(&mut buf);
+            Framer::frame(&buf, &mut framed);
+            wire.extend_from_slice(&framed);
+        }
+
+        // A whole burst in one read: every message must come out in order.
+        let mut f = Framer::new();
+        f.push(&wire);
+        let mut got = Vec::new();
+        while let Some(body) = f.take().expect("well formed") {
+            got.push(FromClient::decode(&body).expect("well formed"));
+        }
+        assert_eq!(got, up(), "a burst in one read");
+
+        // Now cut the wire mid-message so a partial tail is still buffered
+        // when the next push compacts, and the message completes across it.
+        for cut in [1usize, 7, wire.len() / 3, wire.len() - 2] {
+            let mut f = Framer::new();
+            f.push(&wire[..cut]);
+            let mut got = Vec::new();
+            while let Some(body) = f.take().expect("well formed") {
+                got.push(FromClient::decode(&body).expect("well formed"));
+            }
+            // Whatever was left half-read is completed by the second push.
+            f.push(&wire[cut..]);
+            while let Some(body) = f.take().expect("well formed") {
+                got.push(FromClient::decode(&body).expect("well formed"));
+            }
+            assert_eq!(got, up(), "split at {cut}");
+        }
     }
 
     #[test]

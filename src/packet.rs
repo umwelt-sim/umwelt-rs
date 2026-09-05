@@ -43,14 +43,26 @@ impl PacketHeader {
     /// The header's width on the wire.
     pub const BYTES: usize = 16;
 
-    /// Appends the header. Little-endian, like everything else on this wire.
+    /// The header's sixteen wire bytes. Little-endian, like everything else
+    /// on this wire.
+    ///
+    /// An array rather than a buffer to append to, because the header is
+    /// written twice per payload: reserved before the counts are known, then
+    /// rewritten over the front once they are.
+    pub fn to_bytes(self) -> [u8; PacketHeader::BYTES] {
+        let mut out = [0u8; PacketHeader::BYTES];
+        out[0..4].copy_from_slice(&self.tick.to_le_bytes());
+        out[4..6].copy_from_slice(&self.sequence.to_le_bytes());
+        out[6..8].copy_from_slice(&self.ack.to_le_bytes());
+        out[8..12].copy_from_slice(&self.ack_bits.to_le_bytes());
+        out[12..14].copy_from_slice(&self.despawns.to_le_bytes());
+        out[14..16].copy_from_slice(&self.updates.to_le_bytes());
+        out
+    }
+
+    /// Appends the header.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.tick.to_le_bytes());
-        out.extend_from_slice(&self.sequence.to_le_bytes());
-        out.extend_from_slice(&self.ack.to_le_bytes());
-        out.extend_from_slice(&self.ack_bits.to_le_bytes());
-        out.extend_from_slice(&self.despawns.to_le_bytes());
-        out.extend_from_slice(&self.updates.to_le_bytes());
+        out.extend_from_slice(&self.to_bytes());
     }
 
     /// `None` if `buf` is shorter than a header.
@@ -134,9 +146,7 @@ impl PacketWriter {
             despawns: u16::try_from(despawns.len()).expect("despawn count fits a u16"),
             updates: u16::try_from(updated).expect("update count fits a u16"),
         };
-        let mut head = Vec::with_capacity(PacketHeader::BYTES);
-        header.encode(&mut head);
-        self.buf[..PacketHeader::BYTES].copy_from_slice(&head);
+        self.buf[..PacketHeader::BYTES].copy_from_slice(&header.to_bytes());
         &self.buf
     }
 
@@ -344,6 +354,43 @@ mod tests {
                 "a payload {cut} bytes short must not parse"
             );
         }
+    }
+
+    /// The writer is documented as holding one allocation and reusing it, and
+    /// used to allocate a sixteen-byte buffer per payload to rewrite the
+    /// header through. The buffer keeping both its capacity and its address
+    /// across a long run is what says the header no longer needs one.
+    #[test]
+    fn building_a_payload_reuses_one_buffer_and_nothing_else() {
+        let c = codec();
+        let mut w = PacketWriter::new(c, 1200);
+        let moved: Vec<(EntityId, Pos3, u16)> =
+            (0..84).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
+        w.build(1, 1, &[], moved.clone());
+        let (cap, ptr) = (w.buf.capacity(), w.buf.as_ptr());
+        for tick in 2..500u32 {
+            w.build(tick, tick as u16, &[id(1)], moved.clone());
+            assert_eq!(w.buf.capacity(), cap, "the payload buffer reallocated");
+            assert_eq!(w.buf.as_ptr(), ptr, "the payload buffer moved");
+        }
+    }
+
+    /// The two ways of writing a header have to agree, since one reserves the
+    /// space and the other overwrites it once the counts are known.
+    #[test]
+    fn appending_a_header_matches_writing_its_bytes() {
+        let h = PacketHeader {
+            tick: 0xDEAD_BEEF,
+            sequence: 0x1234,
+            ack: 0x5678,
+            ack_bits: 0xAABB_CCDD,
+            despawns: 7,
+            updates: 91,
+        };
+        let mut appended = Vec::new();
+        h.encode(&mut appended);
+        assert_eq!(appended.as_slice(), &h.to_bytes()[..]);
+        assert_eq!(PacketHeader::decode(&h.to_bytes()), Some(h));
     }
 
     #[test]

@@ -9,6 +9,8 @@
 //! [`LiveSet`] says which of those slots hold a live entity; the rest are
 //! skipped.
 
+use std::sync::{Arc, OnceLock};
+
 use crate::config::WorldConfig;
 use crate::entity::{EntityId, LiveSet};
 use crate::fixed::Fixed;
@@ -116,8 +118,8 @@ pub struct CellSnapshot {
     sub_cursor: Vec<u32>,
     /// Sub-cell visit order, nearest first, for every possible origin.
     /// `sub_order[o * buckets .. (o + 1) * buckets]` is the order from origin
-    /// `o`. Built once at construction; independent of entity data.
-    sub_order: Vec<u16>,
+    /// `o`. Depends only on `sub_axis`, so it is shared rather than owned.
+    sub_order: Arc<[u16]>,
     /// Cell offsets from a viewer's own cell, nearest first. A viewer sits at
     /// the center of its subscription, so one order serves every viewer.
     cell_order: Vec<(i8, i8)>,
@@ -248,7 +250,7 @@ impl CellSnapshot {
             scratch_zs: Vec::new(),
             scratch_tags: Vec::new(),
             sub_cursor: vec![0; (sub_axis * sub_axis) as usize],
-            sub_order: build_sub_order(sub_axis),
+            sub_order: sub_order_for(sub_axis),
             cell_order: build_cell_order(cfg.cell_radius()),
         }
     }
@@ -434,11 +436,9 @@ impl CellSnapshot {
         let cfg = self.cfg;
         let slots = xs.len();
         let n = live.live();
-        self.ids.clear();
-        self.xs.clear();
-        self.ys.clear();
-        self.zs.clear();
-        self.tags.clear();
+        // Resized, not cleared and resized. Pass 3 writes every slot below `n`
+        // exactly once, because the cursors partition that range, so filling
+        // them with defaults first is `n` writes thrown away on every tick.
         self.ids.resize(n, EntityId::from_raw(0));
         self.xs.resize(n, Fixed::ZERO);
         self.ys.resize(n, Fixed::ZERO);
@@ -574,6 +574,23 @@ fn build_cell_order(cell_radius: u32) -> Vec<(i8, i8)> {
     }
     v.sort_by_key(|&(d2, _)| d2);
     v.into_iter().map(|(_, o)| o).collect()
+}
+
+/// The visit-order table for one axis, built at most once per process.
+///
+/// It depends on nothing but `sub_axis`, and at the default of 32 it is
+/// `32^4` entries: a megabyte of `u16` produced by 1024 sorts of 1024
+/// elements, measured at 21.7 ms. Every `CellSnapshot` was paying that to
+/// compute a table identical to every other snapshot's.
+///
+/// `sub_axis` is a power of two no greater than [`MAX_SUB_AXIS`], so there are
+/// six legal values and the cache is indexed by the exponent.
+fn sub_order_for(axis: u32) -> Arc<[u16]> {
+    const SLOTS: usize = MAX_SUB_AXIS.trailing_zeros() as usize + 1;
+    static CACHE: [OnceLock<Arc<[u16]>>; SLOTS] = [const { OnceLock::new() }; SLOTS];
+    CACHE[axis.trailing_zeros() as usize]
+        .get_or_init(|| build_sub_order(axis).into())
+        .clone()
 }
 
 /// Visit order from every origin, nearest first by squared distance between
@@ -1154,6 +1171,56 @@ mod tests {
         }
     }
 
+    /// The snapshot arrays are resized rather than cleared between ticks, so
+    /// a slot the sort failed to write would keep the previous tick's entity
+    /// instead of an obvious zero. Rebuilding onto a disjoint population is
+    /// what catches that: nothing from the first tick may survive into the
+    /// second.
+    #[test]
+    fn a_rebuild_leaves_nothing_of_the_previous_tick() {
+        let cfg = WorldConfig::default();
+        let first: Vec<Pos3> = (0..900).map(|k| Pos3::from_meters(10 + k % 40, 10 + k / 40, 0)).collect();
+        let (xs, ys, zs, tags) = axes(&first);
+        let mut live = LiveSet::new();
+        for k in 0..first.len() {
+            live.insert(EntityId::from_raw(k as u32));
+        }
+        let mut snap = CellSnapshot::new(&cfg);
+        snap.update(&xs, &ys, &zs, &tags, &live);
+
+        // A second population with no id in common and a different footprint,
+        // shrinking the array so any surviving tail would be visible.
+        let mut live2 = LiveSet::new();
+        let mut xs2 = xs.clone();
+        let mut ys2 = ys.clone();
+        let mut zs2 = zs.clone();
+        let mut tags2 = tags.clone();
+        for k in 0..first.len() {
+            xs2[k] = Fixed::from_meters(3000 + (k % 17) as i32);
+            ys2[k] = Fixed::from_meters(3000 + (k / 17) as i32);
+            zs2[k] = Fixed::from_meters(7);
+            tags2[k] = 42;
+        }
+        for k in 500..first.len() {
+            live2.insert(EntityId::from_raw(k as u32));
+        }
+        snap.update(&xs2, &ys2, &zs2, &tags2, &live2);
+
+        assert_eq!(snap.len(), 400);
+        let mut seen = 0;
+        for c in 0..snap.cell_count() {
+            let cell = snap.entities_for_cell(CellId::from_raw(c as u32));
+            for i in 0..cell.len() {
+                let id = cell.ids[i];
+                assert!(live2.contains(id), "{id:?} is from the previous tick");
+                assert_eq!(cell.pos(i), Pos3::new(xs2[id.index()], ys2[id.index()], zs2[id.index()]));
+                assert_eq!(cell.tags[i], 42, "a stale tag survived");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 400, "every live entity is present exactly once");
+    }
+
     #[test]
     fn one_cell_can_hold_everything() {
         let cfg = WorldConfig::default();
@@ -1196,5 +1263,41 @@ mod thread_safety {
         fn assert_sync<T: Sync + Send>() {}
         assert_sync::<CellSnapshot>();
         assert_sync::<CellOccupants<'_>>();
+    }
+}
+
+#[cfg(test)]
+mod order_cache_tests {
+    use super::*;
+
+    #[test]
+    fn the_order_table_is_built_once_per_axis() {
+        // Every snapshot on one axis shares one table, so construction after
+        // the first pays nothing for it and a clone bumps a refcount.
+        let cfg = WorldConfig::default();
+        let a = CellSnapshot::new(&cfg);
+        let b = CellSnapshot::new(&cfg);
+        assert!(
+            Arc::ptr_eq(&a.sub_order, &b.sub_order),
+            "two snapshots on the same axis must share one table"
+        );
+        assert!(Arc::ptr_eq(&a.sub_order, &a.clone().sub_order), "a clone shares it");
+
+        // A different axis gets its own, and each is the right size.
+        let coarse = CellSnapshot::with_subdivision(&cfg, 8, 512);
+        assert!(!Arc::ptr_eq(&a.sub_order, &coarse.sub_order));
+        assert_eq!(coarse.sub_order.len(), 8usize.pow(4));
+        assert_eq!(a.sub_order.len(), (DEFAULT_SUB_AXIS as usize).pow(4));
+    }
+
+    #[test]
+    fn a_cached_table_matches_a_freshly_built_one() {
+        for axis in [1u32, 2, 4, 8, 16, 32] {
+            assert_eq!(
+                sub_order_for(axis).as_ref(),
+                build_sub_order(axis).as_slice(),
+                "axis {axis}"
+            );
+        }
     }
 }

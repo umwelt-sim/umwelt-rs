@@ -7,7 +7,7 @@
 
 use crate::entity::EntityId;
 use crate::fixed::DistSq;
-use crate::pos::{CellCoord, Pos2, Pos3};
+use crate::pos::{CellCoord, Pos3};
 use crate::snapshot::{CellOccupants, CellSnapshot};
 use crate::subscription::Subscription;
 
@@ -241,7 +241,7 @@ impl CellSnapshot {
                         walk.sub_cells += 1;
                         walk.examined += bucket.len() as u32;
                         walk.biggest_bucket = walk.biggest_bucket.max(bucket.len() as u32);
-                        take(viewer, viewer_h, radius_sq, bucket, out);
+                        take(viewer, radius_sq, bucket, out);
                         if out.len() >= cap {
                             return walk;
                         }
@@ -252,7 +252,7 @@ impl CellSnapshot {
                     walk.whole_cells += 1;
                     walk.examined += bucket.len() as u32;
                     walk.biggest_bucket = walk.biggest_bucket.max(bucket.len() as u32);
-                    take(viewer, viewer_h, radius_sq, bucket, out);
+                    take(viewer, radius_sq, bucket, out);
                     if out.len() >= cap {
                         return walk;
                     }
@@ -267,24 +267,36 @@ impl CellSnapshot {
 // slower than always.
 
 /// Tests one run of entities against the view radius and appends survivors.
+///
+/// The horizontal separation decides membership and is also two thirds of the
+/// 3D distance that gets recorded, so it is computed once and reused rather
+/// than once for each. The height term is only reached by an entity that
+/// passed, which is what makes it worth splitting.
 #[inline(always)]
 fn take(
     viewer: Pos3,
-    viewer_h: Pos2,
     radius_sq: DistSq,
     entities: CellOccupants<'_>,
     out: &mut DiscoveredEntities,
 ) {
+    let (vx, vy, vz) = (
+        viewer.x.raw() as i64,
+        viewer.y.raw() as i64,
+        viewer.z.raw() as i64,
+    );
+    let radius = radius_sq.raw();
     for i in 0..entities.len() {
-        // The horizontal terms are computed twice: once here, once in
-        // the 3D distance below.
-        if viewer_h.dist_sq(entities.horizontal(i)) > radius_sq {
+        let dx = vx - entities.xs[i].raw() as i64;
+        let dy = vy - entities.ys[i].raw() as i64;
+        let flat = (dx * dx + dy * dy) as u64;
+        if flat > radius {
             continue;
         }
+        let dz = vz - entities.zs[i].raw() as i64;
         out.push(DiscoveredEntity::new(
             entities.ids[i],
             entities.snapshot_index(i),
-            viewer.dist_sq(entities.pos(i)),
+            DistSq::from_raw(flat + (dz * dz) as u64),
         ));
     }
 }
@@ -299,6 +311,61 @@ mod tests {
             0,
             DistSq::from_radius(crate::fixed::Fixed::from_meters(radius_m)),
         )
+    }
+
+    /// The split path has to agree with the obvious one on both halves: which
+    /// entities are in range, and how far away each is in three dimensions.
+    #[test]
+    fn the_recorded_distance_is_the_full_3d_separation() {
+        use crate::config::WorldConfig;
+        use crate::entity::LiveSet;
+        use crate::fixed::Fixed;
+        use crate::snapshot::CellSnapshot;
+
+        let cfg = WorldConfig::default();
+        let mut seed = 0x5eed_1234_9abc_def0u64;
+        let mut next = |m: i32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as u32 % m as u32) as i32
+        };
+        let pts: Vec<Pos3> =
+            (0..3000).map(|_| Pos3::from_meters(next(4096), next(4096), next(1024))).collect();
+        let (xs, ys, zs): (Vec<Fixed>, Vec<Fixed>, Vec<Fixed>) = (
+            pts.iter().map(|p| p.x).collect(),
+            pts.iter().map(|p| p.y).collect(),
+            pts.iter().map(|p| p.z).collect(),
+        );
+        let mut live = LiveSet::new();
+        for i in 0..pts.len() {
+            live.insert(EntityId::from_raw(i as u32));
+        }
+        let mut snap = CellSnapshot::new(&cfg);
+        snap.update(&xs, &ys, &zs, &vec![0u16; pts.len()], &live);
+
+        let radius_sq = crate::fixed::DistSq::from_radius(cfg.horizontal_view_radius());
+        for viewer in [
+            Pos3::from_meters(2048, 2048, 500),
+            Pos3::from_meters(64, 64, 0),
+            Pos3::from_meters(4000, 100, 1023),
+        ] {
+            let sub = Subscription::at_center(&cfg, cfg.cell_of(viewer.horizontal()));
+            let mut found = DiscoveredEntities::new();
+            snap.gather_into(viewer, sub, &mut found);
+
+            // Independently: everyone inside the cylinder, by the plain
+            // formulas on the original points.
+            let mut want: Vec<(u32, u64)> = pts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| viewer.horizontal_dist_sq(**p) <= radius_sq)
+                .map(|(i, p)| (i as u32, viewer.dist_sq(*p).raw()))
+                .collect();
+            let mut got: Vec<(u32, u64)> =
+                found.iter().map(|e| (e.id.raw(), e.dist_sq.raw())).collect();
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want, "from {viewer:?}");
+        }
     }
 
     #[test]

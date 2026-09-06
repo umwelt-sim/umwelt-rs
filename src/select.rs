@@ -149,6 +149,20 @@ pub struct Policy {
     pub unseen_drift: u32,
     /// How the parts of a score are traded off.
     pub weights: Weights,
+    /// Ticks after which a ghost is treated as unseen even if nothing has
+    /// moved, so it is sent again. Zero switches it off.
+    ///
+    /// A mark advances when a record is sent, not when it arrives. Nothing on
+    /// this link acknowledges anything, so a packet that is lost leaves the
+    /// client holding a position the region believes it corrected. If that
+    /// entity then stops moving its drift is zero, its score is zero, and it
+    /// is never chosen again: the client stays wrong for as long as it holds
+    /// the ghost.
+    ///
+    /// Re-sending on a timer bounds that. It does not detect the loss, so it
+    /// costs a slot on entities that were fine, and the exchange is that
+    /// error becomes temporary instead of permanent.
+    pub refresh: u32,
 }
 
 impl Default for Policy {
@@ -158,6 +172,7 @@ impl Default for Policy {
             grace: 0,
             unseen_drift: DEFAULT_UNSEEN_DRIFT,
             weights: Weights::inverse_distance(),
+            refresh: 0,
         }
     }
 }
@@ -288,8 +303,18 @@ pub fn select(
 
     for &k in &out.keep {
         let e = &cands[k as usize];
-        let (drift, flag) = match ghosts.mark(e.id) {
-            Some(mark) => (odometer.reading(e.id).wrapping_sub(mark), 0),
+        let (drift, flag) = match ghosts.held(e.id) {
+            Some(held) => {
+                let moved = odometer.reading(e.id).wrapping_sub(held.mark);
+                // A ghost nothing has corrected in `refresh` ticks is treated
+                // as one the client does not hold, because after a lost packet
+                // that is what it is. Scored rather than forced, so it takes a
+                // slot in distance order along with everything else and a near
+                // one is refreshed before a far one.
+                let stale = policy.refresh != 0
+                    && tick.wrapping_sub(held.last_sent) >= policy.refresh;
+                (if stale { moved.max(policy.unseen_drift) } else { moved }, 0)
+            }
             None => (policy.unseen_drift, NEW_BIT),
         };
         out.ranked.push(Ranked {
@@ -489,6 +514,73 @@ mod tests {
             u64::from(DEFAULT_UNSEEN_DRIFT) * u64::from(heaviest) * 4 == 1u64 << 32,
             "an unseen entity should sit exactly four times under the ceiling"
         );
+    }
+
+    /// A mark advances on send, so a packet that never arrives leaves the
+    /// client holding a position the region believes it corrected. If that
+    /// entity then stops moving, its drift is zero and nothing brings it back.
+    /// The refresh is what bounds how long the client stays wrong.
+    #[test]
+    fn a_lost_update_to_an_entity_that_then_idles_is_repaired() {
+        let id = EntityId::from_raw(0);
+        let mut w = World::new(1);
+        let cands = candidates(&[(0, 10)]);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = Policy { ghost_cap: 64, grace: 1000, refresh: 100, ..Policy::default() };
+
+        // Introduced, and this one arrives. The client's copy is the truth.
+        select(1, &cands, &w.odo, &p, 84, &mut ghosts, &mut sel);
+        assert_eq!(sel.records().len(), 1);
+
+        // It moves 50 m and is chosen again. This packet is lost, which the
+        // region has no way to know: the mark advances regardless.
+        w.walk(id, 50);
+        w.tick();
+        select(2, &cands, &w.odo, &p, 84, &mut ghosts, &mut sel);
+        assert_eq!(sel.records().len(), 1, "the update the client never got");
+
+        // It stands still from here. Drift is zero, so only the refresh can
+        // choose it.
+        let mut repaired_at = None;
+        for tick in 3..=400u32 {
+            w.tick();
+            select(tick, &cands, &w.odo, &p, 84, &mut ghosts, &mut sel);
+            if !sel.records().is_empty() && repaired_at.is_none() {
+                repaired_at = Some(tick);
+            }
+        }
+        let at = repaired_at.expect("an idle ghost must be sent again eventually");
+        assert!(
+            (102..=104).contains(&at),
+            "repaired at tick {at}, which is not the tick after the refresh came due"
+        );
+    }
+
+    /// The refresh must not turn into a per-tick resend: an entity that is
+    /// correct costs a slot once per period, not once per tick.
+    #[test]
+    fn a_refresh_costs_one_slot_per_period_not_every_tick() {
+        let n = 50;
+        let mut w = World::new(n);
+        let cands = ladder(n);
+        let mut ghosts = GhostTable::new();
+        let mut sel = Selection::new();
+        let p = Policy { ghost_cap: 1024, grace: 1000, refresh: 100, ..Policy::default() };
+
+        select(1, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+        assert_eq!(sel.records().len(), n, "every entity is new on the first tick");
+
+        let mut sent = 0;
+        for tick in 2..=400u32 {
+            w.tick();
+            select(tick, &cands, &w.odo, &p, 98, &mut ghosts, &mut sel);
+            sent += sel.records().len();
+        }
+        // Nothing moved across 399 ticks. Each of the 50 comes due at 100 and
+        // again at 200 and 300, so four sweeps at most.
+        assert!(sent <= n * 4, "{sent} records for {n} idle entities is a resend storm");
+        assert!(sent >= n, "every idle entity should come due at least once");
     }
 
     #[test]

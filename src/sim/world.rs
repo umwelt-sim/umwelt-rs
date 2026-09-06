@@ -65,6 +65,20 @@ pub const DEFAULT_WALK_CAP: usize = DEFAULT_GHOST_CAP;
 /// well. Nothing here was measured below 16.
 const GRAIN: usize = 16;
 
+/// Ticks after which a ghost is sent again even if nothing moved.
+///
+/// Five seconds at 20 Hz. Nothing acknowledges a packet, so a lost one leaves
+/// a client holding a position the region believes it corrected, and an entity
+/// that then stops moving is never chosen again. This bounds how long that
+/// lasts.
+///
+/// The cost is slots spent on entities that were already correct: with the
+/// default ghost cap, one two-hundredth of the set comes due each tick, which
+/// is between one and two records of the eighty-four a packet holds. Lowering
+/// it shortens the worst case and spends more; zero switches it off and
+/// returns the permanent error.
+pub const DEFAULT_REFRESH: u32 = 100;
+
 /// Ticks a ghost survives after leaving the ghost set.
 ///
 /// One tick absorbs a rank flapping across the edge of the set without keeping
@@ -587,6 +601,7 @@ impl<G: Game> WorldSimulation<G, NullSink> {
                 // by up to the whole view radius.
                 unseen_drift: cfg.horizontal_view_radius().raw() as u32,
                 weights: crate::select::Weights::inverse_distance(),
+                refresh: DEFAULT_REFRESH,
             },
         )
     }

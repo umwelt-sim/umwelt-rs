@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use umwelt::internals::{NEAR_BAND, Outbound};
-use umwelt::sim::{DEFAULT_GHOST_CAP, DEFAULT_GRACE};
+use umwelt::sim::{DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_REFRESH};
 use umwelt::{ClientLimits, EntityId, Fixed, Game, Policy, Pos3, Step, Weights};
 use umwelt::{WorldConfig, WorldSimulation};
 
@@ -344,6 +344,7 @@ struct Sweep {
     grace: u32,
     viewer_class: usize,
     send_period: u8,
+    refresh: u32,
     seed: u64,
 }
 
@@ -356,6 +357,7 @@ impl Sweep {
             grace: DEFAULT_GRACE,
             viewer_class: WALKING_VIEWERS,
             send_period: 1,
+            refresh: DEFAULT_REFRESH,
             seed: 0x5EED,
         }
     }
@@ -390,6 +392,7 @@ fn run(s: Sweep) -> Run {
         grace: s.grace,
         unseen_drift: cfg.horizontal_view_radius().raw() as u32,
         weights: s.weights,
+        refresh: s.refresh,
     };
     let mut sim = WorldSimulation::with_replication(cfg, game, s.ghost_cap, policy);
     sim.tick();
@@ -675,6 +678,27 @@ fn main() {
             })
             .collect();
     report("send period, at the default grace", &periods);
+
+    // What re-sending on a timer costs. Nothing here loses a packet, so every
+    // refresh is spent on a ghost that was already correct: this measures the
+    // price, and the repair it buys is only visible against a link that drops
+    // things, which this harness does not model. Off is the behaviour before
+    // the refresh existed, and is what the other tables in this report were
+    // measured against.
+    //
+    // A period is only exercised by a ghost that stays in the set that long
+    // without being chosen, so nothing at or above TICKS is worth running: it
+    // would come due once at the very end, or never, and read as free.
+    let refreshes: Vec<Run> = [
+        ("off", 0u32),
+        ("every 200", 200),
+        ("every 100", DEFAULT_REFRESH),
+        ("every 25", 25),
+    ]
+    .into_iter()
+    .map(|(label, refresh)| run(Sweep { label, refresh, ..Sweep::base() }))
+    .collect();
+    report("refresh period, with no packet loss", &refreshes);
 
     // Coverage moves around between populations in a way the error columns do
     // not, so the same caps are run against three crowds before anything is

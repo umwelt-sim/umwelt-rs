@@ -24,16 +24,30 @@ struct Ghost {
     mark: u32,
     /// Tick this entity was last a candidate for this client.
     last_seen: u32,
+    /// Tick this entity was last actually sent, which is not the tick it was
+    /// last a candidate. A send is what the client's copy depends on, and a
+    /// send that never arrived leaves that copy wrong with nothing in the
+    /// reading to say so.
+    last_sent: u32,
 }
 
 impl Ghost {
-    const VACANT: Ghost = Ghost { id: EMPTY, mark: 0, last_seen: 0 };
+    const VACANT: Ghost = Ghost { id: EMPTY, mark: 0, last_seen: 0, last_sent: 0 };
+}
+
+/// What a client is believed to hold for one entity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// Odometer reading when it was last sent.
+    pub mark: u32,
+    /// Tick it was last sent.
+    pub last_sent: u32,
 }
 
 /// Ghost records for one viewer, keyed by entity id.
 ///
 /// Open addressing with linear probing, power-of-two slot count, held at or
-/// below half full. Computed: 12 bytes per slot, so 24 bytes per ghost.
+/// below half full. Computed: 16 bytes per slot, so 32 bytes per ghost.
 ///
 /// The hash is fixed rather than seeded, so a replay reconstructs identical
 /// probe orders. Entity ids are server-assigned.
@@ -97,11 +111,21 @@ impl GhostTable {
     /// The mark for `id`, or `None` if the client holds no ghost of it.
     #[inline]
     pub fn mark(&self, id: EntityId) -> Option<u32> {
+        self.held(id).map(|h| h.mark)
+    }
+
+    /// What the client is believed to hold for `id`, or `None` if it holds no
+    /// ghost of it. Both halves come off one probe.
+    #[inline]
+    pub fn held(&self, id: EntityId) -> Option<Held> {
         if self.slots.is_empty() {
             return None;
         }
         match self.find(id.raw()) {
-            Ok(i) => Some(self.slots[i].mark),
+            Ok(i) => Some(Held {
+                mark: self.slots[i].mark,
+                last_sent: self.slots[i].last_sent,
+            }),
             Err(_) => None,
         }
     }
@@ -128,9 +152,12 @@ impl GhostTable {
     /// Records that `id` was sent on `tick` at odometer reading `mark`,
     /// creating the ghost if the client did not have one.
     ///
-    /// The mark advances on send rather than on acknowledgment, so a lost
-    /// packet leaves this client's copy of a since-idle entity permanently
-    /// wrong. Unresolved; see §Open questions in the design document.
+    /// The mark advances on send rather than on acknowledgment. Nothing on
+    /// this link acknowledges anything, so a lost packet leaves the client
+    /// holding a position the region believes it corrected, and an entity that
+    /// then stops moving has zero drift and is never chosen again.
+    /// [`Policy::refresh`](crate::Policy::refresh) bounds how long that lasts
+    /// by sending a ghost again on a timer. It does not detect the loss.
     ///
     /// Allocates only while growing.
     ///
@@ -144,9 +171,15 @@ impl GhostTable {
             Ok(i) => {
                 self.slots[i].mark = mark;
                 self.slots[i].last_seen = tick;
+                self.slots[i].last_sent = tick;
             }
             Err(i) => {
-                self.slots[i] = Ghost { id: id.raw(), mark, last_seen: tick };
+                self.slots[i] = Ghost {
+                    id: id.raw(),
+                    mark,
+                    last_seen: tick,
+                    last_sent: tick,
+                };
                 self.len += 1;
             }
         }
@@ -289,8 +322,13 @@ mod tests {
     }
 
     #[test]
-    fn a_ghost_record_is_twelve_bytes() {
-        assert_eq!(size_of::<Ghost>(), 12, "id, mark, and tick with no padding");
+    fn a_ghost_record_is_sixteen_bytes() {
+        // One per entity a client holds, and a table is kept at or below half
+        // full, so a viewer at the default ghost cap pays 8 KB for its ghosts.
+        // Four of these bytes are `last_sent`, which is what a refresh costs
+        // in memory.
+        assert_eq!(size_of::<Ghost>(), 16, "id, two ticks and a mark, no padding");
+        assert_eq!(align_of::<Ghost>(), 4);
     }
 
     #[test]

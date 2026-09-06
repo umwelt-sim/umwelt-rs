@@ -16,7 +16,8 @@ pub use sink::{NullSink, PayloadSink, RecordingSink};
 pub use viewer::{ClientLimits, ViewerId};
 pub(crate) use world::TickSpan;
 pub use world::{
-    DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_WALK_CAP, Step, TickStats, WorldSimulation,
+    DEFAULT_GHOST_CAP, DEFAULT_GRACE, DEFAULT_REFRESH, DEFAULT_WALK_CAP, Step,
+    TickStats, WorldSimulation,
 };
 
 #[doc(hidden)]

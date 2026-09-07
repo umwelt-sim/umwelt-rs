@@ -135,12 +135,12 @@ tier that sees both frames; its consumer sees the world frame.
 **Client.** `ClientHandle::spawn`, `move_entity` and `teleport` take a
 `WorldPos` and no `RegionId`. `TickObservation::updates` yields a `WorldPos`,
 translated by `EdgeClient` from the frame the edge sends the client for each
-region it is registered in, and names the entity by the edge's `EntityKey`
-rather than the region's id. The region's id drops below the client API. No
+region it is registered in, and names the entity by the 64-bit name the edge
+assigned and the region wrote into the record, never by a region's id. No
 region-local position and no region-local id reaches a `ClientGame`, its own
 entity's included. `observed` still says which region served the packet,
 because a game holding one entity sees two packets a tick near a seam, one
-from its region and one from its shadow's. It keys what it draws by the key,
+from its region and one from its shadow's. It keys what it draws by the name,
 and an entity it holds from both regions is one entity. A crossing reaches it
 as `spawned` with the new region, then `teleported`, as a requested teleport
 does. `ClientGame` gains nothing.
@@ -228,10 +228,40 @@ at the default region size of 4096 m, 512 regions along one axis exhaust an
 `i32`. A region size that is a power of two, which the builder already
 enforces, makes the translation a shift and a subtract.
 
-The wire protocol does not change. A record is 14 bytes of local position at the
-default config, and the world position is rebuilt where the record is read.
-This closes the `DESIGN.md` open item that a global space would need `i64`: it
-does, but only off the wire.
+The wire changes in one place. The entity field of a record and of a despawn
+is the entity's 64-bit name rather than the region's 32-bit id, so a record is
+18 bytes at the default config instead of 14, and a default packet holds 65
+records instead of 84, computed. Positions stay local on the wire and are
+rebuilt into world coordinates where the record is read. This closes the
+`DESIGN.md` open item that a global space would need `i64`: it does, but only
+off the wire.
+
+### One name per entity
+
+The mapping between a region's ids and the name a client sees is done by the
+edge and by nothing else, and its purpose is to hide the regions from the
+client. The edge already assigns that name: it is the `EntityKey` the edge
+mints at spawn, sends to the region as the token, and keeps across a teleport
+(`docs/adr/0008`), and the edge already holds the only table from names to
+region ids. What changes is that the name reaches the client's wire. The
+region keeps the token per entity, eight bytes it does not read, and writes
+it into each record and each despawn in place of the region's id. The region
+maps nothing; it echoes what the edge told it.
+
+An entity the region's game spawned has no edge and no token. The region
+names it by its own `RegionId` and the entity's id composed into one `u64`
+with the top bit clear. It never leaves its region, so that name is stable
+for its whole life. An edge's keys carry the top bit set, so the two kinds of
+name cannot collide. The key is minted from a per-edge counter today; its
+high 32 bits now come from the edge's random name with the top bit set, and
+two edges mint disjoint keys.
+
+A client holds no table. `EdgeClient` keeps only which regions are currently
+sending a name, so that a despawn from one region for a name another region
+is still sending, which is what a crossing looks like from beside the seam,
+is not reported as the entity going away. A pocket universe needs nothing
+more: its entities carry the same kinds of name, and nothing crosses out of
+it.
 
 The translation is done in the client's library half, not at the edge.
 `docs/adr/0006` decided the edge relays a packet without decoding it, and it
@@ -387,38 +417,27 @@ walker at 1.5 m/s and under 70 cm for a vehicle at 30 m/s, inside the tick or
 two a client draws behind. A client that reckons its own entity's motion
 carries on through it as it does through a late packet.
 
-**A bystander sees nothing, because the identity it holds does not change.**
-`docs/adr/0003` named a stable identity as a need, so that a crossing does not
-make people who did not move drop the entity and re-add it. The identity
-already exists: the edge's `EntityKey` survives the crossing, and the edge
-already sends it to every region as the token on `Spawn`. What was missing is
-that the region echoed it once on `Added` and forgot it, and the wire named
-entities by the region's id. So the region keeps the token per entity, eight
-bytes it does not read, and when a viewer first sights an entity the packet
-carries `Sighted { id, key }` on the event reserve despawns already use,
-twelve bytes, ahead of the record. The refresh that already re-sends a ghost
-after a lost packet re-sends the sighting with it, so a client is never left
-holding an id it cannot name. `EdgeClient` keeps the map from a region's ids
-to keys and hands the game keys. A bystander near the seam holds the crosser
-under one key from two regions, and the origin's despawn of the old id retires
-a mapping and nothing it draws. Measured in the quality harness, ghosts arrive
-at 0.58 a tick, so the sightings cost about seven bytes a tick per viewer,
-computed.
+**A bystander sees nothing.** The name it holds for the crosser is the same
+in both regions, so the destination's first record for that name updates an
+entity the bystander already draws, and the origin's despawn for a name the
+destination is still sending is not reported. The edge assigned the name and
+the region wrote the same one on both sides; nothing at the client maps
+anything.
 
 An unattended entity has no shadow and crosses by the same teleport under the
 same key; a bystander sees nothing of that either.
 
 ### Protocol additions
 
-On the bus: the key `map` in the key-value bucket `umwelt`, read by every edge
-at startup. Region to edge: `Presence::BoundaryCollision { entity, target }`
-when a move would leave the box, `Presence::ViewCollision { entity, position }`
-when a viewer's view reaches the box and on each cell change while it does, and
-`Presence::ViewCleared { entity }` when it no longer does. Edge to region:
-nothing. In a packet: `Sighted { id, key }` on the existing event reserve, on a
-viewer's first sighting of an entity and on a refresh resend. Nothing in a
-region's info reply or heartbeat changes, and nothing is added for the teleport
-itself.
+On the bus: the key `map` in the key-value bucket `umwelt`, read by every
+edge at startup. Region to edge: `Presence::BoundaryCollision { entity,
+target }` when a move would leave the box, `Presence::ViewCollision { entity,
+position }` when a viewer's view reaches the box and on each cell change while
+it does, and `Presence::ViewCleared { entity }` when it no longer does. Edge
+to region: nothing. In a packet: records and despawns carry the entity's
+64-bit name in place of the region's id, and nothing else changes. Nothing in
+a region's info reply or heartbeat changes, and nothing is added for the
+teleport itself.
 
 Edge to client: `Frame { region, placement }`, with no placement for a region
 off the map, sent when the client is first registered in a region. Client to
@@ -486,13 +505,12 @@ edge makes no difference to the region.
 per move, which the debug build already makes; one compare when a viewer's
 subscription is rebuilt, which happens only on a cell change and is already
 counted; an event per collision of either kind, queued off the hot path like a
-despawn; eight bytes per entity for a token it already receives; and twelve
-bytes on the event reserve per first sighting, where the reserve already gives
-way to state when nothing is queued. Serving shadows is the seam's cost, and
-it goes through the machinery every viewer already uses, bounded by the
-geometry above. No per-viewer per-tick work is added. No tier does another
+despawn; eight bytes per entity for a name it already receives or composes;
+and four more bytes per record on the wire. Serving shadows is the seam's
+cost, and it goes through the machinery every viewer already uses, bounded by
+the geometry above. No per-viewer per-tick work is added. No tier does another
 tier's job: the region reports its box and the world in it, the edge reads the
-map, and the client adds an offset and keeps a mapping.
+map and assigns names, and the client adds an offset.
 
 **Nothing of the region's crosses but the entity.** `docs/adr/0005` asked
 whether umwelt should carry the consumer's per-entity game state, and
@@ -511,14 +529,14 @@ the seam adds a trigger and a shadow on each side. `teleport` through the map
 by position, `teleport_into` by name into a region the map does not join, and
 the edge's own teleport on a boundary collision all run it.
 
-**The identity a client sees is the edge's key, everywhere.** A portal, a
-teleport into a raid and a plain spawn all show the same key to everyone who
-can see the entity for as long as it exists, which `docs/adr/0006` already
-gave the owner. The key is minted by a per-edge counter today and is unique
-within one edge, so two edges can mint the same one. Its high 32 bits now come
-from the edge's random name, so a bystander served entities from two edges
-cannot confuse them, at a computed one in four billion chance that two edges
-share a prefix.
+**One name per entity, everywhere.** A portal, a teleport into a raid, a
+crossing and a plain spawn all show one name to everyone who can see the
+entity. The edge assigns it and is the only tier that can map it to a
+region's id, which is the table it already keeps. The price is four bytes per
+record: 65 records in a default packet instead of 84, computed, so a full
+ghost set refreshes over four packets instead of three. The alternative, a
+mapping sent to the client once per first sighting, costs less bandwidth and
+puts a table of region ids in the client, which is what this record refuses.
 
 **What a consumer changes.** It starts its broker with JetStream and writes
 its map to the bucket. It stops clamping at the box, since the library clamps

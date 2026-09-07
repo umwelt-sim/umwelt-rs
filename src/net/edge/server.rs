@@ -122,7 +122,8 @@ impl EdgeServer {
         quic: quinn::Endpoint,
         game: impl FnOnce(EdgeHandle) -> G,
     ) -> Result<EdgeServer, NetError> {
-        let name = EdgeName::new(mint_name()).expect("a minted name is well formed");
+        let (name, prefix) = mint_identity();
+        let name = EdgeName::new(name).expect("a minted name is well formed");
         let link = RegionClient::new(nats, runtime.clone(), name.clone())?;
 
         let (outbound, queue) = std::sync::mpsc::channel();
@@ -136,7 +137,9 @@ impl EdgeServer {
             outbound: Mutex::new(outbound),
             game: Mutex::new(Box::new(NoGame)),
             client_ids: Mint::new(),
-            entity_keys: Mint::new(),
+            // Seeded, so two edges never mint the same key and a key is a
+            // name a client can hold across every region the entity visits.
+            entity_keys: Mint::seeded(prefix),
             counters: Counters::default(),
             teleport_state: Mutex::new(HashMap::new()),
         });
@@ -239,12 +242,14 @@ impl core::fmt::Debug for EdgeServer {
 struct NoGame;
 impl EdgeGame for NoGame {}
 
-/// A name no other incarnation will use.
+/// A name no other incarnation will use, and the 31-bit prefix its entity keys
+/// carry, from one draw.
 ///
 /// Nothing scopes on the name, so anything short and unlikely to repeat does.
 /// It is drawn from the process id and the clock so that two edges started in
-/// the same second on the same host still differ.
-fn mint_name() -> String {
+/// the same second on the same host still differ. The prefix is the name's low
+/// 31 bits, so a key can be read back to the edge that minted it.
+fn mint_identity() -> (String, u32) {
     use std::hash::{BuildHasher, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -252,7 +257,8 @@ fn mint_name() -> String {
     h.write_u128(
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
     );
-    format!("edge-{:012x}", h.finish() & 0xffff_ffff_ffff)
+    let bits = h.finish() & 0xffff_ffff_ffff;
+    (format!("edge-{bits:012x}"), (bits & 0x7fff_ffff) as u32)
 }
 
 // -- clients ---------------------------------------------------------------
@@ -732,14 +738,22 @@ mod tests {
     #[test]
     fn a_minted_name_is_a_valid_subject_token() {
         for _ in 0..100 {
-            let name = mint_name();
+            let name = mint_identity().0;
             EdgeName::new(&name).unwrap_or_else(|e| panic!("{name:?}: {e}"));
         }
     }
 
     #[test]
+    fn a_key_prefix_fits_31_bits_and_is_the_name_s_low_bits() {
+        let (name, prefix) = mint_identity();
+        assert_eq!(prefix >> 31, 0, "the top bit is the mint's, not the prefix's");
+        let bits = u64::from_str_radix(name.trim_start_matches("edge-"), 16).expect("hex");
+        assert_eq!(prefix, (bits & 0x7fff_ffff) as u32);
+    }
+
+    #[test]
     fn two_edges_started_together_do_not_share_a_name() {
-        let names: HashSet<String> = (0..64).map(|_| mint_name()).collect();
+        let names: HashSet<String> = (0..64).map(|_| mint_identity().0).collect();
         assert_eq!(names.len(), 64, "a name repeated within one process");
     }
 }

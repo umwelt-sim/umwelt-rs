@@ -252,9 +252,10 @@ An entity the region's game spawned has no edge and no token. The region
 names it by its own `RegionId` and the entity's id composed into one `u64`
 with the top bit clear. It never leaves its region, so that name is stable
 for its whole life. An edge's keys carry the top bit set, so the two kinds of
-name cannot collide. The key is minted from a per-edge counter today; its
-high 32 bits now come from the edge's random name with the top bit set, and
-two edges mint disjoint keys.
+name cannot collide. A region's id has to fit 31 bits for that: `RegionId` is a
+`u32`, and its top bit is reserved. The key is minted from a per-edge counter
+today; its high half now carries 31 bits of the edge's random name under the
+top bit, and two edges mint disjoint keys.
 
 A client holds no table. `EdgeClient` keeps only which regions are currently
 sending a name, so that a despawn from one region for a name another region
@@ -433,8 +434,10 @@ On the bus: the key `map` in the key-value bucket `umwelt`, read by every
 edge at startup. Region to edge: `Presence::BoundaryCollision { entity,
 target }` when a move would leave the box, `Presence::ViewCollision { entity,
 position }` when a viewer's view reaches the box and on each cell change while
-it does, and `Presence::ViewCleared { entity }` when it no longer does. Edge
-to region: nothing. In a packet: records and despawns carry the entity's
+it does, and `Presence::ViewCleared { entity }` when it no longer does.
+`Presence` widens from 13 to 17 bytes, the width `BoundaryCollision` needs for
+its `Pos3`, and every variant is written at that width. Edge to region:
+nothing. In a packet: records and despawns carry the entity's
 64-bit name in place of the region's id, and nothing else changes. Nothing in
 a region's info reply or heartbeat changes, and nothing is added for the
 teleport itself.

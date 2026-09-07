@@ -107,6 +107,22 @@ impl EntityKey {
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    /// The name of an entity the region's own game spawned, which no edge
+    /// minted a key for: the region in the high half, the entity's id in the
+    /// low, and the top bit clear. A key an edge mints carries the top bit
+    /// set, so the two never meet. A region's id has to fit 31 bits.
+    #[inline]
+    pub const fn of_region(region: RegionId, id: crate::EntityId) -> EntityKey {
+        debug_assert!(region.raw() >> 31 == 0, "a region id must fit 31 bits");
+        EntityKey(((region.raw() as u64) << 32) | id.raw() as u64)
+    }
+
+    /// Whether an edge minted this key, as opposed to a region composing it.
+    #[inline]
+    pub const fn minted_by_an_edge(self) -> bool {
+        self.0 >> 63 == 1
+    }
 }
 
 impl fmt::Debug for EntityKey {
@@ -169,8 +185,23 @@ impl fmt::Display for EntityHandle {
 pub(crate) struct Mint(AtomicU64);
 
 impl Mint {
+    /// The bit every seeded id carries, so a seeded id never equals a name a
+    /// region composes from its own id and an entity's.
+    const TOP: u64 = 1 << 63;
+
     pub(crate) const fn new() -> Mint {
         Mint(AtomicU64::new(1))
+    }
+
+    /// A mint whose ids carry `prefix` in the high half with the top bit set,
+    /// counting from one in the low half. Two mints with different prefixes
+    /// never hand out the same id, which is what lets every edge mint entity
+    /// keys without asking anyone. Only the low 31 bits of `prefix` are used.
+    ///
+    /// The low half runs into the prefix after 2^32 ids. An edge does not
+    /// mint that many in one incarnation.
+    pub(crate) const fn seeded(prefix: u32) -> Mint {
+        Mint(AtomicU64::new(Mint::TOP | (((prefix & 0x7fff_ffff) as u64) << 32) | 1))
     }
 
     pub(crate) fn next(&self) -> u64 {
@@ -197,6 +228,49 @@ mod tests {
         assert_ne!(first, 0);
         assert_eq!(m.next(), first + 1);
         assert_eq!(m.next(), first + 2);
+    }
+
+    #[test]
+    fn a_seeded_mint_carries_its_prefix_under_the_top_bit() {
+        let m = Mint::seeded(0x1234);
+        let first = m.next();
+        assert_eq!(first >> 63, 1, "the top bit is set");
+        assert_eq!((first >> 32) & 0x7fff_ffff, 0x1234, "the prefix is in the high half");
+        assert_eq!(first & 0xffff_ffff, 1, "counting starts at one");
+        assert_eq!(m.next(), first + 1);
+    }
+
+    #[test]
+    fn a_prefix_wider_than_31_bits_is_cut_to_31() {
+        let a = Mint::seeded(0x8000_0001).next();
+        let b = Mint::seeded(0x0000_0001).next();
+        assert_eq!(a, b, "bit 31 of the prefix is not the top bit");
+    }
+
+    #[test]
+    fn two_seeds_never_meet() {
+        let a = Mint::seeded(1);
+        let b = Mint::seeded(2);
+        let from_a: std::collections::HashSet<u64> = (0..1000).map(|_| a.next()).collect();
+        assert!((0..1000).map(|_| b.next()).all(|k| !from_a.contains(&k)));
+    }
+
+    #[test]
+    fn a_composed_name_never_meets_a_minted_key() {
+        let name = EntityKey::of_region(RegionId::from_raw(7), crate::EntityId::from_raw(3));
+        assert!(!name.minted_by_an_edge());
+        assert_eq!(name.raw(), (7u64 << 32) | 3);
+        let widest = EntityKey::of_region(
+            RegionId::from_raw(0x7fff_ffff),
+            crate::EntityId::from_raw(u32::MAX),
+        );
+        assert!(!widest.minted_by_an_edge());
+        let m = Mint::seeded(7);
+        for _ in 0..1000 {
+            let key = EntityKey::from_raw(m.next());
+            assert!(key.minted_by_an_edge());
+            assert_ne!(key, name);
+        }
     }
 
     #[test]

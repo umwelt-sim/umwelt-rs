@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1010" width="900" height="1010" role="img" aria-label="A dotted placement grid holds regions A and B in adjacent squares, sharing a seam. An entity in A walks east with its view radius crossing the seam; a shadow viewer on the seam in B has its own view radius. Below, an edge holding the map receives state from both regions and a view-collision event from A, and spawns and moves the shadow in B. Below that, a game client receives observations in world coordinates and draws one world.">
+<defs>
+  <marker id="amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b5721f"/></marker>
+  <marker id="slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#5f7079"/></marker>
+  <clipPath id="inA"><rect x="120" y="280" width="220" height="220"/></clipPath>
+  <clipPath id="inB"><rect x="340" y="280" width="220" height="220"/></clipPath>
+</defs>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5f7079">
+
+<text x="450" y="40" font-size="12" text-anchor="middle">world map (not to scale)</text>
+<g stroke="#5f7079" stroke-width="1" stroke-dasharray="1.5 4" stroke-linecap="round" opacity="0.7">
+  <line x1="120" y1="60" x2="120" y2="500"/><line x1="340" y1="60" x2="340" y2="500"/>
+  <line x1="560" y1="60" x2="560" y2="500"/><line x1="780" y1="60" x2="780" y2="500"/>
+  <line x1="120" y1="60" x2="780" y2="60"/><line x1="120" y1="280" x2="780" y2="280"/>
+  <line x1="120" y1="500" x2="780" y2="500"/>
+</g>
+
+<rect x="120" y="280" width="220" height="220" fill="#ffffff" stroke="#5f7079" stroke-width="1.2"/>
+<rect x="340" y="280" width="220" height="220" fill="#ffffff" stroke="#5f7079" stroke-width="1.2"/>
+<text x="128" y="296">region A (0,0)</text>
+<text x="348" y="296">region B (1,0)</text>
+
+<g fill="#5f7079">
+  <circle cx="160" cy="340" r="3"/><circle cx="230" cy="460" r="3"/><circle cx="250" cy="330" r="3"/><circle cx="300" cy="445" r="3"/>
+  <circle cx="360" cy="360" r="3"/><circle cx="395" cy="415" r="3"/><circle cx="400" cy="340" r="3"/>
+  <circle cx="470" cy="340" r="3"/><circle cx="500" cy="460" r="3"/><circle cx="440" cy="435" r="3"/>
+</g>
+
+<circle cx="285" cy="390" r="80" fill="none" stroke="#5f7079" stroke-width="1.4" clip-path="url(#inA)"/>
+<circle cx="285" cy="390" r="80" fill="none" stroke="#5f7079" stroke-width="1.4" stroke-dasharray="2 4" opacity="0.8" clip-path="url(#inB)"/>
+<circle cx="340" cy="390" r="80" fill="#b5721f" fill-opacity="0.07" stroke="#b5721f" stroke-width="1.4" stroke-dasharray="6 4" clip-path="url(#inB)"/>
+
+<line x1="340" y1="280" x2="340" y2="500" stroke="#b5721f" stroke-width="1.6"/>
+<text x="340" y="268" text-anchor="middle" fill="#b5721f">seam</text>
+
+<circle cx="285" cy="390" r="5" fill="#b5721f"/>
+<line x1="293" y1="390" x2="316" y2="390" stroke="#b5721f" stroke-width="1.4" marker-end="url(#amber)"/>
+<text x="258" y="376">entity</text>
+<text x="126" y="404">view radius</text>
+<circle cx="340" cy="390" r="6" fill="#ffffff" stroke="#b5721f" stroke-width="1.6"/>
+<line x1="346" y1="387" x2="440" y2="330" stroke="#b5721f" stroke-width="0.8"/>
+<text x="444" y="334" fill="#b5721f">shadow</text>
+
+<line x1="150" y1="500" x2="150" y2="616" stroke="#5f7079" stroke-width="1.2" marker-end="url(#slate)"/>
+<text x="158" y="540">state</text>
+<rect x="158" y="551" width="104" height="18" rx="5" fill="#b5721f"/>
+<text x="166" y="564" fill="#ffffff" font-weight="500">ViewCollision</text>
+<line x1="290" y1="500" x2="290" y2="616" stroke="#5f7079" stroke-width="1.2" marker-end="url(#slate)"/>
+<text x="298" y="540">later, at the seam</text>
+<rect x="298" y="551" width="132" height="18" rx="5" fill="#b5721f"/>
+<text x="306" y="564" fill="#ffffff" font-weight="500">BoundaryCollision</text>
+<line x1="460" y1="500" x2="460" y2="616" stroke="#5f7079" stroke-width="1.2" marker-end="url(#slate)"/>
+<text x="468" y="545">state</text>
+<line x1="540" y1="616" x2="540" y2="502" stroke="#b5721f" stroke-width="1.2" marker-end="url(#amber)"/>
+<text x="548" y="560" fill="#b5721f">spawn, move shadow</text>
+<text x="548" y="596" fill="#b5721f">later, teleport</text>
+
+<rect x="130" y="620" width="640" height="90" rx="7" fill="#ffffff" stroke="#5f7079" stroke-width="1.2"/>
+<text x="150" y="645" font-size="13">edge</text>
+<text x="150" y="690">map: A (0,0)   B (1,0)</text>
+
+<line x1="450" y1="710" x2="450" y2="766" stroke="#5f7079" stroke-width="1.2" marker-end="url(#slate)"/>
+<text x="458" y="735">observed(A, ..), observed(B, ..)</text>
+<text x="458" y="751">world coordinates</text>
+
+<rect x="130" y="770" width="640" height="225" rx="7" fill="#ffffff" stroke="#5f7079" stroke-width="1.2"/>
+<text x="150" y="795" font-size="13">game client</text>
+<rect x="150" y="808" width="420" height="172" rx="4" fill="#eef2f3"/>
+<g fill="#5f7079">
+  <circle cx="205" cy="844" r="3"/><circle cx="275" cy="964" r="3"/><circle cx="295" cy="834" r="3"/><circle cx="345" cy="949" r="3"/>
+  <circle cx="405" cy="864" r="3"/><circle cx="440" cy="919" r="3"/><circle cx="445" cy="844" r="3"/>
+  <circle cx="515" cy="844" r="3"/><circle cx="545" cy="964" r="3"/><circle cx="485" cy="939" r="3"/>
+</g>
+<circle cx="330" cy="894" r="80" fill="none" stroke="#5f7079" stroke-width="1.4"/>
+<circle cx="330" cy="894" r="5" fill="#b5721f"/>
+<line x1="338" y1="894" x2="361" y2="894" stroke="#b5721f" stroke-width="1.4" marker-end="url(#amber)"/>
+<text x="590" y="830">one world</text>
+</g>
+</svg>

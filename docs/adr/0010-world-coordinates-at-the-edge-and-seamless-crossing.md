@@ -68,6 +68,11 @@ nothing and keeps the veto it already has for teleport. A bare edge with no
 consumer code carries players across seams, which the README promises of an
 unmodified edge.
 
+![Two placed regions on a dotted placement grid, an entity in A whose view
+radius crosses the seam, a shadow viewer on the seam in B, the edge below
+holding the map and receiving state and collision events, and the game client
+below that drawing one world](../../assets/diagram/seam.svg)
+
 ### Roles
 
 | | region | edge | client | deployment |

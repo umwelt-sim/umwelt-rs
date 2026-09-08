@@ -227,7 +227,7 @@ impl EdgeGame for TeleportEdge {
     fn teleporting(
         &mut self,
         _entity: EntityKey,
-        _client: ClientId,
+        _client: Option<ClientId>,
         _from: RegionId,
         _to: RegionId,
         _at: WorldPos,
@@ -245,7 +245,7 @@ impl EdgeGame for TeleportEdge {
     fn teleport_arrived(
         &mut self,
         _entity: EntityKey,
-        _client: ClientId,
+        _client: Option<ClientId>,
         from: RegionId,
         to: RegionId,
         state: &[u8],
@@ -543,7 +543,7 @@ impl EdgeGame for SharedTeleportEdge {
     fn teleporting(
         &mut self,
         _entity: EntityKey,
-        _client: ClientId,
+        _client: Option<ClientId>,
         _from: RegionId,
         _to: RegionId,
         _at: WorldPos,
@@ -561,7 +561,7 @@ impl EdgeGame for SharedTeleportEdge {
     fn teleport_arrived(
         &mut self,
         _entity: EntityKey,
-        _client: ClientId,
+        _client: Option<ClientId>,
         from: RegionId,
         to: RegionId,
         state: &[u8],

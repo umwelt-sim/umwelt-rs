@@ -174,9 +174,15 @@ pub trait EdgeGame: Send + 'static {
     /// for departure isn't passed here.
     fn removed(&mut self, entity: EntityKey, client: Option<ClientId>) {}
 
-    /// A client asked to teleport an entity to another region. Return
-    /// [`TeleportDecision::Allow`] or [`TeleportDecision::Carry`] to proceed,
-    /// or [`TeleportDecision::Deny`] to refuse.
+    /// A client asked to teleport an entity to another region, or the entity
+    /// reached a seam and the edge is crossing it into the placed region
+    /// beyond (`docs/adr/0010`). Return [`TeleportDecision::Allow`] or
+    /// [`TeleportDecision::Carry`] to proceed, or [`TeleportDecision::Deny`]
+    /// to refuse. A denied crossing is a wall: the entity stands where the
+    /// region stopped it, and its client is not told.
+    ///
+    /// `client` is `None` for an entity with no client behind it. `at` is
+    /// where it will stand in the destination, in world coordinates.
     ///
     /// `Carry` serializes game state — inventory, health, whatever the game
     /// needs on the other side — as opaque bytes. The destination's
@@ -184,7 +190,7 @@ pub trait EdgeGame: Send + 'static {
     fn teleporting(
         &mut self,
         entity: EntityKey,
-        client: ClientId,
+        client: Option<ClientId>,
         from: RegionId,
         to: RegionId,
         at: WorldPos,
@@ -198,7 +204,7 @@ pub trait EdgeGame: Send + 'static {
     fn teleport_arrived(
         &mut self,
         entity: EntityKey,
-        client: ClientId,
+        client: Option<ClientId>,
         from: RegionId,
         to: RegionId,
         state: &[u8],

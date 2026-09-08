@@ -32,5 +32,5 @@ mod server;
 pub(crate) mod protocol;
 
 pub use client::{ClientHandle, EdgeClient};
-pub use handle::{EdgeHandle, EdgeStats};
+pub use handle::{EdgeHandle, EdgeStats, TELEPORT_TIMEOUT};
 pub use server::EdgeServer;

@@ -13,11 +13,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 
 use crate::config::WorldConfig;
 use crate::entity::{EntityId, EntityKind};
 use crate::fixed::Fixed;
-use crate::game::EdgeGame;
+use crate::game::{EdgeGame, TeleportDecision};
 use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
 use crate::map::WorldMap;
 use crate::net::control::EdgeLoad;
@@ -60,7 +61,30 @@ pub struct EdgeStats {
     /// Shadows this edge keeps right now: second viewers across seams for its
     /// observers whose view reaches one (`docs/adr/0010`).
     pub shadows: u32,
+    /// Boundary collisions answered by crossing the entity into the placed
+    /// region beyond, by the teleport this edge already has (`docs/adr/0010`).
+    pub crossings: u64,
+    /// Boundary collisions dropped: nothing placed beyond that side, or the
+    /// game denied the crossing. The region had already stopped the entity at
+    /// its box.
+    pub walls: u64,
+    /// Teleports in flight right now, asked for or crossings.
+    pub transitions: u32,
+    /// Teleports given up because the destination never confirmed the spawn
+    /// within [`TELEPORT_TIMEOUT`].
+    pub teleport_timeouts: u64,
 }
+
+/// How long a teleport waits for the destination to confirm the spawn before
+/// it is given up: the destination copy is forgotten, what was held for the
+/// entity meanwhile goes to the region it is still in, and its client is told
+/// the teleport failed.
+///
+/// `docs/adr/0003` measured the whole sequence at 10.5 to 22.9 ms with both
+/// regions on one machine, so only a destination that is down or unreachable
+/// reaches this. `docs/adr/0008` left the bound open. Two seconds is a guess,
+/// and not yet a setting.
+pub const TELEPORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
@@ -74,6 +98,9 @@ pub(crate) struct Counters {
     refused: AtomicU64,
     off_map: AtomicU64,
     shadows: AtomicU32,
+    crossings: AtomicU64,
+    walls: AtomicU64,
+    teleport_timeouts: AtomicU64,
 }
 
 /// What a region runs, as the edge keeps it: what a client is told, and the
@@ -137,6 +164,33 @@ pub(crate) struct Entity {
     /// The name every region writes for it: the key it was first minted
     /// under, kept across a teleport (`docs/adr/0010`).
     pub(crate) name: u64,
+    /// Set while a teleport of this entity is in flight, until the
+    /// destination confirms or the wait is given up.
+    pub(crate) transition: Option<Transition>,
+}
+
+/// A teleport in flight, kept on the entity leaving (`docs/adr/0008`, and a
+/// crossing in `docs/adr/0010`).
+///
+/// What arrives for the entity meanwhile is held here and forwarded after the
+/// remap, so a move or a message sent during the transition reaches the
+/// destination rather than a copy about to be given back.
+pub(crate) struct Transition {
+    /// The destination copy, whose `Presence::Added` completes this.
+    pub(crate) to: EntityKey,
+    pub(crate) dest: RegionId,
+    /// The latest position asked for meanwhile, in world coordinates, since
+    /// which frame it belongs to is not known until the remap.
+    pub(crate) held_move: Option<WorldPos>,
+    /// Entity messages sent meanwhile, in arrival order.
+    pub(crate) held_messages: Vec<Vec<u8>>,
+}
+
+/// One teleport in flight and when it is given up, for the sweep.
+pub(crate) struct Transit {
+    pub(crate) from: EntityKey,
+    pub(crate) to: EntityKey,
+    pub(crate) deadline: Instant,
 }
 
 #[derive(Default)]
@@ -220,6 +274,8 @@ pub(crate) struct Shared {
     /// key. Inserted when the teleport is initiated, consumed when the
     /// destination's `Presence::Added` arrives.
     pub(crate) teleport_state: Mutex<HashMap<EntityKey, Vec<u8>>>,
+    /// Teleports in flight, oldest first, swept for ones past their deadline.
+    pub(crate) transits: Mutex<Vec<Transit>>,
 }
 
 impl Shared {
@@ -255,6 +311,10 @@ impl Shared {
         self.counters.off_map.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn count_wall(&self) {
+        self.counters.walls.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The placed region a world position falls in and the position inside
     /// it. `None` off the map, or before any placed region has said how big a
     /// region is.
@@ -285,9 +345,15 @@ impl Shared {
         let mut local: Vec<(EntityKey, Pos3)> = Vec::new();
         let mut dropped = 0u64;
         {
-            let entities = self.entities();
+            let mut entities = self.entities();
             for (key, to) in moves {
-                let Some(held) = entities.by_key.get(&key) else { continue };
+                let Some(held) = entities.by_key.get_mut(&key) else { continue };
+                // In transit, which frame this belongs to is not known until
+                // the remap: held in world coordinates, latest only.
+                if let Some(transition) = held.transition.as_mut() {
+                    transition.held_move = Some(to);
+                    continue;
+                }
                 match self.to_frame(held.region, to) {
                     Some(at) => local.push((key, at)),
                     None => dropped += 1,
@@ -513,6 +579,7 @@ impl Shared {
                 shadows: Vec::new(),
                 shadow_of,
                 name,
+                transition: None,
             },
         );
         if let Some(client) = client {
@@ -594,6 +661,7 @@ impl Shared {
 
     pub(crate) fn stats(&self) -> EdgeStats {
         let clients = self.clients().len() as u32;
+        let transitions = self.transits.lock().expect("not poisoned").len() as u32;
         let entities = self.entities();
         EdgeStats {
             clients,
@@ -606,6 +674,10 @@ impl Shared {
             placed_regions: self.map.len() as u32,
             off_map: self.counters.off_map.load(Ordering::Relaxed),
             shadows: self.counters.shadows.load(Ordering::Relaxed),
+            crossings: self.counters.crossings.load(Ordering::Relaxed),
+            walls: self.counters.walls.load(Ordering::Relaxed),
+            transitions,
+            teleport_timeouts: self.counters.teleport_timeouts.load(Ordering::Relaxed),
         }
     }
 
@@ -974,9 +1046,42 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
                 shared.release(shadow);
             }
         }
-        // A wall or a crossing is the edge's to decide, from the crossing work
-        // on. Heard, and nothing done.
-        Presence::BoundaryCollision { .. } => {}
+        // The entity itself reached its region's box. Whether a placed region
+        // lies beyond is the map's to say: if one does, the edge crosses the
+        // entity into it by the teleport it already has; if none does, the
+        // wall is a wall, and the region has already stopped the entity at it
+        // (`docs/adr/0010`, "Crossing"). A shadow never crosses: it stands
+        // where its owner's view reaches, and its owner is what crosses.
+        Presence::BoundaryCollision { entity, target } => {
+            let key = {
+                let entities = shared.entities();
+                let Some(&key) = entities.by_id.get(&(region, entity)) else { return };
+                let Some(held) = entities.by_key.get(&key) else { return };
+                if held.shadow_of.is_some() || held.doomed || held.transition.is_some() {
+                    return;
+                }
+                key
+            };
+            let placed = shared.map.placement_of(region).and_then(|square| {
+                let size = (*shared.region_size.lock().expect("not poisoned"))?;
+                Some(WorldPos::from_local(target, square, size))
+            });
+            let Some(beyond) = placed else {
+                shared.count_wall();
+                return;
+            };
+            match shared.locate(beyond) {
+                Some((dest, local)) if dest != region => {
+                    match begin_teleport(shared, key, dest, local, beyond) {
+                        Some(_) => {
+                            shared.counters.crossings.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => shared.count_wall(),
+                    }
+                }
+                _ => shared.count_wall(),
+            }
+        }
         Presence::Removed { entity } => {
             let Some(key) = shared.entities().by_id.get(&(region, entity)).copied()
             else {
@@ -1020,7 +1125,7 @@ fn complete_teleport(
 ) {
     // Read the old entity's details under the entities lock, then update
     // both keys atomically.
-    let (handle, from_region, old_id, old_observed, name) = {
+    let (handle, from_region, old_id, old_observed, name, transition) = {
         let mut entities = shared.entities();
         let Some(old) = entities.by_key.get(&old_key) else {
             // The old entity is already gone — the client disconnected or
@@ -1029,6 +1134,7 @@ fn complete_teleport(
             drop(entities);
             shared.tell_region(Outgoing::Despawn(dest, new_entity));
             shared.forget(new_key);
+            shared.transits.lock().expect("not poisoned").retain(|t| t.to != new_key);
             return;
         };
         let handle = old.handle;
@@ -1052,14 +1158,18 @@ fn complete_teleport(
         }
         // Remove the old entity from by_key. Its shadows stood in for a view
         // that no longer exists; the destination reports its own.
-        let old_shadows =
-            entities.by_key.remove(&old_key).map(|e| e.shadows).unwrap_or_default();
+        let (old_shadows, transition) = entities
+            .by_key
+            .remove(&old_key)
+            .map(|e| (e.shadows, e.transition))
+            .unwrap_or_default();
         drop(entities);
         for shadow in old_shadows {
             shared.release(shadow);
         }
-        (handle, from_region, old_id, old_observed, name)
+        (handle, from_region, old_id, old_observed, name, transition)
     };
+    shared.transits.lock().expect("not poisoned").retain(|t| t.to != new_key);
 
     // Update the client's handle mapping: handle → new_key, remove old_key.
     if let (Some(client), Some(handle)) = (client, handle) {
@@ -1080,6 +1190,18 @@ fn complete_teleport(
     // Flush any pending position to the new entity.
     if let Some(to) = pending {
         shared.queue_move(dest, new_entity, to);
+    }
+    // What arrived for the entity in transit: the latest move, if it falls
+    // in the destination, and every entity message in order. A move that
+    // does not fit the destination is dropped rather than clamped to its
+    // box, which for a crossing would be the seam it just came through.
+    if let Some(transition) = transition {
+        if let Some(local) = transition.held_move.and_then(|w| shared.to_frame(dest, w)) {
+            shared.queue_move(dest, new_entity, local);
+        }
+        for body in transition.held_messages {
+            shared.tell_region(Outgoing::Message(dest, new_entity, body));
+        }
     }
 
     // Adjust observer count: the old entity is gone without going through
@@ -1107,10 +1229,115 @@ fn complete_teleport(
         .unwrap_or_default();
     shared.with_game(|game| {
         game.spawned(new_key, client, dest, new_entity);
-        if let Some(client) = client {
-            game.teleport_arrived(new_key, client, from_region, dest, &state);
-        }
+        game.teleport_arrived(new_key, client, from_region, dest, &state);
     });
+}
+
+/// Starts a teleport: the destination is asked for a copy under the entity's
+/// name, and until it answers the entity leaving holds what arrives for it.
+/// `at` is the destination position in world coordinates, for the game.
+///
+/// `None` is a refusal: the entity is unknown, given back, already in transit
+/// or bound for the region it is in; the game denied it; or the destination
+/// could not be asked. What to tell a client is the caller's business, since
+/// a crossing the client never asked for reports nothing.
+pub(crate) fn begin_teleport(
+    shared: &Arc<Shared>,
+    key: EntityKey,
+    dest: RegionId,
+    position: Pos3,
+    at: WorldPos,
+) -> Option<EntityKey> {
+    let (client, kind, from, name) = {
+        let entities = shared.entities();
+        let held = entities.by_key.get(&key)?;
+        if held.doomed || held.transition.is_some() || held.region == dest {
+            return None;
+        }
+        (held.client, held.kind, held.region, held.name)
+    };
+    let mut decision = TeleportDecision::Allow;
+    shared.with_game(|game| decision = game.teleporting(key, client, from, dest, at));
+    let carried = match decision {
+        TeleportDecision::Deny => return None,
+        TeleportDecision::Allow => None,
+        TeleportDecision::Carry(state) => Some(state),
+    };
+    // The same name at the destination, so a client holding it from the
+    // origin holds one entity across the move.
+    let to = shared.ask_named(client, dest, position, kind, name).ok()?;
+    {
+        let mut entities = shared.entities();
+        // Gone while the game was deciding: the copy is given straight back.
+        let Some(old) = entities.by_key.get_mut(&key) else {
+            drop(entities);
+            shared.release(to);
+            return None;
+        };
+        old.transition =
+            Some(Transition { to, dest, held_move: None, held_messages: Vec::new() });
+        if let Some(new) = entities.by_key.get_mut(&to) {
+            new.replaces = Some(key);
+        }
+    }
+    if let Some(state) = carried {
+        shared.teleport_state.lock().expect("not poisoned").insert(to, state);
+    }
+    shared.transits.lock().expect("not poisoned").push(Transit {
+        from: key,
+        to,
+        deadline: Instant::now() + TELEPORT_TIMEOUT,
+    });
+    Some(to)
+}
+
+/// Gives up on every teleport whose destination has not confirmed the spawn
+/// by its deadline. Run from the thread that publishes to regions.
+pub(crate) fn expire_transitions(shared: &Arc<Shared>, now: Instant) {
+    let due: Vec<Transit> = {
+        let mut transits = shared.transits.lock().expect("not poisoned");
+        if transits.iter().all(|t| t.deadline > now) {
+            return;
+        }
+        let (due, waiting) = transits.drain(..).partition(|t| t.deadline <= now);
+        *transits = waiting;
+        due
+    };
+    for Transit { from, to, .. } in due {
+        let taken = {
+            let mut entities = shared.entities();
+            // Confirmed after all, and the remap is under way: leave it be.
+            if entities.by_key.get(&to).is_some_and(|new| new.id.is_some()) {
+                continue;
+            }
+            match entities.by_key.get_mut(&from) {
+                Some(old) if old.transition.as_ref().is_some_and(|t| t.to == to) => {
+                    old.transition.take().map(|t| (t, old.client, old.handle, old.region))
+                }
+                _ => None,
+            }
+        };
+        let Some((transition, client, handle, region)) = taken else { continue };
+        shared.teleport_state.lock().expect("not poisoned").remove(&to);
+        shared.forget(to);
+        // What was held goes to where the entity still is.
+        if let Some(world) = transition.held_move {
+            shared.set_world_positions([(from, world)]);
+        }
+        let id = shared.entities().by_key.get(&from).and_then(|e| e.id);
+        if let Some(id) = id {
+            for body in transition.held_messages {
+                shared.tell_region(Outgoing::Message(region, id, body));
+            }
+        }
+        shared.counters.teleport_timeouts.fetch_add(1, Ordering::Relaxed);
+        if let (Some(client), Some(handle)) = (client, handle) {
+            let _ = shared.post(
+                client,
+                ToClient::TeleportFailed { handle, region: transition.dest },
+            );
+        }
+    }
 }
 
 /// Fires `disconnected` once the last of a leaving client's entities is gone.

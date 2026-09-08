@@ -91,7 +91,9 @@ pub(crate) mod edge;
 pub(crate) mod region;
 
 pub use control::{EdgeHeartbeat, EdgeLoad, Heartbeat, RegionLoad};
-pub use edge::{ClientHandle, EdgeClient, EdgeHandle, EdgeServer, EdgeStats};
+pub use edge::{
+    ClientHandle, EdgeClient, EdgeHandle, EdgeServer, EdgeStats, TELEPORT_TIMEOUT,
+};
 pub use error::NetError;
 pub use region::{
     Applied, ClaimError, EdgeId, EdgeName, EdgeSink, EdgeView, Edges, Inbound,

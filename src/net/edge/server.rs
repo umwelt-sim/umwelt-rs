@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::game::{EdgeGame, TeleportDecision};
+use crate::game::EdgeGame;
 use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
 use crate::map::WorldMap;
 use crate::net::control::{self, EdgeHeartbeat};
 use crate::net::edge::handle::{
     Client, Counters, EdgeHandle, EdgeStats, Entities, Outgoing, RegionWorld, Shared,
-    finish_leaving, on_presence, span,
+    begin_teleport, expire_transitions, finish_leaving, on_presence, span,
 };
 use crate::net::edge::protocol::{EdgeInfo, Framer, FromClient, ToClient};
 use crate::net::error::NetError;
@@ -152,6 +152,7 @@ impl EdgeServer {
             map,
             region_size: Mutex::new(None),
             teleport_state: Mutex::new(HashMap::new()),
+            transits: Mutex::new(Vec::new()),
         });
         // Best effort: a placed region that is up says how big every placed
         // region is. Retried from the publishing thread until one answers.
@@ -485,9 +486,21 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
                 shared.count_refused();
                 return;
             };
-            let resolved =
-                shared.entities().by_key.get(&key).and_then(|e| Some((e.region, e.id?)));
-            if let Some((region, id)) = resolved {
+            // In transit, held in order and forwarded after the remap, so it
+            // reaches the destination rather than a copy about to be given
+            // back (`docs/adr/0010`, "Crossing").
+            let forward = {
+                let mut entities = shared.entities();
+                let Some(held) = entities.by_key.get_mut(&key) else { return };
+                match held.transition.as_mut() {
+                    Some(transition) => {
+                        transition.held_messages.push(body);
+                        None
+                    }
+                    None => held.id.map(|id| (held.region, id, body)),
+                }
+            };
+            if let Some((region, id, body)) = forward {
                 shared.tell_region(Outgoing::Message(region, id, body));
             }
         }
@@ -516,7 +529,7 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
 
 /// The client half of a teleport, once the destination and the position in
 /// its frame are known. `at` is the same position in world coordinates, for
-/// the consumer's game.
+/// the consumer's game. The client asked, so a refusal is reported to it.
 fn teleport(
     shared: &Arc<Shared>,
     client: ClientId,
@@ -525,77 +538,12 @@ fn teleport(
     position: Pos3,
     at: WorldPos,
 ) {
-    {
-        {
-            // Look up the entity this handle names. `clients` then
-            // `entities`, one at a time, per the locking rule on `Shared`.
-            let Some(key) = key_of(shared, client, handle) else {
-                shared.count_refused();
-                return;
-            };
-            let (kind, from, name) = {
-                let entities = shared.entities();
-                let Some(entity) = entities.by_key.get(&key) else {
-                    shared.count_refused();
-                    return;
-                };
-                (entity.kind, entity.region, entity.name)
-            };
-            if from == dest {
-                // Same region — a move, not a teleport.
-                shared.count_refused();
-                return;
-            }
-            // Ask the consumer's game whether to allow it.
-            let mut decision = TeleportDecision::Allow;
-            shared.with_game(|game| {
-                decision = game.teleporting(key, client, from, dest, at);
-            });
-            match decision {
-                TeleportDecision::Deny => {
-                    let _ = shared
-                        .post(client, ToClient::TeleportFailed { handle, region: dest });
-                }
-                TeleportDecision::Allow | TeleportDecision::Carry(_) => {
-                    // Spawn in the destination. The new entity replaces the
-                    // old one: when the destination confirms, the handle is
-                    // remapped and the origin copy is despawned.
-                    // The same name at the destination, so a client holding
-                    // it from the origin holds one entity across the move.
-                    let new_key = match shared.ask_named(
-                        Some(client),
-                        dest,
-                        position,
-                        kind,
-                        name,
-                    ) {
-                        Ok(k) => k,
-                        Err(_) => {
-                            let _ = shared.post(
-                                client,
-                                ToClient::TeleportFailed { handle, region: dest },
-                            );
-                            return;
-                        }
-                    };
-                    // Link the new entity to the old one.
-                    shared
-                        .entities()
-                        .by_key
-                        .get_mut(&new_key)
-                        .expect("just created")
-                        .replaces = Some(key);
-                    // Stash game state for delivery on arrival.
-                    if let TeleportDecision::Carry(state) = decision {
-                        shared
-                            .teleport_state
-                            .lock()
-                            .expect("not poisoned")
-                            .insert(new_key, state);
-                    }
-                }
-            }
-        }
+    let Some(key) = key_of(shared, client, handle) else {
+        shared.count_refused();
+        return;
+    };
+    if begin_teleport(shared, key, dest, position, at).is_none() {
+        let _ = shared.post(client, ToClient::TeleportFailed { handle, region: dest });
     }
 }
 
@@ -689,10 +637,11 @@ fn publish_to_regions(
             let _ = shared.link.game_message(region, entity, &body);
         }
         shared.flush_moves();
+        let now = Instant::now();
+        expire_transitions(shared, now);
 
         // Keep regions alive when the edge has nothing else to say, and keep
         // asking placed regions how big a region is until one has answered.
-        let now = Instant::now();
         if now.duration_since(last_keepalive) >= REGION_KEEPALIVE {
             for region in shared.regions() {
                 let _ = shared.link.keepalive(region);

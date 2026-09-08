@@ -246,6 +246,7 @@ impl EntityKind {
         match role {
             0 => Ok(EntityKind::unattended(tag)),
             1 => Ok(EntityKind::observer(tag)),
+            2 => Ok(EntityKind::shadow()),
             _ => Err(NetError::Malformed("entity kind role")),
         }
     }

@@ -62,3 +62,7 @@ harness = false
 [[bench]]
 name = "relay"
 harness = false
+
+[[bench]]
+name = "seam"
+harness = false

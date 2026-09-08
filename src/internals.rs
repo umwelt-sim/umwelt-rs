@@ -37,6 +37,16 @@ pub fn read_payload<'a>(
     crate::packet::TickObservation::new(codec, buf)
 }
 
+/// Spawns a shadow, the library's viewer with no presence in the snapshot.
+///
+/// Here rather than on [`Step`](crate::Step) because a consumer never spawns
+/// one: the edge does, over the region link, for an observer whose view
+/// reaches a seam. The seam benchmark needs a region full of them without a
+/// broker.
+pub fn spawn_shadow(step: &mut crate::Step<'_>, at: crate::Pos3) -> crate::EntityId {
+    step.spawn_shadow(at)
+}
+
 /// The region-to-edge wire, and an edge's side of it.
 pub mod region {
     pub use crate::net::region::client::{Incoming, Offer, RegionClient};

@@ -97,6 +97,10 @@ pub struct Step<'a> {
     zs: &'a mut Vec<Fixed>,
     tags: &'a mut Vec<u16>,
     live: &'a mut LiveSet,
+    /// The live entities that are in the snapshot: everything but a shadow.
+    /// What a viewer can gather, what a game's sweep covers, and what the
+    /// region counts as its world.
+    shown: &'a mut LiveSet,
     /// Ids despawned this tick, whoever asked. Recorded because a despawn the
     /// game performs is otherwise invisible to anything outside the game, and
     /// something has to tell the edge that owned it.
@@ -127,7 +131,7 @@ impl Step<'_> {
     /// How many entities are alive.
     #[inline]
     pub fn entity_count(&self) -> usize {
-        self.live.live()
+        self.shown.live()
     }
 
     /// How long an array keyed by [`EntityId::index`] has to be to cover every
@@ -148,13 +152,14 @@ impl Step<'_> {
         self.live.contains(id)
     }
 
-    /// Every live entity, in ascending id order.
+    /// Every live entity of the game's, in ascending id order. A shadow the
+    /// edge keeps here is not the game's and is not listed.
     ///
     /// Holds the whole `Step` borrowed for as long as the iterator lives, so
     /// collect the ids first if the loop body has to move anything.
     #[inline]
     pub fn entities(&self) -> LiveIter<'_> {
-        self.live.iter()
+        self.shown.iter()
     }
 
     /// Where an entity is, or `None` if it is not alive.
@@ -231,7 +236,7 @@ impl Step<'_> {
             self.xs.as_mut_slice(),
             self.ys.as_mut_slice(),
             self.zs.as_mut_slice(),
-            Live::new(&*self.live),
+            Live::new(&*self.shown),
         )
     }
 
@@ -246,6 +251,22 @@ impl Step<'_> {
         self.tags.push(tag);
         self.at_wall.push(false);
         self.live.insert(id);
+        self.shown.insert(id);
+        id
+    }
+
+    /// Appends a shadow: a viewer with no presence in the snapshot. Only the
+    /// edge asks for one, through the region link (`docs/adr/0010`).
+    pub(crate) fn spawn_shadow(&mut self, pos: Pos3) -> EntityId {
+        debug_assert!(self.cfg.contains(pos), "spawned outside the region at {pos:?}");
+        let id = EntityId::from_raw(self.xs.len() as u32);
+        self.xs.push(pos.x);
+        self.ys.push(pos.y);
+        self.zs.push(pos.z);
+        self.tags.push(0);
+        self.at_wall.push(false);
+        self.live.insert(id);
+        self.shown.cover(id);
         id
     }
 
@@ -270,6 +291,7 @@ impl Step<'_> {
     pub fn despawn(&mut self, id: EntityId) {
         if self.live.contains(id) {
             self.live.remove(id);
+            self.shown.remove(id);
             self.despawned.push(id);
         }
     }
@@ -378,6 +400,8 @@ struct Frame<'a, S: PayloadSink> {
     snap: &'a CellSnapshot,
     odo: &'a Odometer,
     live: &'a LiveSet,
+    /// Everything but the shadows, which the region does not report on.
+    shown: &'a LiveSet,
     xs: &'a [Fixed],
     ys: &'a [Fixed],
     zs: &'a [Fixed],
@@ -424,10 +448,14 @@ fn serve<S: PayloadSink>(
             || cx + radius > last
             || cy - radius < 0
             || cy + radius > last;
-        if at_boundary {
-            w.view_collisions.push((avatar, at));
-        } else if v.at_boundary {
-            w.view_cleared.push(avatar);
+        // A shadow stands at a seam by construction, and its view reaching
+        // the box is not news to the edge that put it there.
+        if f.shown.contains(avatar) {
+            if at_boundary {
+                w.view_collisions.push((avatar, at));
+            } else if v.at_boundary {
+                w.view_cleared.push(avatar);
+            }
         }
         v.at_boundary = at_boundary;
     }
@@ -612,6 +640,8 @@ pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     /// position-based odometer.
     prev_tags: Vec<u16>,
     live: LiveSet,
+    /// The live entities in the snapshot: everything but a shadow.
+    shown: LiveSet,
     /// Cleared at the start of every tick and filled by [`Step::despawn`].
     despawned: Vec<EntityId>,
     /// See [`Step`]'s field of the same name.
@@ -682,6 +712,7 @@ impl<G: Game> WorldSimulation<G, NullSink> {
             tags: Vec::new(),
             prev_tags: Vec::new(),
             live: LiveSet::new(),
+            shown: LiveSet::new(),
             despawned: Vec::new(),
             at_wall: Vec::new(),
             collisions: Vec::new(),
@@ -725,6 +756,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             tags: self.tags,
             prev_tags: self.prev_tags,
             live: self.live,
+            shown: self.shown,
             despawned: self.despawned,
             at_wall: self.at_wall,
             collisions: self.collisions,
@@ -861,7 +893,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     /// Entities currently alive.
     #[inline]
     pub fn entity_count(&self) -> usize {
-        self.live.live()
+        self.shown.live()
     }
 
     /// Total entity ids allocated, alive or not.
@@ -1023,6 +1055,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
                 zs: &mut self.zs,
                 tags: &mut self.tags,
                 live: &mut self.live,
+                shown: &mut self.shown,
                 despawned: &mut self.despawned,
                 at_wall: &mut self.at_wall,
                 collisions: &mut self.collisions,
@@ -1032,7 +1065,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             self.game.step(&mut step);
         }
 
-        self.odo.accumulate(&self.xs, &self.ys, &self.zs, &self.live);
+        self.odo.accumulate(&self.xs, &self.ys, &self.zs, &self.shown);
 
         // Detect tag-only changes that the position-based odometer would miss.
         // A changed tag bumps the entity's reading so it scores alongside movers
@@ -1048,7 +1081,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         }
         self.prev_tags.clear();
         self.prev_tags.extend_from_slice(&self.tags);
-        self.snap.update(&self.xs, &self.ys, &self.zs, &self.tags, &self.live);
+        self.snap.update(&self.xs, &self.ys, &self.zs, &self.tags, &self.shown);
 
         let frame = Frame {
             sink: &self.sink,
@@ -1057,6 +1090,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             snap: &self.snap,
             odo: &self.odo,
             live: &self.live,
+            shown: &self.shown,
             xs: &self.xs,
             ys: &self.ys,
             zs: &self.zs,
@@ -1184,6 +1218,7 @@ mod tests {
             zs: &mut sim.zs,
             tags: &mut sim.tags,
             live: &mut sim.live,
+            shown: &mut sim.shown,
             despawned: &mut sim.despawned,
             at_wall: &mut sim.at_wall,
             collisions: &mut sim.collisions,
@@ -1419,6 +1454,7 @@ mod tests {
             zs: &mut s.zs,
             tags: &mut s.tags,
             live: &mut s.live,
+            shown: &mut s.shown,
             despawned: &mut s.despawned,
             at_wall: &mut s.at_wall,
             collisions: &mut s.collisions,
@@ -1675,6 +1711,7 @@ mod tests {
                     zs: &mut s.zs,
                     tags: &mut s.tags,
                     live: &mut s.live,
+                    shown: &mut s.shown,
                     despawned: &mut s.despawned,
                     at_wall: &mut s.at_wall,
                     collisions: &mut s.collisions,
@@ -1819,6 +1856,7 @@ mod tests {
             zs: &mut sim.zs,
             tags: &mut sim.tags,
             live: &mut sim.live,
+            shown: &mut sim.shown,
             despawned: &mut sim.despawned,
             at_wall: &mut sim.at_wall,
             collisions: &mut sim.collisions,
@@ -2107,5 +2145,105 @@ mod tests {
         s.register_viewer(id, ClientLimits::default());
         s.tick();
         assert!(s.view_collisions().iter().any(|&(who, _)| who == id));
+    }
+
+    /// Spawns one shown entity and one shadow at the same spot on the first
+    /// tick.
+    struct Pair {
+        at: Pos3,
+        ids: Option<(EntityId, EntityId)>,
+    }
+
+    impl Game for Pair {
+        fn step(&mut self, w: &mut Step<'_>) {
+            if self.ids.is_none() {
+                let shown = w.spawn(self.at, 7);
+                let shadow = w.spawn_shadow(self.at);
+                self.ids = Some((shown, shadow));
+            }
+        }
+    }
+
+    #[test]
+    fn a_shadow_is_alive_and_served_but_in_nobodys_snapshot() {
+        use crate::packet::TickObservation;
+        let cfg = WorldConfig::default();
+        let at = Pos3::from_meters(2048, 2048, 0);
+        let mut s = WorldSimulation::new(cfg, Pair { at, ids: None })
+            .with_sink(RecordingSink::new());
+        s.set_thread_count(1);
+        s.tick();
+        let (shown, shadow) = s.game().ids.expect("spawned");
+        assert_eq!(s.entity_count(), 1, "a shadow is not in the world");
+        assert!(s.position(shadow).is_some(), "but it is alive");
+        assert_eq!(s.id_space(), 2);
+
+        // Both hold a viewer; both are served; neither packet names the
+        // shadow, and the shown one is in both.
+        let a = s.register_viewer(shown, ClientLimits::default());
+        let b = s.register_viewer(shadow, ClientLimits::default());
+        let stats = s.tick();
+        assert_eq!(stats.viewers, 2);
+        let codec = RecordCodec::new(&cfg);
+        for viewer in [a, b] {
+            let bytes = s.sink().latest(viewer).expect("served");
+            let r = TickObservation::new(&codec, &bytes).expect("well formed");
+            let ids: Vec<EntityId> = r.updates().map(|(id, _, _)| id).collect();
+            assert_eq!(
+                ids,
+                vec![shown],
+                "viewer {viewer:?} sees the shown entity and not the shadow"
+            );
+        }
+    }
+
+    #[test]
+    fn a_game_never_sweeps_or_lists_a_shadow() {
+        let cfg = WorldConfig::default();
+        let at = Pos3::from_meters(100, 100, 0);
+        let mut s = WorldSimulation::new(cfg, Pair { at, ids: None });
+        s.tick();
+        let (shown, shadow) = s.game().ids.expect("spawned");
+        let mut step = Step {
+            xs: &mut s.xs,
+            ys: &mut s.ys,
+            zs: &mut s.zs,
+            tags: &mut s.tags,
+            live: &mut s.live,
+            shown: &mut s.shown,
+            despawned: &mut s.despawned,
+            at_wall: &mut s.at_wall,
+            collisions: &mut s.collisions,
+            cfg: &s.cfg,
+            tick: 1,
+        };
+        assert_eq!(step.entities().collect::<Vec<_>>(), vec![shown]);
+        assert!(step.contains(shadow), "a move can still name it");
+        let (_, _, _, live) = step.positions_mut();
+        assert!(live.contains(shown));
+        assert!(!live.contains(shadow), "the bulk path skips it");
+    }
+
+    #[test]
+    fn a_shadow_at_the_seam_reports_no_view_collision() {
+        let cfg = WorldConfig::default();
+        let cell = cfg.cell_size().raw();
+        let near = Pos3::new(
+            Fixed::from_raw(cfg.region_size().raw() - cell / 2),
+            Fixed::from_meters(2048),
+            Fixed::ZERO,
+        );
+        let mut s = WorldSimulation::new(cfg, Pair { at: near, ids: None });
+        s.set_thread_count(1);
+        s.tick();
+        let (shown, shadow) = s.game().ids.expect("spawned");
+        s.register_viewer(shown, ClientLimits::default());
+        s.register_viewer(shadow, ClientLimits::default());
+        s.tick();
+        assert_eq!(
+            s.view_collisions(),
+            &[(shown, near)],
+            "the shown one is news; the shadow is not"
+        );
     }
 }

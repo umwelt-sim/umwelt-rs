@@ -390,9 +390,13 @@ pub enum ToClient<'a> {
     ///
     /// Latest-only, so this rides a datagram.
     State {
-        /// Which of this client's entities is looking.
+        /// Which of this client's entities is looking. Near a seam the same
+        /// handle receives packets from two regions, its own and its
+        /// shadow's.
         handle: EntityHandle,
-        /// The region's packet, untouched except for the four bytes in front.
+        /// Which region built it, and so which frame its positions are in.
+        region: RegionId,
+        /// The region's packet, untouched except for the bytes in front.
         packet: &'a [u8],
     },
     /// The game's own, which umwelt does not read.
@@ -452,9 +456,10 @@ impl ToClient<'_> {
                 out.push(KIND_REMOVED);
                 out.extend_from_slice(&handle.raw().to_le_bytes());
             }
-            ToClient::State { handle, packet } => {
+            ToClient::State { handle, region, packet } => {
                 out.push(KIND_STATE);
                 out.extend_from_slice(&handle.raw().to_le_bytes());
+                out.extend_from_slice(&region.raw().to_le_bytes());
                 out.extend_from_slice(packet);
             }
             ToClient::Message(body) => {
@@ -515,13 +520,16 @@ impl ToClient<'_> {
                 Ok(ToClient::Removed { handle })
             }
             KIND_STATE => {
-                if body.len() < 4 {
+                if body.len() < 8 {
                     return Err(NetError::Malformed("state"));
                 }
                 let handle = EntityHandle::from_raw(u32::from_le_bytes([
                     body[0], body[1], body[2], body[3],
                 ]));
-                Ok(ToClient::State { handle, packet: &body[4..] })
+                let region = RegionId::from_raw(u32::from_le_bytes([
+                    body[4], body[5], body[6], body[7],
+                ]));
+                Ok(ToClient::State { handle, region, packet: &body[8..] })
             }
             KIND_MESSAGE => Ok(ToClient::Message(body)),
             KIND_TELEPORTED => {
@@ -696,8 +704,12 @@ mod tests {
                 entity: EntityId::from_raw(42),
             },
             ToClient::Removed { handle: h(7) },
-            ToClient::State { handle: h(7), packet: b"a packet" },
-            ToClient::State { handle: h(7), packet: b"" },
+            ToClient::State {
+                handle: h(7),
+                region: RegionId::from_raw(9),
+                packet: b"a packet",
+            },
+            ToClient::State { handle: h(7), region: RegionId::from_raw(10), packet: b"" },
             ToClient::Message(b"the game's own"),
             ToClient::Teleported { handle: h(5), region: RegionId::from_raw(42) },
             ToClient::TeleportFailed { handle: h(5), region: RegionId::from_raw(42) },

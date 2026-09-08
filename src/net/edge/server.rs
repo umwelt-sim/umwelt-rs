@@ -25,8 +25,8 @@ use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
 use crate::map::WorldMap;
 use crate::net::control::{self, EdgeHeartbeat};
 use crate::net::edge::handle::{
-    Client, Counters, EdgeHandle, EdgeStats, Entities, Outgoing, Shared, finish_leaving,
-    on_presence, span,
+    Client, Counters, EdgeHandle, EdgeStats, Entities, Outgoing, RegionWorld, Shared,
+    finish_leaving, on_presence, span,
 };
 use crate::net::edge::protocol::{EdgeInfo, Framer, FromClient, ToClient};
 use crate::net::error::NetError;
@@ -400,6 +400,11 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
         // which regions exist, let alone where a player belongs — that is the
         // game's, and the game is what told this client where it is.
         FromClient::Spawn { handle, position, kind } => {
+            // The shadow role is the library's own.
+            if kind.is_shadow() {
+                shared.count_refused();
+                return;
+            }
             let taken = shared
                 .clients()
                 .get(&client)
@@ -427,6 +432,10 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
         // gone: a client sends its first move for a handle on the ordered
         // stream, where it cannot pass anything.
         FromClient::SpawnInto { handle, region, position, kind } => {
+            if kind.is_shadow() {
+                shared.count_refused();
+                return;
+            }
             let taken = shared
                 .clients()
                 .get(&client)
@@ -690,10 +699,10 @@ fn publish_to_regions(
 /// What world a region runs, asked once and cached. `None` if the region did
 /// not answer, and not cached then: a region that is not up yet may be by the
 /// next ask. Blocks on the runtime, so only from a plain thread.
-fn world_of(shared: &Arc<Shared>, region: RegionId) -> Option<EdgeInfo> {
+fn world_of(shared: &Arc<Shared>, region: RegionId) -> Option<RegionWorld> {
     let known = shared.worlds.lock().expect("not poisoned").get(&region).copied();
-    if let Some(info) = known {
-        return Some(info);
+    if let Some(world) = known {
+        return Some(world);
     }
     let offer = shared.link.info(region, INFO_TIMEOUT).ok()?;
     // Only the two extents and the frame cross to a client. What the region
@@ -705,14 +714,15 @@ fn world_of(shared: &Arc<Shared>, region: RegionId) -> Option<EdgeInfo> {
         vertical_extent_m: offer.config.vertical_extent().floor_meters(),
         placement: shared.map.placement_of(region),
     };
-    shared.worlds.lock().expect("not poisoned").insert(region, info);
+    let world = RegionWorld { info, config: offer.config };
+    shared.worlds.lock().expect("not poisoned").insert(region, world);
     if info.placement.is_some() {
         let mut size = shared.region_size.lock().expect("not poisoned");
         if size.is_none() {
             *size = Some(offer.config.region_size());
         }
     }
-    Some(info)
+    Some(world)
 }
 
 /// Learns the region size every placed region shares from the first placed
@@ -750,7 +760,8 @@ fn tell_the_world(shared: &Arc<Shared>, region: RegionId, batch: &[Spawn]) {
         return;
     }
 
-    let Some(info) = world_of(shared, region) else { return };
+    let Some(world) = world_of(shared, region) else { return };
+    let info = world.info;
 
     for client in owners {
         if shared.post(client, ToClient::Region(info)).is_ok() {
@@ -771,13 +782,21 @@ fn relay(shared: &Arc<Shared>, region: RegionId, entity: crate::EntityId, packet
             .by_id
             .get(&(region, entity))
             .and_then(|key| entities.by_key.get(key))
-            .and_then(|held| Some((held.client?, held.handle?)))
+            .and_then(|held| {
+                // A shadow's packets are its owner's: same client, same
+                // handle, so the client sees one entity with two views.
+                let owner = match held.shadow_of {
+                    Some(owner) => entities.by_key.get(&owner)?,
+                    None => held,
+                };
+                Some((owner.client?, owner.handle?))
+            })
     };
     let Some((client, handle)) = owner else {
         shared.count_relayed(false);
         return;
     };
-    let sent = shared.post(client, ToClient::State { handle, packet }).is_ok();
+    let sent = shared.post(client, ToClient::State { handle, region, packet }).is_ok();
     shared.count_relayed(sent);
 }
 

@@ -74,8 +74,6 @@ struct Frame {
 /// One entity this client is holding.
 #[derive(Clone, Copy, Debug)]
 struct Held {
-    /// Where the edge put it, once it has said. Used only to pick a codec.
-    region: Option<RegionId>,
     /// Whether a move has been sent for it yet. The first goes on the ordered
     /// stream, behind the spawn that named the handle, where it cannot overtake
     /// it; the rest ride datagrams.
@@ -86,10 +84,7 @@ impl Shared {
     /// Asks for an entity.
     fn ask(&self, at: WorldPos, kind: EntityKind) -> Result<EntityHandle, NetError> {
         let handle = EntityHandle::from_raw(self.handles.fetch_add(1, Ordering::Relaxed));
-        self.live
-            .lock()
-            .expect("not poisoned")
-            .insert(handle, Held { region: None, walked: false });
+        self.live.lock().expect("not poisoned").insert(handle, Held { walked: false });
         reliable(self, &FromClient::Spawn { handle, position: at, kind })?;
         Ok(handle)
     }
@@ -275,11 +270,7 @@ impl ClientHandle {
         let shared = self.live()?;
         let handle =
             EntityHandle::from_raw(shared.handles.fetch_add(1, Ordering::Relaxed));
-        shared
-            .live
-            .lock()
-            .expect("not poisoned")
-            .insert(handle, Held { region: None, walked: false });
+        shared.live.lock().expect("not poisoned").insert(handle, Held { walked: false });
         reliable(&shared, &FromClient::SpawnInto { handle, region, position: at, kind })?;
         Ok(handle)
     }
@@ -512,17 +503,15 @@ fn deliver(shared: &Shared, body: &[u8]) {
         }
         return;
     }
-    if let ToClient::State { handle, packet } = message {
-        let Some(region) =
-            shared.live.lock().expect("not poisoned").get(&handle).and_then(|h| h.region)
-        else {
-            return;
-        };
+    if let ToClient::State { handle, region, packet } = message {
+        // The region is on the message because near a seam one handle hears
+        // from two: its own region and the one its shadow stands in.
+        //
         // Copied out rather than borrowed from the map: the observation is
         // handed to consumer code below, and nothing may be locked while that
-        // runs. The world arrives before the first spawn into a region, on the
-        // reliable stream, so a missing codec means a handle this client never
-        // spent.
+        // runs. The world arrives before the first packet from a region, on the
+        // reliable stream, so a missing frame is a packet that overtook it,
+        // and the next tick supersedes it.
         let held = shared.frames.lock().expect("not poisoned").get(&region).cloned();
         let Some(frame) = held else { return };
         let Some(state) = TickObservation::in_frame(
@@ -539,20 +528,8 @@ fn deliver(shared: &Shared, body: &[u8]) {
     // Settled before the game is told, so nothing is locked while consumer
     // code runs and a game calling back in sees the state it was told about
     // rather than the one before it.
-    match message {
-        // Kept here so a state packet can be decoded without the wire having
-        // to repeat the region on every one. The game is told it too, since it
-        // is the only tier that sees more than one region at a time.
-        ToClient::Spawned { handle, region, .. } => {
-            if let Some(held) = shared.live.lock().expect("not poisoned").get_mut(&handle)
-            {
-                held.region = Some(region);
-            }
-        }
-        ToClient::Removed { handle } => {
-            shared.live.lock().expect("not poisoned").remove(&handle);
-        }
-        _ => {}
+    if let ToClient::Removed { handle } = message {
+        shared.live.lock().expect("not poisoned").remove(&handle);
     }
     shared.with_game(|game| match message {
         ToClient::Spawned { handle, region, entity } => {

@@ -25,6 +25,7 @@
 
 mod client;
 mod handle;
+mod seam;
 mod server;
 
 // The wire itself, on both ends of the QUIC link.

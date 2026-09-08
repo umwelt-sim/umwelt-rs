@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use crate::config::WorldConfig;
 use crate::entity::{EntityId, EntityKind};
 use crate::fixed::Fixed;
 use crate::game::EdgeGame;
@@ -21,6 +22,7 @@ use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
 use crate::map::WorldMap;
 use crate::net::control::EdgeLoad;
 use crate::net::edge::protocol::{EdgeInfo, ToClient};
+use crate::net::edge::seam;
 use crate::net::error::NetError;
 use crate::net::region::client::RegionClient;
 use crate::net::region::protocol::{Presence, Spawn};
@@ -55,6 +57,9 @@ pub struct EdgeStats {
     /// `refused` because a client walking into the edge of the world is not
     /// making a mistake.
     pub off_map: u64,
+    /// Shadows this edge keeps right now: second viewers across seams for its
+    /// observers whose view reaches one (`docs/adr/0010`).
+    pub shadows: u32,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +73,15 @@ pub(crate) struct Counters {
     commands: AtomicU64,
     refused: AtomicU64,
     off_map: AtomicU64,
+    shadows: AtomicU32,
+}
+
+/// What a region runs, as the edge keeps it: what a client is told, and the
+/// config the edge's own seam arithmetic reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegionWorld {
+    pub(crate) info: EdgeInfo,
+    pub(crate) config: WorldConfig,
 }
 
 /// One connected game client.
@@ -113,6 +127,13 @@ pub(crate) struct Entity {
     /// handle is remapped from the old key to this one and the old entity is
     /// despawned from its origin region.
     pub(crate) replaces: Option<EntityKey>,
+    /// The shadows this observer keeps across seams, one per neighbor its
+    /// view reaches. Empty for anything that is not an observer near a seam.
+    pub(crate) shadows: Vec<EntityKey>,
+    /// For a shadow, the observer it stands in for. Its packets go to that
+    /// owner's client under that owner's handle, and it is never reported to
+    /// the consumer's game.
+    pub(crate) shadow_of: Option<EntityKey>,
 }
 
 #[derive(Default)]
@@ -179,7 +200,7 @@ pub(crate) struct Shared {
     /// spawned into one, and which clients have been told. A client cannot
     /// decode a packet without it, and cannot be told at connect time because
     /// an edge has no home region.
-    pub(crate) worlds: Mutex<HashMap<RegionId, EdgeInfo>>,
+    pub(crate) worlds: Mutex<HashMap<RegionId, RegionWorld>>,
     pub(crate) told: Mutex<HashSet<(ClientId, RegionId)>>,
     pub(crate) game: Mutex<Box<dyn EdgeGame>>,
     pub(crate) client_ids: Mint,
@@ -421,6 +442,34 @@ impl Shared {
         at: Pos3,
         kind: EntityKind,
     ) -> Result<EntityKey, NetError> {
+        self.ask_for(client, handle, region, at, kind, None)
+    }
+
+    /// A shadow for `owner` in `region`, at a point inside that region's box.
+    /// Owned by the owner's client so it is swept with it, named by no handle
+    /// so the client is never told of it, and never reported to the game.
+    pub(crate) fn ask_shadow(
+        &self,
+        owner: EntityKey,
+        client: Option<ClientId>,
+        region: RegionId,
+        at: Pos3,
+    ) -> Result<EntityKey, NetError> {
+        let key =
+            self.ask_for(client, None, region, at, EntityKind::shadow(), Some(owner))?;
+        self.counters.shadows.fetch_add(1, Ordering::Relaxed);
+        Ok(key)
+    }
+
+    fn ask_for(
+        &self,
+        client: Option<ClientId>,
+        handle: Option<EntityHandle>,
+        region: RegionId,
+        at: Pos3,
+        kind: EntityKind,
+        shadow_of: Option<EntityKey>,
+    ) -> Result<EntityKey, NetError> {
         let key = EntityKey::from_raw(self.entity_keys.next());
         self.entities().by_key.insert(
             key,
@@ -433,6 +482,8 @@ impl Shared {
                 pending: None,
                 doomed: false,
                 replaces: None,
+                shadows: Vec::new(),
+                shadow_of,
             },
         );
         if let Some(client) = client {
@@ -448,7 +499,7 @@ impl Shared {
                 );
             }
         }
-        if kind.observes() {
+        if kind.observes() && !kind.is_shadow() {
             self.counters.observers.fetch_add(1, Ordering::Relaxed);
         }
         // The key is the correlation token: unique to this edge, never reused,
@@ -487,7 +538,9 @@ impl Shared {
     pub(crate) fn forget(&self, key: EntityKey) -> Option<Entity> {
         let mut entities = self.entities();
         let entity = entities.by_key.remove(&key)?;
-        if entity.kind.observes() {
+        if entity.kind.is_shadow() {
+            self.counters.shadows.fetch_sub(1, Ordering::Relaxed);
+        } else if entity.kind.observes() {
             self.counters.observers.fetch_sub(1, Ordering::Relaxed);
         }
         if let Some(id) = entity.id {
@@ -523,6 +576,7 @@ impl Shared {
             refused: self.counters.refused.load(Ordering::Relaxed),
             placed_regions: self.map.len() as u32,
             off_map: self.counters.off_map.load(Ordering::Relaxed),
+            shadows: self.counters.shadows.load(Ordering::Relaxed),
         }
     }
 
@@ -723,11 +777,17 @@ impl EdgeHandle {
     /// that has gone.
     pub fn entities_of(&self, client: ClientId) -> Vec<EntityKey> {
         let Ok(shared) = self.live() else { return Vec::new() };
-        shared
+        let keys: Vec<EntityKey> = shared
             .clients()
             .get(&client)
             .map(|held| held.keys.iter().copied().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The shadows the edge keeps for this client's observers are swept
+        // with them but were never asked for, so they are not listed.
+        let entities = shared.entities();
+        keys.into_iter()
+            .filter(|key| entities.by_key.get(key).is_none_or(|e| e.shadow_of.is_none()))
+            .collect()
     }
 
     /// This edge's name for what a region calls `id`.
@@ -766,17 +826,12 @@ impl core::fmt::Debug for EdgeHandle {
 /// in one place.
 pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence) {
     match what {
-        // Answered from the shadow and crossing work on: for now the region
-        // is heard and nothing is done.
-        Presence::BoundaryCollision { .. }
-        | Presence::ViewCollision { .. }
-        | Presence::ViewCleared { .. } => {}
         Presence::Added { entity, token } => {
             let key = EntityKey::from_raw(token);
 
             // Extract everything needed from the entity before releasing
             // the lock on `entities`, so borrow-checker is happy.
-            let (client, handle, pending, replaces) = {
+            let (client, handle, pending, replaces, is_shadow) = {
                 let mut entities = shared.entities();
                 let Some(held) = entities.by_key.get_mut(&key) else {
                     // A token this edge never spent, or one whose entity it
@@ -787,8 +842,13 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
                     return;
                 };
                 held.id = Some(entity);
-                let out =
-                    (held.client, held.handle, held.pending.take(), held.replaces.take());
+                let out = (
+                    held.client,
+                    held.handle,
+                    held.pending.take(),
+                    held.replaces.take(),
+                    held.shadow_of.is_some(),
+                );
                 entities.by_id.insert((region, entity), key);
                 out
             };
@@ -804,15 +864,106 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
                     let _ =
                         shared.post(client, ToClient::Spawned { handle, region, entity });
                 }
-                shared.with_game(|game| game.spawned(key, client, region, entity));
+                // A shadow is the library's, and the game is not told of it.
+                if !is_shadow {
+                    shared.with_game(|game| game.spawned(key, client, region, entity));
+                }
             }
         }
+        // An observer's view reaches its region's box. Which neighbors are
+        // there is the map's to say, and a shadow is kept in each so the
+        // client is served the far side too. Nothing for a region off the map.
+        Presence::ViewCollision { entity, position } => {
+            let (owner, client, existing): (
+                EntityKey,
+                Option<ClientId>,
+                Vec<(EntityKey, RegionId)>,
+            ) = {
+                let entities = shared.entities();
+                let Some(&key) = entities.by_id.get(&(region, entity)) else { return };
+                let Some(held) = entities.by_key.get(&key) else { return };
+                if held.shadow_of.is_some() {
+                    return;
+                }
+                let existing = held
+                    .shadows
+                    .iter()
+                    .filter_map(|k| entities.by_key.get(k).map(|s| (*k, s.region)))
+                    .collect();
+                (key, held.client, existing)
+            };
+            let Some(square) = shared.map.placement_of(region) else { return };
+            let Some(cfg) = shared
+                .worlds
+                .lock()
+                .expect("not poisoned")
+                .get(&region)
+                .map(|w| w.config)
+            else {
+                return;
+            };
+            let here = WorldPos::from_local(position, square, cfg.region_size());
+            let mut keep: Vec<EntityKey> = Vec::new();
+            for beyond in seam::squares_in_view(&cfg, square, position) {
+                let Some(neighbor) = shared.map.region_at(beyond) else { continue };
+                let Some(point) = seam::shadow_point(&cfg, here, beyond) else {
+                    continue;
+                };
+                match existing.iter().find(|(_, r)| *r == neighbor) {
+                    Some(&(shadow, _)) => {
+                        shared.set_positions([(shadow, point)]);
+                        keep.push(shadow);
+                    }
+                    None => {
+                        if let Ok(shadow) =
+                            shared.ask_shadow(owner, client, neighbor, point)
+                        {
+                            keep.push(shadow);
+                        }
+                    }
+                }
+            }
+            for (shadow, _) in existing {
+                if !keep.contains(&shadow) {
+                    shared.release(shadow);
+                }
+            }
+            if let Some(held) = shared.entities().by_key.get_mut(&owner) {
+                held.shadows = keep;
+            }
+        }
+        Presence::ViewCleared { entity } => {
+            let shadows: Vec<EntityKey> = {
+                let mut entities = shared.entities();
+                let Some(&key) = entities.by_id.get(&(region, entity)) else { return };
+                let Some(held) = entities.by_key.get_mut(&key) else { return };
+                std::mem::take(&mut held.shadows)
+            };
+            for shadow in shadows {
+                shared.release(shadow);
+            }
+        }
+        // A wall or a crossing is the edge's to decide, from the crossing work
+        // on. Heard, and nothing done.
+        Presence::BoundaryCollision { .. } => {}
         Presence::Removed { entity } => {
             let Some(key) = shared.entities().by_id.get(&(region, entity)).copied()
             else {
                 return;
             };
             let Some(held) = shared.forget(key) else { return };
+            // A shadow going takes itself off its owner's list, and that is
+            // all: the client never knew it and the game is not told.
+            if let Some(owner) = held.shadow_of {
+                if let Some(o) = shared.entities().by_key.get_mut(&owner) {
+                    o.shadows.retain(|k| *k != key);
+                }
+                return;
+            }
+            // An owner going takes its shadows with it.
+            for shadow in held.shadows {
+                shared.release(shadow);
+            }
             if let (Some(client), Some(handle)) = (held.client, held.handle) {
                 let _ = shared.post(client, ToClient::Removed { handle });
             }
@@ -867,9 +1018,14 @@ fn complete_teleport(
         if let Some(old_id) = old_id {
             entities.by_id.remove(&(from_region, old_id));
         }
-        // Remove the old entity from by_key.
-        entities.by_key.remove(&old_key);
+        // Remove the old entity from by_key. Its shadows stood in for a view
+        // that no longer exists; the destination reports its own.
+        let old_shadows =
+            entities.by_key.remove(&old_key).map(|e| e.shadows).unwrap_or_default();
         drop(entities);
+        for shadow in old_shadows {
+            shared.release(shadow);
+        }
         (handle, from_region, old_id, old_observed)
     };
 

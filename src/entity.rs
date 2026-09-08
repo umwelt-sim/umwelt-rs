@@ -65,6 +65,9 @@ pub struct EntityKind {
 /// The observer/unattended distinction, without the tag.
 const ROLE_UNATTENDED: u8 = 0;
 const ROLE_OBSERVER: u8 = 1;
+/// A viewer with no presence in the snapshot: the library's own, for seeing
+/// across a seam (`docs/adr/0010`). A consumer cannot construct one.
+const ROLE_SHADOW: u8 = 2;
 
 impl EntityKind {
     /// An unattended entity carrying a game-defined tag. No viewer is
@@ -81,10 +84,32 @@ impl EntityKind {
         EntityKind { role: ROLE_OBSERVER, tag }
     }
 
+    /// An entity that holds a viewer and is in nobody's snapshot: nothing
+    /// gathers it and nobody is told about it. The edge spawns one in the
+    /// region across a seam for an observer whose view reaches it, so that
+    /// observer's client is served the neighbor's border strip too.
+    #[inline]
+    pub(crate) const fn shadow() -> EntityKind {
+        EntityKind { role: ROLE_SHADOW, tag: 0 }
+    }
+
     /// Whether a viewer is registered for it.
     #[inline]
     pub const fn observes(self) -> bool {
-        self.role == ROLE_OBSERVER
+        self.role == ROLE_OBSERVER || self.role == ROLE_SHADOW
+    }
+
+    /// Whether it is in the snapshot, where other viewers can gather it. Only
+    /// a shadow is not.
+    #[inline]
+    pub const fn shown(self) -> bool {
+        self.role != ROLE_SHADOW
+    }
+
+    /// Whether this is the library's shadow role.
+    #[inline]
+    pub const fn is_shadow(self) -> bool {
+        self.role == ROLE_SHADOW
     }
 
     /// The game-defined tag. Umwelt does not interpret it.
@@ -93,7 +118,7 @@ impl EntityKind {
         self.tag
     }
 
-    /// The role byte: 0 for unattended, 1 for observer.
+    /// The role byte: 0 for unattended, 1 for observer, 2 for shadow.
     #[inline]
     pub(crate) const fn role(self) -> u8 {
         self.role
@@ -105,6 +130,7 @@ impl fmt::Display for EntityKind {
         match self.role {
             ROLE_UNATTENDED => write!(f, "unattended({})", self.tag),
             ROLE_OBSERVER => write!(f, "observer({})", self.tag),
+            ROLE_SHADOW => write!(f, "shadow"),
             _ => write!(f, "unknown({})", self.tag),
         }
     }
@@ -201,6 +227,19 @@ impl LiveSet {
             return false;
         }
         self.words[i >> 6] & (1u64 << (i & 63)) != 0
+    }
+
+    /// Grows to cover an id without marking it live, so a set that omits an
+    /// entity on purpose still spans every slot the position arrays hold.
+    pub(crate) fn cover(&mut self, id: EntityId) {
+        let i = id.index();
+        if i >= self.slots {
+            self.slots = i + 1;
+            let needed = self.slots.div_ceil(64);
+            if self.words.len() < needed {
+                self.words.resize(needed, 0);
+            }
+        }
     }
 
     /// Marks an entity live, growing to cover it if needed.

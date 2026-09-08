@@ -164,6 +164,16 @@ pub(crate) struct Entity {
     /// The name every region writes for it: the key it was first minted
     /// under, kept across a teleport (`docs/adr/0010`).
     pub(crate) name: u64,
+    /// The last thing its client said to it, kept so a crossing can say it
+    /// again to the region the entity lands in.
+    ///
+    /// A region that has just been handed an entity has heard nothing about
+    /// it. Whatever standing instruction the client gave — the one that had
+    /// the entity walking into the boundary in the first place — was sent to
+    /// the region it left. Every such message passes through this edge, so
+    /// the edge is what can say it again, and the client never learns that
+    /// anything was repeated.
+    pub(crate) standing: Option<Vec<u8>>,
     /// Set while a teleport of this entity is in flight, until the
     /// destination confirms or the wait is given up.
     pub(crate) transition: Option<Transition>,
@@ -580,6 +590,7 @@ impl Shared {
                 shadow_of,
                 name,
                 transition: None,
+                standing: None,
             },
         );
         if let Some(client) = client {
@@ -1125,7 +1136,7 @@ fn complete_teleport(
 ) {
     // Read the old entity's details under the entities lock, then update
     // both keys atomically.
-    let (handle, from_region, old_id, old_observed, name, transition) = {
+    let (handle, from_region, old_id, old_observed, name, transition, standing) = {
         let mut entities = shared.entities();
         let Some(old) = entities.by_key.get(&old_key) else {
             // The old entity is already gone — the client disconnected or
@@ -1158,16 +1169,16 @@ fn complete_teleport(
         }
         // Remove the old entity from by_key. Its shadows stood in for a view
         // that no longer exists; the destination reports its own.
-        let (old_shadows, transition) = entities
+        let (old_shadows, transition, standing) = entities
             .by_key
             .remove(&old_key)
-            .map(|e| (e.shadows, e.transition))
+            .map(|e| (e.shadows, e.transition, e.standing))
             .unwrap_or_default();
         drop(entities);
         for shadow in old_shadows {
             shared.release(shadow);
         }
-        (handle, from_region, old_id, old_observed, name, transition)
+        (handle, from_region, old_id, old_observed, name, transition, standing)
     };
     shared.transits.lock().expect("not poisoned").retain(|t| t.to != new_key);
 
@@ -1191,6 +1202,14 @@ fn complete_teleport(
     if let Some(to) = pending {
         shared.queue_move(dest, new_entity, to);
     }
+    // The last thing the client said to this entity, said again to the
+    // region it has landed in. That region has heard nothing about it, and
+    // the instruction still stands: it is what had the entity walking into
+    // the boundary that started this. Ahead of anything held during the
+    // transition, which is newer and supersedes it.
+    if let Some(body) = standing.clone() {
+        shared.tell_region(Outgoing::Message(dest, new_entity, body));
+    }
     // What arrived for the entity in transit: the latest move, if it falls
     // in the destination, and every entity message in order. A move that
     // does not fit the destination is dropped rather than clamped to its
@@ -1202,6 +1221,12 @@ fn complete_teleport(
         for body in transition.held_messages {
             shared.tell_region(Outgoing::Message(dest, new_entity, body));
         }
+    }
+    // The arriving entity carries it on, so the next crossing repeats it too.
+    if let Some(body) = standing
+        && let Some(new) = shared.entities().by_key.get_mut(&new_key)
+    {
+        new.standing = Some(body);
     }
 
     // Adjust observer count: the old entity is gone without going through

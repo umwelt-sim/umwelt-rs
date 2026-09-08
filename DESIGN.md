@@ -1544,7 +1544,13 @@ initiative: one entry point starts every teleport, asked for or a crossing,
 and a client is told of a failure only when it asked. While the destination
 has not answered, the entity leaving holds what arrives for it, the latest
 move in world coordinates and entity messages in order, and the remap forwards
-both to the destination. A transition the destination never confirms is given
+both to the destination. Ahead of those it repeats the last message the client
+sent before the crossing: the destination has heard nothing about the entity,
+and that instruction is what had it walking into the boundary. Measured in
+`mildew-valley`, whose region walks a farmer from a heading it holds: a walker
+crossing a seam is served 498 times in 498 ticks with a mean position error
+under one raw unit, against 77 sightings in 374 ticks when the destination was
+told nothing. A transition the destination never confirms is given
 up after `TELEPORT_TIMEOUT`, two seconds, and the client told. The shadows
 swap by the reports that made them: the remap releases the old entity's, and
 the destination's own view collision puts one in the origin. A game developer

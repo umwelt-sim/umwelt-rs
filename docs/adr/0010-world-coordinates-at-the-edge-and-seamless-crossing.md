@@ -400,18 +400,21 @@ It costs bandwidth for three ticks and changes nothing the client sees.
 Handing a ghost table from one viewer to another would save only that
 bandwidth.
 
-**The walk resumes on the far side because the edge carries the intent.**
-Nothing of the region's crosses. `docs/adr/0005` puts input state at the edge,
-and a heading is input state. A game whose region resolves movement from
-intent may send that intent to the edge's game rather than to the entity; the
-library does not require it, and this is the game's own state handled with
-the callbacks it already has:
-`EdgeGame::message_received` forwards it to the region with `send_to_region`
-and remembers the last one per entity, a byte for a heading. On a crossing
-`teleporting` returns it in `Carry`, and `teleport_arrived` sends it to the
-destination, which walks the entity on its next tick. The region still takes
-every step. A game that keeps nothing at the edge re-sends its intent from the
-client on `teleported` and pays one more round trip of standing still.
+**The walk resumes on the far side because the edge says again what it
+already heard.** The region a crossing lands in has been handed an entity it
+knows nothing about. Whatever standing instruction the client gave is what had
+that entity walking into the boundary in the first place, and it was sent to
+the region it left. Every message a client sends its entity passes through the
+edge, so the edge holds the latest one and repeats it to the destination after
+the remap, ahead of anything held during the transition, which is newer. The
+region takes every step, as it did before.
+
+This is the same buffering the transition already does, extended by one
+message backward. It runs inside the edge with nothing asked of a game
+developer: no callback, no state to keep, and nothing on the client, which is
+never told a crossing happened. A game whose region resolves movement from a
+heading it holds gets a walker that crosses without breaking stride and costs
+one message per crossing.
 
 **What a crossing costs the crosser** is the teleport's own latency, which
 `docs/adr/0003` measured end to end at 10.5 to 22.9 ms with both regions on

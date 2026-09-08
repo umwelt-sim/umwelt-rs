@@ -495,17 +495,20 @@ fn an_entity_reaching_a_seam_is_crossed_by_the_edge_under_one_name() {
         );
 
         // Messages: the five before went to A, the twenty during the
-        // transition reach B in order, and A never sees them.
+        // transition reach B in order, and A never sees them. Ahead of those,
+        // B is told the last thing the client said before the crossing: that
+        // instruction still stands, and B has heard nothing about this
+        // entity. Whatever had it walking into the boundary is what carries
+        // it on, and the client repeats nothing.
         wait_until("B's game to receive the held messages", &stop, || {
-            east.messages().len() >= 20
+            east.messages().len() >= 21
         });
         let to_a = west.messages();
         let to_b = east.messages();
         assert_eq!(to_a, (0..5u8).map(|n| vec![b'a', b'0' + n]).collect::<Vec<_>>());
-        assert_eq!(
-            to_b,
-            (0..20u8).map(|n| format!("t{n:02}").into_bytes()).collect::<Vec<_>>()
-        );
+        let mut want = vec![b"a4".to_vec()];
+        want.extend((0..20u8).map(|n| format!("t{n:02}").into_bytes()));
+        assert_eq!(to_b, want, "the standing instruction, then the held messages");
 
         // The bystander held the name throughout: it was sent the crosser from
         // A through its shadow, then from B, and was never told to forget it.

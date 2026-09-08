@@ -488,7 +488,11 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
             };
             // In transit, held in order and forwarded after the remap, so it
             // reaches the destination rather than a copy about to be given
-            // back (`docs/adr/0010`, "Crossing").
+            // back (`docs/adr/0010`, "Crossing"). Otherwise it goes on to the
+            // region, and the latest is kept so a crossing can repeat it to
+            // the region the entity lands in, which has heard nothing about
+            // it. A message held during a transition is already being
+            // delivered, so it is not kept twice.
             let forward = {
                 let mut entities = shared.entities();
                 let Some(held) = entities.by_key.get_mut(&key) else { return };
@@ -497,7 +501,10 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
                         transition.held_messages.push(body);
                         None
                     }
-                    None => held.id.map(|id| (held.region, id, body)),
+                    None => {
+                        held.standing = Some(body.clone());
+                        held.id.map(|id| (held.region, id, body))
+                    }
                 }
             };
             if let Some((region, id, body)) = forward {

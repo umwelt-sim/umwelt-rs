@@ -633,6 +633,18 @@ fn positive(v: Fixed, name: &'static str) -> Result<(), ConfigError> {
     if v.raw() <= 0 { Err(ConfigError::NonPositive(name)) } else { Ok(()) }
 }
 
+/// `raw` held to `0..=last`.
+#[inline]
+const fn clamp_raw(raw: i32, last: i32) -> i32 {
+    if raw < 0 {
+        0
+    } else if raw > last {
+        last
+    } else {
+        raw
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -807,17 +819,5 @@ mod tests {
         let a = base().build().unwrap();
         let b = base().vertical_extent_m(512).build().unwrap();
         assert_ne!(a.protocol_hash(), b.protocol_hash());
-    }
-}
-
-/// `raw` held to `0..=last`.
-#[inline]
-const fn clamp_raw(raw: i32, last: i32) -> i32 {
-    if raw < 0 {
-        0
-    } else if raw > last {
-        last
-    } else {
-        raw
     }
 }

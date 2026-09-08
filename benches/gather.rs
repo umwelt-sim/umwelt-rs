@@ -21,7 +21,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use umwelt::internals::{CellSnapshot, DiscoveredEntities, Subscription};
-use umwelt::{EntityId, Fixed, LiveSet, Pos3, WorldConfig};
+use umwelt::{EntityId, Fixed, LiveSet, Pos3, RegionId, WorldConfig};
 
 /// xorshift64. Deterministic across runs so successive benchmarks compare.
 struct Rng(u64);
@@ -49,6 +49,7 @@ struct Entities {
     ys: Vec<Fixed>,
     zs: Vec<Fixed>,
     tags: Vec<u16>,
+    names: Vec<u64>,
     live: LiveSet,
 }
 
@@ -59,6 +60,7 @@ impl Entities {
             ys: Vec::with_capacity(n),
             zs: Vec::with_capacity(n),
             tags: Vec::with_capacity(n),
+            names: Vec::with_capacity(n),
             live: LiveSet::with_capacity(n),
         }
     }
@@ -69,6 +71,7 @@ impl Entities {
         self.ys.push(p.y);
         self.zs.push(p.z);
         self.tags.push(0);
+        self.names.push(0);
         self.live.insert(id);
     }
 }
@@ -129,7 +132,7 @@ fn hot_cell(
 
 fn snapshot_of(cfg: &WorldConfig, e: &Entities) -> CellSnapshot {
     let mut s = CellSnapshot::new(cfg);
-    s.update(&e.xs, &e.ys, &e.zs, &e.tags, &e.live);
+    s.update(&e.xs, &e.ys, &e.zs, &e.tags, &e.names, RegionId::from_raw(0), &e.live);
     s
 }
 
@@ -402,6 +405,8 @@ fn bench_subdivision(c: &mut Criterion) {
                     black_box(&entities.ys),
                     black_box(&entities.zs),
                     black_box(&entities.tags),
+                    black_box(&entities.names),
+                    RegionId::from_raw(0),
                     &entities.live,
                 )
             })

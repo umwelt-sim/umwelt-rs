@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{
-    ClientGame, ClientLimits, EdgeClient, EdgeGame, EdgeServer, EntityHandle, EntityId,
+    ClientGame, ClientLimits, EdgeClient, EdgeGame, EdgeServer, EntityHandle, EntityKey,
     EntityKind, Flow, Game, Handoff, Overrun, Pacing, Placement, Pos3, RegionId,
     RegionServer, Step, TickObservation, Wait, WorldConfig, WorldMap, WorldPos,
     WorldSimulation,
@@ -215,17 +215,19 @@ fn region_ids() -> (RegionId, RegionId) {
 struct Relay;
 impl EdgeGame for Relay {}
 
+/// Packets per region, and every (handle, name, world position) they carried.
+type Seen = HashMap<RegionId, (u64, Vec<(EntityHandle, EntityKey, WorldPos)>)>;
+
 /// What the edge told this client, by region.
 struct Watcher {
-    spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityId)>>>,
-    /// Packets per region, and every (entity, world position) they carried.
-    seen: Arc<Mutex<HashMap<RegionId, (u64, Vec<(EntityHandle, EntityId, WorldPos)>)>>>,
+    spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityKey)>>>,
+    seen: Arc<Mutex<Seen>>,
     packets: Arc<AtomicU64>,
 }
 
 impl ClientGame for Watcher {
-    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-        self.spawned.lock().expect("not poisoned").push((handle, region, entity));
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {
+        self.spawned.lock().expect("not poisoned").push((handle, region, name));
     }
 
     fn observed(

@@ -134,6 +134,9 @@ pub(crate) struct Entity {
     /// owner's client under that owner's handle, and it is never reported to
     /// the consumer's game.
     pub(crate) shadow_of: Option<EntityKey>,
+    /// The name every region writes for it: the key it was first minted
+    /// under, kept across a teleport (`docs/adr/0010`).
+    pub(crate) name: u64,
 }
 
 #[derive(Default)]
@@ -442,7 +445,20 @@ impl Shared {
         at: Pos3,
         kind: EntityKind,
     ) -> Result<EntityKey, NetError> {
-        self.ask_for(client, handle, region, at, kind, None)
+        self.ask_for(client, handle, region, at, kind, None, None)
+    }
+
+    /// An entity that keeps a name it already has: the destination copy of a
+    /// teleport, so a client holding the name from before holds it after.
+    pub(crate) fn ask_named(
+        &self,
+        client: Option<ClientId>,
+        region: RegionId,
+        at: Pos3,
+        kind: EntityKind,
+        name: u64,
+    ) -> Result<EntityKey, NetError> {
+        self.ask_for(client, None, region, at, kind, None, Some(name))
     }
 
     /// A shadow for `owner` in `region`, at a point inside that region's box.
@@ -455,12 +471,22 @@ impl Shared {
         region: RegionId,
         at: Pos3,
     ) -> Result<EntityKey, NetError> {
-        let key =
-            self.ask_for(client, None, region, at, EntityKind::shadow(), Some(owner))?;
+        let key = self.ask_for(
+            client,
+            None,
+            region,
+            at,
+            EntityKind::shadow(),
+            Some(owner),
+            None,
+        )?;
         self.counters.shadows.fetch_add(1, Ordering::Relaxed);
         Ok(key)
     }
 
+    // Every argument is one fact about the spawn being asked for; a struct
+    // would name the same seven once more.
+    #[allow(clippy::too_many_arguments)]
     fn ask_for(
         &self,
         client: Option<ClientId>,
@@ -469,8 +495,10 @@ impl Shared {
         at: Pos3,
         kind: EntityKind,
         shadow_of: Option<EntityKey>,
+        name: Option<u64>,
     ) -> Result<EntityKey, NetError> {
         let key = EntityKey::from_raw(self.entity_keys.next());
+        let name = name.unwrap_or(key.raw());
         self.entities().by_key.insert(
             key,
             Entity {
@@ -484,6 +512,7 @@ impl Shared {
                 replaces: None,
                 shadows: Vec::new(),
                 shadow_of,
+                name,
             },
         );
         if let Some(client) = client {
@@ -506,7 +535,7 @@ impl Shared {
         // and echoed back by the region without being looked inside.
         self.tell_region(Outgoing::Spawn(
             region,
-            Spawn { position: at, kind, token: key.raw() },
+            Spawn { position: at, kind, token: key.raw(), name },
         ));
         Ok(key)
     }
@@ -831,7 +860,7 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
 
             // Extract everything needed from the entity before releasing
             // the lock on `entities`, so borrow-checker is happy.
-            let (client, handle, pending, replaces, is_shadow) = {
+            let (client, handle, pending, replaces, is_shadow, name) = {
                 let mut entities = shared.entities();
                 let Some(held) = entities.by_key.get_mut(&key) else {
                     // A token this edge never spent, or one whose entity it
@@ -848,6 +877,7 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
                     held.pending.take(),
                     held.replaces.take(),
                     held.shadow_of.is_some(),
+                    held.name,
                 );
                 entities.by_id.insert((region, entity), key);
                 out
@@ -861,8 +891,9 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
                     shared.queue_move(region, entity, to);
                 }
                 if let (Some(client), Some(handle)) = (client, handle) {
+                    let name = EntityKey::from_raw(name);
                     let _ =
-                        shared.post(client, ToClient::Spawned { handle, region, entity });
+                        shared.post(client, ToClient::Spawned { handle, region, name });
                 }
                 // A shadow is the library's, and the game is not told of it.
                 if !is_shadow {
@@ -989,7 +1020,7 @@ fn complete_teleport(
 ) {
     // Read the old entity's details under the entities lock, then update
     // both keys atomically.
-    let (handle, from_region, old_id, old_observed) = {
+    let (handle, from_region, old_id, old_observed, name) = {
         let mut entities = shared.entities();
         let Some(old) = entities.by_key.get(&old_key) else {
             // The old entity is already gone — the client disconnected or
@@ -1004,6 +1035,7 @@ fn complete_teleport(
         let from_region = old.region;
         let old_id = old.id;
         let old_observed = old.kind.observes();
+        let name = old.name;
 
         // Move the handle onto the new entity.
         if let Some(handle) = handle {
@@ -1026,7 +1058,7 @@ fn complete_teleport(
         for shadow in old_shadows {
             shared.release(shadow);
         }
-        (handle, from_region, old_id, old_observed)
+        (handle, from_region, old_id, old_observed, name)
     };
 
     // Update the client's handle mapping: handle → new_key, remove old_key.
@@ -1056,11 +1088,13 @@ fn complete_teleport(
         shared.counters.observers.fetch_sub(1, Ordering::Relaxed);
     }
 
-    // Tell the client: Spawned first (so it has the new entity id), then
-    // Teleported.
+    // Tell the client: Spawned first, with the name it has held all along and
+    // the region it is now in, then Teleported.
     if let (Some(client), Some(handle)) = (client, handle) {
-        let _ = shared
-            .post(client, ToClient::Spawned { handle, region: dest, entity: new_entity });
+        let _ = shared.post(
+            client,
+            ToClient::Spawned { handle, region: dest, name: EntityKey::from_raw(name) },
+        );
         let _ = shared.post(client, ToClient::Teleported { handle, region: dest });
     }
 

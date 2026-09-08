@@ -26,6 +26,7 @@ use crate::fixed::Fixed;
 use crate::game::Game;
 use crate::gather::DiscoveredEntities;
 use crate::ghost::GhostTable;
+use crate::id::{EntityKey, RegionId};
 use crate::odometer::Odometer;
 use crate::packet::{DESPAWN_BYTES, PacketWriter};
 use crate::pos::Pos3;
@@ -74,7 +75,7 @@ const GRAIN: usize = 16;
 ///
 /// The cost is slots spent on entities that were already correct: with the
 /// default ghost cap, one two-hundredth of the set comes due each tick, which
-/// is between one and two records of the eighty-four a packet holds. Lowering
+/// is between one and two records of the sixty-five a packet holds. Lowering
 /// it shortens the worst case and spends more; zero switches it off and
 /// returns the permanent error.
 pub const DEFAULT_REFRESH: u32 = 100;
@@ -111,6 +112,9 @@ pub struct Step<'a> {
     at_wall: &'a mut Vec<bool>,
     /// Boundary collisions this tick: the entity, and the position it wanted.
     collisions: &'a mut Vec<(EntityId, Pos3)>,
+    /// Each entity's name on the client's wire, or zero for one the game
+    /// spawned, which is named by this region and its id instead.
+    names: &'a mut Vec<u64>,
     cfg: &'a WorldConfig,
     tick: u32,
 }
@@ -250,9 +254,19 @@ impl Step<'_> {
         self.zs.push(pos.z);
         self.tags.push(tag);
         self.at_wall.push(false);
+        self.names.push(0);
         self.live.insert(id);
         self.shown.insert(id);
         id
+    }
+
+    /// Gives an entity the name the edge that owns it chose, which the region
+    /// writes into every record and despawn for it in place of its own id
+    /// (`docs/adr/0010`). Called by the session when it applies a spawn.
+    pub(crate) fn set_name(&mut self, id: EntityId, name: u64) {
+        if self.live.contains(id) {
+            self.names[id.index()] = name;
+        }
     }
 
     /// Appends a shadow: a viewer with no presence in the snapshot. Only the
@@ -265,6 +279,7 @@ impl Step<'_> {
         self.zs.push(pos.z);
         self.tags.push(0);
         self.at_wall.push(false);
+        self.names.push(0);
         self.live.insert(id);
         self.shown.cover(id);
         id
@@ -384,6 +399,8 @@ struct Scratch {
     writer: PacketWriter,
     /// Despawns drained from a viewer's queue for this packet.
     despawns: Vec<EntityId>,
+    /// The same despawns as the names the packet carries.
+    despawn_names: Vec<u64>,
     /// Viewers whose view reached the box this tick, and where they stood.
     view_collisions: Vec<(EntityId, Pos3)>,
     /// Viewers whose view stopped reaching the box this tick.
@@ -402,6 +419,10 @@ struct Frame<'a, S: PayloadSink> {
     live: &'a LiveSet,
     /// Everything but the shadows, which the region does not report on.
     shown: &'a LiveSet,
+    /// See [`Step`]'s field of the same name.
+    names: &'a [u64],
+    /// This region, for naming what its own game spawned.
+    region: RegionId,
     xs: &'a [Fixed],
     ys: &'a [Fixed],
     zs: &'a [Fixed],
@@ -474,20 +495,32 @@ fn serve<S: PayloadSink>(
     w.despawns.extend(v.pending_despawns.drain(..taking));
     let slots = state.saturating_sub(taking * DESPAWN_BYTES) / v.budget.record_bytes();
 
-    let Scratch { found, selection, writer, despawns, stats, .. } = w;
+    let Scratch { found, selection, writer, despawns, despawn_names, stats, .. } = w;
     select(f.tick, found, f.odo, f.policy, slots, &mut v.ghosts, selection);
 
     v.sequence = v.sequence.wrapping_add(1);
     let cands = found.as_slice();
     let snap = f.snap;
+    // A despawned entity is no longer in the snapshot, so its name is looked
+    // up by id: what the owning edge chose, or, for one this region's game
+    // spawned, this region and the id composed. Ids are never reused, so the
+    // name still reads. A record's name comes from the snapshot row the
+    // position does; looked up by id, it cost an eighth of the tick.
+    let name_of = |id: EntityId| -> u64 {
+        match f.names[id.index()] {
+            0 => EntityKey::of_region(f.region, id).raw(),
+            named => named,
+        }
+    };
+    despawn_names.clear();
+    despawn_names.extend(despawns.iter().map(|&id| name_of(id)));
     writer.build(
         f.tick,
         v.sequence,
-        despawns,
+        despawn_names,
         selection.records().iter().map(|r| {
-            let e = cands[r.index()];
-            let si = e.snapshot_index as usize;
-            (e.id, snap.pos_at(si), snap.tag_at(si))
+            let si = cands[r.index()].snapshot_index as usize;
+            (snap.name_at(si), snap.pos_at(si), snap.tag_at(si))
         }),
     );
 
@@ -646,6 +679,12 @@ pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     despawned: Vec<EntityId>,
     /// See [`Step`]'s field of the same name.
     at_wall: Vec<bool>,
+    /// See [`Step`]'s field of the same name.
+    names: Vec<u64>,
+    /// This region, for naming what its own game spawned. Set by the session
+    /// at the first settle, before any viewer is registered and so before any
+    /// packet leaves.
+    region: RegionId,
     /// Boundary collisions during the last tick.
     collisions: Vec<(EntityId, Pos3)>,
     /// Viewers whose view reached the box during the last tick.
@@ -715,6 +754,8 @@ impl<G: Game> WorldSimulation<G, NullSink> {
             shown: LiveSet::new(),
             despawned: Vec::new(),
             at_wall: Vec::new(),
+            names: Vec::new(),
+            region: RegionId::from_raw(0),
             collisions: Vec::new(),
             view_collisions: Vec::new(),
             view_cleared: Vec::new(),
@@ -759,6 +800,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             shown: self.shown,
             despawned: self.despawned,
             at_wall: self.at_wall,
+            names: self.names,
+            region: self.region,
             collisions: self.collisions,
             view_collisions: self.view_collisions,
             view_cleared: self.view_cleared,
@@ -810,6 +853,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             selection: Selection::with_capacity(ghosts),
             writer: PacketWriter::new(codec, payload),
             despawns: Vec::with_capacity(ghosts),
+            despawn_names: Vec::with_capacity(ghosts),
             view_collisions: Vec::new(),
             view_cleared: Vec::new(),
             stats: TickStats::default(),
@@ -856,6 +900,12 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     #[inline]
     pub fn odometer(&self) -> &Odometer {
         &self.odo
+    }
+
+    /// Names what this region's own game spawns by this region. The session
+    /// calls it at every settle; nothing else needs to.
+    pub(crate) fn set_region(&mut self, region: RegionId) {
+        self.region = region;
     }
 
     /// Entities despawned during the last tick, whoever asked for it.
@@ -1059,6 +1109,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
                 despawned: &mut self.despawned,
                 at_wall: &mut self.at_wall,
                 collisions: &mut self.collisions,
+                names: &mut self.names,
                 cfg: &self.cfg,
                 tick: self.tick,
             };
@@ -1081,7 +1132,15 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         }
         self.prev_tags.clear();
         self.prev_tags.extend_from_slice(&self.tags);
-        self.snap.update(&self.xs, &self.ys, &self.zs, &self.tags, &self.shown);
+        self.snap.update(
+            &self.xs,
+            &self.ys,
+            &self.zs,
+            &self.tags,
+            &self.names,
+            self.region,
+            &self.shown,
+        );
 
         let frame = Frame {
             sink: &self.sink,
@@ -1091,6 +1150,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             odo: &self.odo,
             live: &self.live,
             shown: &self.shown,
+            names: &self.names,
+            region: self.region,
             xs: &self.xs,
             ys: &self.ys,
             zs: &self.zs,
@@ -1169,6 +1230,12 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// The id behind a name from a simulation whose region was never set:
+    /// region zero composes to the id itself.
+    fn id_of(name: EntityKey) -> EntityId {
+        EntityId::from_raw(name.raw() as u32)
+    }
+
     use crate::sim::sink::RecordingSink;
 
     /// Every entity walks along x, wrapping inside the region so nothing ever
@@ -1222,6 +1289,7 @@ mod tests {
             despawned: &mut sim.despawned,
             at_wall: &mut sim.at_wall,
             collisions: &mut sim.collisions,
+            names: &mut sim.names,
             cfg: &sim.cfg,
             tick: 0,
         };
@@ -1458,6 +1526,7 @@ mod tests {
             despawned: &mut s.despawned,
             at_wall: &mut s.at_wall,
             collisions: &mut s.collisions,
+            names: &mut s.names,
             cfg: &s.cfg,
             tick: 0,
         };
@@ -1489,7 +1558,8 @@ mod tests {
                 .iter()
                 .map(|k| o.candidates.as_slice()[k.index()].id)
                 .collect();
-            let got: Vec<EntityId> = r.updates().map(|(id, _, _)| id).collect();
+            let got: Vec<EntityId> =
+                r.updates().map(|(name, _, _)| id_of(name)).collect();
             assert_eq!(got, want, "a payload must carry the selection, in order");
             assert_eq!(r.header().updates as usize, want.len());
             assert!(!want.is_empty());
@@ -1532,7 +1602,8 @@ mod tests {
             Mutex::new(Vec::new());
         s.tick_with(&|o: Outbound<'_>| {
             let r = TickObservation::new(&codec, o.bytes).expect("well formed");
-            *seen.lock().unwrap() = r.updates().collect();
+            *seen.lock().unwrap() =
+                r.updates().map(|(name, at, tag)| (id_of(name), at, tag)).collect();
         });
         let seen = seen.into_inner().unwrap();
         assert!(!seen.is_empty());
@@ -1715,6 +1786,7 @@ mod tests {
                     despawned: &mut s.despawned,
                     at_wall: &mut s.at_wall,
                     collisions: &mut s.collisions,
+                    names: &mut s.names,
                     cfg: &s.cfg,
                     tick: 0,
                 };
@@ -1860,6 +1932,7 @@ mod tests {
             despawned: &mut sim.despawned,
             at_wall: &mut sim.at_wall,
             collisions: &mut sim.collisions,
+            names: &mut sim.names,
             cfg: &sim.cfg,
             tick: 0,
         }
@@ -2188,7 +2261,8 @@ mod tests {
         for viewer in [a, b] {
             let bytes = s.sink().latest(viewer).expect("served");
             let r = TickObservation::new(&codec, &bytes).expect("well formed");
-            let ids: Vec<EntityId> = r.updates().map(|(id, _, _)| id).collect();
+            let ids: Vec<EntityId> =
+                r.updates().map(|(name, _, _)| id_of(name)).collect();
             assert_eq!(
                 ids,
                 vec![shown],
@@ -2214,6 +2288,7 @@ mod tests {
             despawned: &mut s.despawned,
             at_wall: &mut s.at_wall,
             collisions: &mut s.collisions,
+            names: &mut s.names,
             cfg: &s.cfg,
             tick: 1,
         };

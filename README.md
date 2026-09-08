@@ -33,7 +33,7 @@ modern equipment should be able to reach much higher numbers.
 | | Ballpark |
 |---|---|
 | What one player sees | a 5×5 box of cells, 640 m across, from a 256 m view radius |
-| What reaches that player | the nearest 256 entities, one 1,200-byte packet a tick carrying ~84 updates — about 24 KB/s |
+| What reaches that player | the nearest 256 entities, one 1,200-byte packet a tick carrying ~65 updates — about 24 KB/s |
 | What one player costs | 0.86 µs of a 20 Hz tick when sparse, 1.9 µs packed into one cell when dense, on 4 consumer-grade cores |
 | Entities one region process holds | 50,000, at 7 µs per player watching them |
 | Entities one edge connection relays | ~2,000 steady; drops start by 2,500 |
@@ -42,7 +42,7 @@ The size of a region and the cells within it is also configurable, so the `640 m
 
 ### How Observers Learn About the World
 
-A single packet carries ~84 entity updates, but a player can be surrounded by
+A single packet carries ~65 entity updates, but a player can be surrounded by
 thousands of entities. The key is that the library builds a complete picture
 over successive ticks, not in a single burst.
 
@@ -64,7 +64,7 @@ The result is a natural refresh cycle:
   been told about them, they cost zero bandwidth until they move again.
 
 The player's client keeps a **ghost table** of every entity it has been told
-about — up to 256 by default, far more than the ~84 that fit in one packet.
+about — up to 256 by default, far more than the ~65 that fit in one packet.
 Over a handful of ticks the client learns about the full nearby population.
 From then on, each packet refreshes the ones that have moved the most since
 last update, and the client holds the rest at their last-known positions.
@@ -233,7 +233,7 @@ via QUIC, and create your `ClientHandle`.
 
 ```rust,no_run
 use umwelt::{
-    ClientGame, ClientHandle, EdgeClient, EntityHandle, EntityId, EntityKind, TickObservation,
+    ClientGame, ClientHandle, EdgeClient, EntityHandle, EntityKey, EntityKind, TickObservation,
     RegionId, WorldPos,
 };
 
@@ -244,8 +244,10 @@ struct Farm {
 
 // ClientGame has the umwelt callbacks you need to implement.
 impl ClientGame for Farm {
-    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-        println!("{handle} is {entity} in {region}");
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {
+        // The name is what every packet's records call this entity, and it
+        // stays the same when the entity crosses into another region.
+        println!("{handle} is {name} in {region}");
     }
 
     // Umwelt will call this whenever state changes, at a fixed interval of your choosing
@@ -259,10 +261,10 @@ impl ClientGame for Farm {
             // .. your logic here: the neighbor's goat wandered out of sight
             let _ = gone;
         }
-        for (id, at, tag) in observation.updates() {
-            // .. and here: draw whatever `id` is at `at`, using `tag`
+        for (name, at, tag) in observation.updates() {
+            // .. and here: draw whatever `name` is at `at`, using `tag`
             // to choose a sprite, model or asset
-            let _ = (id, at, tag);
+            let _ = (name, at, tag);
         }
     }
 

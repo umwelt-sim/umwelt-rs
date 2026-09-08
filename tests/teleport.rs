@@ -6,9 +6,9 @@
 //!
 //! What it establishes: a client calls `teleport`, the edge orchestrates the
 //! spawn-in-destination / wait / remap / despawn-from-origin sequence, and the
-//! client receives `spawned` (with the new entity id) followed by `teleported`
-//! for the same handle it has always held. The handle stays valid throughout,
-//! the old id is gone from the origin, and a denied teleport fires
+//! client receives `spawned` (under the name it already had) followed by
+//! `teleported` for the same handle it has always held. The handle stays valid
+//! throughout, the old id is gone from the origin, and a denied teleport fires
 //! `teleport_failed` without moving the entity.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{
     ClientGame, ClientId, ClientLimits, EdgeClient, EdgeGame, EdgeServer, EntityHandle,
-    EntityId, EntityKey, EntityKind, Flow, Game, Handoff, Overrun, Pacing, RegionId,
-    RegionServer, Step, TeleportDecision, TickObservation, Wait, WorldConfig, WorldPos,
+    EntityKey, EntityKind, Flow, Game, Handoff, Overrun, Pacing, RegionId, RegionServer,
+    Step, TeleportDecision, TickObservation, Wait, WorldConfig, WorldPos,
     WorldSimulation,
 };
 
@@ -260,7 +260,7 @@ impl EdgeGame for TeleportEdge {
 
 struct TeleportWatcher {
     /// All spawned callbacks: (handle, region, entity).
-    spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityId)>>>,
+    spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityKey)>>>,
     /// All teleported callbacks: (handle, region).
     teleported: Arc<Mutex<Vec<(EntityHandle, RegionId)>>>,
     /// All teleport_failed callbacks: (handle, region).
@@ -272,8 +272,8 @@ struct TeleportWatcher {
 }
 
 impl ClientGame for TeleportWatcher {
-    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-        self.spawned.lock().expect("not poisoned").push((handle, region, entity));
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {
+        self.spawned.lock().expect("not poisoned").push((handle, region, name));
     }
 
     fn removed(&mut self, handle: EntityHandle) {
@@ -361,7 +361,7 @@ fn a_client_teleports_an_entity_between_regions() {
             })
             .expect("connects to the edge");
 
-        let spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityId)>>> =
+        let spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityKey)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let teleported: Arc<Mutex<Vec<(EntityHandle, RegionId)>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -432,10 +432,9 @@ fn a_client_teleports_an_entity_between_regions() {
             // Second spawned is in the destination.
             assert_eq!(s[1].0, avatar, "same handle");
             assert_eq!(s[1].1, dest_id, "arrived in destination");
-            // The destination allocated its own id. It may or may not
-            // equal the origin's — ids are unique within a region, not
-            // globally — so what matters is that it arrived, not that
-            // the raw number differs.
+            // The destination allocated its own id, which the client is
+            // never shown: it arrives under the name it had at the origin.
+            assert_eq!(s[1].2, s[0].2, "the name survives the teleport");
         }
         {
             let t = teleported.lock().expect("not poisoned");

@@ -159,29 +159,29 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_packet_holds_eighty_four_records() {
-        // 1200 - 16 = 1184, and 1184 / 14 = 84.
+    fn an_idle_packet_holds_sixty_five_records() {
+        // 1200 - 16 = 1184, and 1184 / 18 = 65.
         let b = budget(4096);
-        assert_eq!(b.record_bytes(), 14);
+        assert_eq!(b.record_bytes(), 18);
         assert_eq!(b.state_bytes_available(0), 1184);
-        assert_eq!(b.max_slots(), 84);
+        assert_eq!(b.max_slots(), 65);
     }
 
     #[test]
-    fn a_full_backlog_leaves_sixty_six() {
-        // 1200 - (16 + 256) = 928, and 928 / 14 = 66.
+    fn a_full_backlog_leaves_fifty_one() {
+        // 1200 - (16 + 256) = 928, and 928 / 18 = 51.
         let b = budget(4096);
         assert_eq!(b.state_bytes_available(256), 928);
-        assert_eq!(b.min_slots(), 66);
+        assert_eq!(b.min_slots(), 51);
     }
 
     #[test]
     fn the_reserve_is_a_floor_not_a_subtraction() {
         let b = budget(4096);
-        assert_eq!(b.slots(0), 84, "no events pending, so state takes everything");
-        assert_eq!(b.slots(100), 77, "events take what they have queued");
-        assert_eq!(b.slots(256), 66);
-        assert_eq!(b.slots(100_000), 66, "a backlog past the reserve waits its turn");
+        assert_eq!(b.slots(0), 65, "no events pending, so state takes everything");
+        assert_eq!(b.slots(100), 60, "events take what they have queued");
+        assert_eq!(b.slots(256), 51);
+        assert_eq!(b.slots(100_000), 51, "a backlog past the reserve waits its turn");
     }
 
     #[test]
@@ -197,25 +197,25 @@ mod tests {
 
     #[test]
     fn a_bigger_region_costs_a_slot() {
-        // A 16 km region needs 15 bytes per record, so 1184 / 15 = 78.
+        // A 16 km region needs 19 bytes per record, so 1184 / 19 = 62.
         let b = budget(16_384);
-        assert_eq!(b.record_bytes(), 15);
-        assert_eq!(b.max_slots(), 78);
+        assert_eq!(b.record_bytes(), 19);
+        assert_eq!(b.max_slots(), 62);
     }
 
     #[test]
     fn a_packet_too_small_for_a_record_yields_no_slots() {
         let b = PacketBudget::with_overhead(&RecordCodec::new(&world(4096)), 20, 16, 0);
         assert_eq!(b.state_bytes_available(0), 4);
-        assert_eq!(b.max_slots(), 0, "four bytes hold no fourteen-byte record");
+        assert_eq!(b.max_slots(), 0, "four bytes hold no eighteen-byte record");
     }
 
     #[test]
     fn overheads_are_swept_not_fixed() {
         let codec = RecordCodec::new(&world(4096));
         let b = PacketBudget::with_overhead(&codec, 1200, 8, 512);
-        assert_eq!(b.max_slots(), (1200 - 8) / 14);
-        assert_eq!(b.min_slots(), (1200 - 8 - 512) / 14);
+        assert_eq!(b.max_slots(), (1200 - 8) / 18);
+        assert_eq!(b.min_slots(), (1200 - 8 - 512) / 18);
     }
 
     #[test]

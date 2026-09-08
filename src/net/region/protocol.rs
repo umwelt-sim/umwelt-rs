@@ -200,8 +200,8 @@ impl ServerInfo {
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 
 /// Bytes one spawn request takes: three raw [`Fixed`](crate::Fixed) axes, the
-/// role byte, the game-defined tag, and the caller's token.
-const SPAWN_BYTES: usize = 23;
+/// role byte, the game-defined tag, the caller's token, and the name.
+const SPAWN_BYTES: usize = 31;
 
 /// Bytes one move takes: an id, and three raw [`Fixed`](crate::Fixed) axes.
 ///
@@ -266,6 +266,11 @@ pub struct Spawn {
     /// game clients. In practice it is the handle the edge already holds for
     /// that client.
     pub token: u64,
+    /// The name the region writes into every record and despawn for this
+    /// entity: the edge's key, which a client holds across every region the
+    /// entity is ever in (`docs/adr/0010`). The same as `token` for a fresh
+    /// entity; for one arriving by teleport, the name it already had.
+    pub name: u64,
 }
 
 /// Asks the region to create entities this edge will manage.
@@ -298,6 +303,7 @@ impl SpawnEntities {
                     position: *p,
                     kind: EntityKind::observer(0),
                     token: n as u64,
+                    name: n as u64,
                 })
                 .collect(),
         }
@@ -315,6 +321,7 @@ impl SpawnEntities {
                     position: *p,
                     kind: EntityKind::unattended(0),
                     token: n as u64,
+                    name: n as u64,
                 })
                 .collect(),
         }
@@ -330,6 +337,7 @@ impl SpawnEntities {
             out.extend_from_slice(&s.position.z.raw().to_le_bytes());
             s.kind.encode_wire(out);
             out.extend_from_slice(&s.token.to_le_bytes());
+            out.extend_from_slice(&s.name.to_le_bytes());
         }
     }
 
@@ -347,7 +355,7 @@ impl SpawnEntities {
                 crate::Fixed::from_raw(c.i32()?),
             );
             let kind = EntityKind::decode_wire(&mut c)?;
-            spawns.push(Spawn { position, kind, token: c.u64()? });
+            spawns.push(Spawn { position, kind, token: c.u64()?, name: c.u64()? });
         }
         c.finish()?;
         Ok(SpawnEntities { spawns })
@@ -705,7 +713,7 @@ mod tests {
     }
 
     fn want(x: i32, kind: EntityKind, token: u64) -> Spawn {
-        Spawn { position: Pos3::from_meters(x, 2, 3), kind, token }
+        Spawn { position: Pos3::from_meters(x, 2, 3), kind, token, name: token }
     }
 
     #[test]

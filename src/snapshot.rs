@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 use crate::config::WorldConfig;
 use crate::entity::{EntityId, LiveSet};
 use crate::fixed::Fixed;
+use crate::id::{EntityKey, RegionId};
 use crate::pos::{CellCoord, CellId, Pos2, Pos3};
 
 /// Marks a cell in `sub_index` as not subdivided.
@@ -94,6 +95,11 @@ pub struct CellSnapshot {
     ys: Vec<Fixed>,
     zs: Vec<Fixed>,
     tags: Vec<u16>,
+    /// The name on the wire, composed here so a record is built from this
+    /// row alone: a lookup by id per record costs more than every other
+    /// read a record makes, since a viewer's candidates sit in a few cells'
+    /// ranges here and are scattered by id.
+    names: Vec<u64>,
     /// Length `cells + 1`. Cell `c` occupies `starts[c]..starts[c + 1]`.
     starts: Vec<u32>,
     /// Write head per cell during an update. A field rather than a local so
@@ -115,6 +121,7 @@ pub struct CellSnapshot {
     scratch_ys: Vec<Fixed>,
     scratch_zs: Vec<Fixed>,
     scratch_tags: Vec<u16>,
+    scratch_names: Vec<u64>,
     sub_cursor: Vec<u32>,
     /// Sub-cell visit order, nearest first, for every possible origin.
     /// `sub_order[o * buckets .. (o + 1) * buckets]` is the order from origin
@@ -236,6 +243,7 @@ impl CellSnapshot {
             ys: Vec::new(),
             zs: Vec::new(),
             tags: Vec::new(),
+            names: Vec::new(),
             starts: vec![0; cells + 1],
             cursor: vec![0; cells],
             cells,
@@ -249,6 +257,7 @@ impl CellSnapshot {
             scratch_ys: Vec::new(),
             scratch_zs: Vec::new(),
             scratch_tags: Vec::new(),
+            scratch_names: Vec::new(),
             sub_cursor: vec![0; (sub_axis * sub_axis) as usize],
             sub_order: sub_order_for(sub_axis),
             cell_order: build_cell_order(cfg.cell_radius()),
@@ -395,6 +404,13 @@ impl CellSnapshot {
         self.tags[i]
     }
 
+    /// The name on the wire at `i` in the snapshot's entity arrays, as
+    /// yielded by [`CellOccupants::snapshot_index`].
+    #[inline]
+    pub fn name_at(&self, i: usize) -> u64 {
+        self.names[i]
+    }
+
     /// How many entities occupy one cell.
     #[inline]
     pub fn count(&self, id: CellId) -> usize {
@@ -415,17 +431,24 @@ impl CellSnapshot {
     ///
     /// If the three slices differ in length, or if `live` covers fewer ids
     /// than the arrays hold.
+    /// `names` is what an edge asked each entity be called, or zero for one
+    /// the game spawned, which is named by `region` and its id.
+    // One slice per column of the simulation's entity arrays.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         xs: &[Fixed],
         ys: &[Fixed],
         zs: &[Fixed],
         tags: &[u16],
+        names: &[u64],
+        region: RegionId,
         live: &LiveSet,
     ) {
         assert_eq!(xs.len(), ys.len(), "position arrays must be parallel");
         assert_eq!(xs.len(), zs.len(), "position arrays must be parallel");
         assert_eq!(xs.len(), tags.len(), "position and tag arrays must be parallel");
+        assert_eq!(xs.len(), names.len(), "position and name arrays must be parallel");
         assert!(
             live.id_space() >= xs.len(),
             "live set covers {} ids, position arrays hold {}",
@@ -444,6 +467,7 @@ impl CellSnapshot {
         self.ys.resize(n, Fixed::ZERO);
         self.zs.resize(n, Fixed::ZERO);
         self.tags.resize(n, 0);
+        self.names.resize(n, 0);
 
         // Pass 1: tally into starts[c + 1], so the running total below produces
         // each cell's start offset with no shifting afterward.
@@ -480,6 +504,10 @@ impl CellSnapshot {
             self.ys[d] = ys[i];
             self.zs[d] = zs[i];
             self.tags[d] = tags[i];
+            self.names[d] = match names[i] {
+                0 => EntityKey::of_region(region, id).raw(),
+                named => named,
+            };
         }
 
         self.rebuild_subdivisions();
@@ -542,6 +570,7 @@ impl CellSnapshot {
         self.scratch_ys.resize(n, Fixed::ZERO);
         self.scratch_zs.resize(n, Fixed::ZERO);
         self.scratch_tags.resize(n, 0);
+        self.scratch_names.resize(n, 0);
         self.sub_cursor.copy_from_slice(&self.sub_starts[base..base + buckets]);
         for i in lo..hi {
             let ox = (self.xs[i].raw() & cell_mask) >> sub_shift;
@@ -554,12 +583,14 @@ impl CellSnapshot {
             self.scratch_ys[d] = self.ys[i];
             self.scratch_zs[d] = self.zs[i];
             self.scratch_tags[d] = self.tags[i];
+            self.scratch_names[d] = self.names[i];
         }
         self.ids[lo..hi].copy_from_slice(&self.scratch_ids[..n]);
         self.xs[lo..hi].copy_from_slice(&self.scratch_xs[..n]);
         self.ys[lo..hi].copy_from_slice(&self.scratch_ys[..n]);
         self.zs[lo..hi].copy_from_slice(&self.scratch_zs[..n]);
         self.tags[lo..hi].copy_from_slice(&self.scratch_tags[..n]);
+        self.names[lo..hi].copy_from_slice(&self.scratch_names[..n]);
     }
 }
 
@@ -666,7 +697,15 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         for (i, p) in pts.iter().enumerate() {
             let cid = cfg.cell_id(cfg.cell_of(p.horizontal()));
@@ -685,7 +724,15 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         let summed: usize =
             (0..snap.cell_count()).map(|c| snap.count(CellId::from_raw(c as u32))).sum();
@@ -700,7 +747,15 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         for c in 0..snap.cell_count() {
             let cell = snap.entities_for_cell(CellId::from_raw(c as u32));
@@ -717,7 +772,15 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         for c in 0..snap.cell_count() {
             let cell = snap.entities_for_cell(CellId::from_raw(c as u32));
@@ -735,7 +798,15 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         let occupied = cfg.cell_id(cfg.cell_of(Pos2::from_meters(10, 10)));
         let mut empties = 0;
@@ -757,14 +828,30 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         let before = cfg.cell_id(cfg.cell_of(Pos2::from_meters(10, 10)));
         assert_eq!(snap.count(before), 1);
 
         pts[0] = Pos3::from_meters(2000, 2000, 0);
         let (xs, ys, zs, tags) = axes(&pts);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         let after = cfg.cell_id(cfg.cell_of(Pos2::from_meters(2000, 2000)));
         assert_ne!(before, after);
@@ -802,7 +889,15 @@ mod tests {
     ) -> CellSnapshot {
         let (xs, ys, zs, tags) = axes(pts);
         let mut snap = CellSnapshot::with_subdivision(cfg, axis, threshold);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(pts.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(pts.len()),
+        );
         snap
     }
 
@@ -1128,12 +1223,28 @@ mod tests {
 
         let mut live = all_live(3);
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &live);
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &live,
+        );
         assert_eq!(snap.count(cid), 3);
         assert_eq!(snap.len(), 3);
 
         live.remove(EntityId::from_raw(1));
-        snap.update(&xs, &ys, &zs, &tags, &live);
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &live,
+        );
 
         assert_eq!(snap.count(cid), 2, "the despawned entity is still in the cell");
         assert_eq!(snap.len(), 2);
@@ -1154,7 +1265,15 @@ mod tests {
         }
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &live);
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &live,
+        );
 
         assert_eq!(snap.len(), 61);
         for c in 0..snap.cell_count() {
@@ -1179,14 +1298,23 @@ mod tests {
     #[test]
     fn a_rebuild_leaves_nothing_of_the_previous_tick() {
         let cfg = WorldConfig::default();
-        let first: Vec<Pos3> = (0..900).map(|k| Pos3::from_meters(10 + k % 40, 10 + k / 40, 0)).collect();
+        let first: Vec<Pos3> =
+            (0..900).map(|k| Pos3::from_meters(10 + k % 40, 10 + k / 40, 0)).collect();
         let (xs, ys, zs, tags) = axes(&first);
         let mut live = LiveSet::new();
         for k in 0..first.len() {
             live.insert(EntityId::from_raw(k as u32));
         }
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &live);
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &live,
+        );
 
         // A second population with no id in common and a different footprint,
         // shrinking the array so any surviving tail would be visible.
@@ -1204,7 +1332,15 @@ mod tests {
         for k in 500..first.len() {
             live2.insert(EntityId::from_raw(k as u32));
         }
-        snap.update(&xs2, &ys2, &zs2, &tags2, &live2);
+        snap.update(
+            &xs2,
+            &ys2,
+            &zs2,
+            &tags2,
+            &vec![0; xs2.len()],
+            RegionId::from_raw(0),
+            &live2,
+        );
 
         assert_eq!(snap.len(), 400);
         let mut seen = 0;
@@ -1213,7 +1349,10 @@ mod tests {
             for i in 0..cell.len() {
                 let id = cell.ids[i];
                 assert!(live2.contains(id), "{id:?} is from the previous tick");
-                assert_eq!(cell.pos(i), Pos3::new(xs2[id.index()], ys2[id.index()], zs2[id.index()]));
+                assert_eq!(
+                    cell.pos(i),
+                    Pos3::new(xs2[id.index()], ys2[id.index()], zs2[id.index()])
+                );
                 assert_eq!(cell.tags[i], 42, "a stale tag survived");
                 seen += 1;
             }
@@ -1229,7 +1368,15 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
 
         let hot = cfg.cell_id(cfg.cell_of(Pos2::from_meters(2048, 2048)));
         assert_eq!(snap.count(hot), 5000);
@@ -1242,11 +1389,27 @@ mod tests {
         let (xs, ys, zs, tags) = axes(&pts);
 
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
         let settled = snap.ids.capacity();
 
         for _tick in 0..50 {
-            snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+            snap.update(
+                &xs,
+                &ys,
+                &zs,
+                &tags,
+                &vec![0; xs.len()],
+                RegionId::from_raw(0),
+                &all_live(xs.len()),
+            );
         }
         assert_eq!(snap.ids.capacity(), settled);
     }

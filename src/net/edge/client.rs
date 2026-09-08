@@ -32,7 +32,7 @@ use crate::codec::RecordCodec;
 use crate::entity::EntityKind;
 use crate::fixed::Fixed;
 use crate::game::ClientGame;
-use crate::id::{EntityHandle, RegionId};
+use crate::id::{EntityHandle, EntityKey, RegionId};
 use crate::map::Placement;
 use crate::net::edge::protocol::{
     Framer, FromClient, MAX_MOVES_PER_DATAGRAM, MOVE_BYTES, MOVES_HEADER_BYTES, ToClient,
@@ -60,6 +60,14 @@ struct Shared {
     /// than by everything ever spawned, and a command naming something absent
     /// is one this end declines to send.
     live: Mutex<HashMap<EntityHandle, Held>>,
+    /// Which regions are currently sending each name this client has been
+    /// told about. Near a seam a name arrives from two, its own region and
+    /// its shadow's, and a despawn from one while the other still sends it is
+    /// what a crossing looks like from beside the seam: not the entity going
+    /// away, and not reported as such (`docs/adr/0010`). Bounded by the ghosts
+    /// the client holds; an entry goes when the last region sending it says
+    /// so. No region's id is here.
+    sending: Mutex<HashMap<EntityKey, Vec<RegionId>>>,
 }
 
 /// How to read one region's packets into the world frame.
@@ -116,7 +124,7 @@ impl Shared {
 /// which is the caller's to do through [`connection`](Self::connection).
 ///
 /// ```no_run
-/// use umwelt::{ClientGame, EdgeClient, EntityHandle, EntityId, EntityKind};
+/// use umwelt::{ClientGame, EdgeClient, EntityHandle, EntityKey, EntityKind};
 /// use umwelt::{TickObservation, RegionId, WorldPos};
 ///
 /// /// A game that counts what it can see.
@@ -126,8 +134,8 @@ impl Shared {
 /// }
 ///
 /// impl ClientGame for Watcher {
-///     fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-///         println!("{handle} is {entity} in {region}");
+///     fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {
+///         println!("{handle} is {name} in {region}");
 ///     }
 ///
 ///     fn observed(
@@ -184,6 +192,7 @@ impl EdgeClient {
             game: Mutex::new(Box::new(NoGame)),
             frames: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            sending: Mutex::new(HashMap::new()),
         });
         let built = game(ClientHandle { shared: Arc::downgrade(&shared) });
         *shared.game.lock().expect("not poisoned") = Box::new(built);
@@ -514,7 +523,7 @@ fn deliver(shared: &Shared, body: &[u8]) {
         // and the next tick supersedes it.
         let held = shared.frames.lock().expect("not poisoned").get(&region).cloned();
         let Some(frame) = held else { return };
-        let Some(state) = TickObservation::in_frame(
+        let Some(mut state) = TickObservation::in_frame(
             &frame.codec,
             packet,
             frame.placement,
@@ -522,6 +531,35 @@ fn deliver(shared: &Shared, body: &[u8]) {
         ) else {
             return;
         };
+        // Which regions are sending each name, so a despawn from one region
+        // for a name another is still sending is held back. Settled before
+        // the game is told, with nothing else locked.
+        let keep: Vec<bool> = {
+            let mut sending = shared.sending.lock().expect("not poisoned");
+            for (name, _, _) in state.updates() {
+                let regions = sending.entry(name).or_default();
+                if !regions.contains(&region) {
+                    regions.push(region);
+                }
+            }
+            state
+                .all_despawns()
+                .map(|name| {
+                    let gone = match sending.get_mut(&name) {
+                        Some(regions) => {
+                            regions.retain(|r| *r != region);
+                            regions.is_empty()
+                        }
+                        None => true,
+                    };
+                    if gone {
+                        sending.remove(&name);
+                    }
+                    gone
+                })
+                .collect()
+        };
+        state.mask_despawns(keep);
         shared.with_game(|game| game.observed(handle, region, &state));
         return;
     }
@@ -532,9 +570,7 @@ fn deliver(shared: &Shared, body: &[u8]) {
         shared.live.lock().expect("not poisoned").remove(&handle);
     }
     shared.with_game(|game| match message {
-        ToClient::Spawned { handle, region, entity } => {
-            game.spawned(handle, region, entity)
-        }
+        ToClient::Spawned { handle, region, name } => game.spawned(handle, region, name),
         ToClient::Removed { handle } => game.removed(handle),
         ToClient::Teleported { handle, region } => game.teleported(handle, region),
         ToClient::TeleportFailed { handle, region } => {

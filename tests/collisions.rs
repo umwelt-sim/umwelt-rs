@@ -15,10 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use umwelt::Overrun;
 use umwelt::internals::region::{Incoming, Presence, RegionClient, Spawn};
 use umwelt::internals::{RecordCodec, read_payload};
 use umwelt::net::{EdgeName, EdgeSink, Edges, Inbound};
-use umwelt::{ClientLimits, EntityId, EntityKind, Fixed, Flow, Game, Handoff, Overrun};
+use umwelt::{ClientLimits, EntityId, EntityKey, EntityKind, Fixed, Flow, Game, Handoff};
 use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, Wait, WorldPos};
 use umwelt::{WorldConfig, WorldSimulation};
 
@@ -148,7 +149,7 @@ fn a_region_reports_collisions_to_the_owning_edge_only() {
         let pump = |link: &RegionClient,
                     heard: &mut Vec<Presence>,
                     latest: &mut Option<WorldPos>,
-                    mine: Option<EntityId>| {
+                    mine: Option<EntityKey>| {
             while let Some(message) = link.receive_timeout(Duration::from_millis(20)) {
                 match message {
                     Incoming::Presence { what, .. } => heard.push(what),
@@ -176,12 +177,12 @@ fn a_region_reports_collisions_to_the_owning_edge_only() {
         );
         link.spawn(
             region,
-            &[Spawn { position: near, kind: EntityKind::observer(0), token: 1 }],
+            &[Spawn { position: near, kind: EntityKind::observer(0), token: 1, name: 1 }],
         )
         .expect("asks");
         let mut me: Option<EntityId> = None;
         wait_for("the spawn to be reported", &stop, || {
-            pump(&link, &mut heard, &mut latest, me);
+            pump(&link, &mut heard, &mut latest, None);
             me = heard.iter().find_map(|p| match p {
                 Presence::Added { entity, token: 1 } => Some(*entity),
                 _ => None,
@@ -189,9 +190,11 @@ fn a_region_reports_collisions_to_the_owning_edge_only() {
             me.is_some()
         });
         let me = me.expect("added");
+        // Records carry the name the spawn asked for, not the region's id.
+        let name = EntityKey::from_raw(1);
 
         wait_for("the view collision", &stop, || {
-            pump(&link, &mut heard, &mut latest, Some(me));
+            pump(&link, &mut heard, &mut latest, Some(name));
             heard.iter().any(|p| matches!(p, Presence::ViewCollision { entity, position } if *entity == me && *position == near))
         });
 
@@ -199,7 +202,7 @@ fn a_region_reports_collisions_to_the_owning_edge_only() {
         let mid = Pos3::from_meters(2048, 2048, 0);
         link.move_entities(region, &[(me, mid)]).expect("moves");
         wait_for("the view to clear", &stop, || {
-            pump(&link, &mut heard, &mut latest, Some(me));
+            pump(&link, &mut heard, &mut latest, Some(name));
             heard
                 .iter()
                 .any(|p| matches!(p, Presence::ViewCleared { entity } if *entity == me))
@@ -215,16 +218,16 @@ fn a_region_reports_collisions_to_the_owning_edge_only() {
         );
         link.move_entities(region, &[(me, beyond)]).expect("moves");
         wait_for("the boundary collision", &stop, || {
-            pump(&link, &mut heard, &mut latest, Some(me));
+            pump(&link, &mut heard, &mut latest, Some(name));
             heard.iter().any(|p| matches!(p, Presence::BoundaryCollision { entity, target } if *entity == me && *target == beyond))
         });
         link.move_entities(region, &[(me, beyond)]).expect("moves");
         wait_for("the clamped position to come back", &stop, || {
-            pump(&link, &mut heard, &mut latest, Some(me));
+            pump(&link, &mut heard, &mut latest, Some(name));
             latest.is_some_and(|at| at.x == size.raw() as i64 - 1)
         });
         std::thread::sleep(Duration::from_millis(300));
-        pump(&link, &mut heard, &mut latest, Some(me));
+        pump(&link, &mut heard, &mut latest, Some(name));
         let boundary_reports = heard
             .iter()
             .filter(|p| matches!(p, Presence::BoundaryCollision { entity, .. } if *entity == me))

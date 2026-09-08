@@ -235,19 +235,19 @@ pub trait EdgeGame: Send + 'static {
 /// in the game.
 ///
 /// ```
-/// # use umwelt::{ClientGame, EntityHandle, EntityId, TickObservation, RegionId};
+/// # use umwelt::{ClientGame, EntityHandle, EntityKey, TickObservation, RegionId};
 /// # struct Farm;
 /// # impl Farm {
-/// #     fn remember(&mut self, _h: EntityHandle, _r: RegionId, _e: EntityId) {}
+/// #     fn remember(&mut self, _h: EntityHandle, _r: RegionId, _e: EntityKey) {}
 /// #     fn forget(&mut self, _handle: EntityHandle) {}
 /// #     fn drop_gone(&mut self, _region: RegionId, _seen: &TickObservation<'_>) {}
 /// #     fn redraw(&mut self, _region: RegionId, _seen: &TickObservation<'_>) {}
 /// #     fn clear_scene(&mut self) {}
 /// # }
 /// impl ClientGame for Farm {
-///     fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
+///     fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {
 ///         // Which region a handle landed in is the game's to keep track of.
-///         self.remember(handle, region, entity);
+///         self.remember(handle, region, name);
 ///     }
 ///
 ///     fn removed(&mut self, handle: EntityHandle) {
@@ -277,7 +277,7 @@ pub trait ClientGame: Send + 'static {
     /// A game is the only tier that sees more than one region at a time, so
     /// keeping that map is its job — the region a handle ended up in is the
     /// game's own knowledge, unlike how that region happens to be configured.
-    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {}
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {}
 
     /// Gone, whatever caused it — including a despawn this client never asked
     /// for, because a region's own game can despawn anything.

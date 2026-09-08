@@ -103,7 +103,7 @@ fn seam(cfg: &WorldConfig, n: usize, rng: &mut Rng) -> Vec<Pos3> {
 /// seam if `shadows`, otherwise observers drawn from the strip itself.
 fn build(shadows: bool) -> WorldSimulation<Strip> {
     let cfg = WorldConfig::default();
-    let mut rng = Rng(0xC0FFEE_5EA3);
+    let mut rng = Rng(0x00C0_FFEE_5EA3);
     let pending = strip(&cfg, ENTITIES, &mut rng);
     let seam = if shadows { seam(&cfg, VIEWERS, &mut rng) } else { Vec::new() };
     let mut sim = WorldSimulation::new(

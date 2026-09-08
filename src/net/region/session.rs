@@ -327,6 +327,7 @@ impl Inbound {
                         } else {
                             step.spawn(want.position, want.kind.tag())
                         };
+                        step.set_name(id, want.name);
                         if self.edges.claim(edge, id).is_err() {
                             // The edge went away between sending and now.
                             step.despawn(id);
@@ -390,6 +391,7 @@ impl Inbound {
         sink: &EdgeSink,
         limits: ClientLimits,
     ) -> Settled {
+        sim.set_region(sink.region());
         let fresh = std::mem::take(&mut *self.fresh.lock().expect("not poisoned"));
         let gone = std::mem::take(&mut *self.gone.lock().expect("not poisoned"));
         let mut out = Settled::default();
@@ -566,6 +568,11 @@ struct Cached {
 }
 
 impl EdgeSink {
+    /// The region this sink serves.
+    pub fn region(&self) -> RegionId {
+        self.shared.region
+    }
+
     /// A sink that publishes each payload to the edge managing its viewer.
     ///
     /// Attaches to a [`WorldSimulation`] through

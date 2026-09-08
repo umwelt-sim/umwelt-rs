@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use umwelt::internals::region::{Incoming, Presence, RegionClient, Spawn};
 use umwelt::internals::{RecordCodec, read_payload};
 use umwelt::net::{EdgeId, EdgeName, EdgeSink, Edges, Inbound};
-use umwelt::{ClientLimits, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
+use umwelt::{
+    ClientLimits, EntityId, EntityKey, EntityKind, Flow, Game, Handoff, Overrun,
+};
 use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
@@ -162,10 +164,11 @@ struct Edge {
     /// The id each token's entity got.
     added: HashMap<(RegionId, u64), EntityId>,
     removed: HashSet<(RegionId, EntityId)>,
-    /// `(region, avatar, entity)` for every entity a packet told that avatar
-    /// about, and for every one it told the avatar to forget.
-    seen: HashSet<(RegionId, EntityId, EntityId)>,
-    forgot: HashSet<(RegionId, EntityId, EntityId)>,
+    /// `(region, avatar, name)` for every entity a packet told that avatar
+    /// about, and for every one it told the avatar to forget. Packets carry
+    /// the names this edge chose, never a region's ids.
+    seen: HashSet<(RegionId, EntityId, EntityKey)>,
+    forgot: HashSet<(RegionId, EntityId, EntityKey)>,
     /// When the first packet addressed to an entity arrived.
     first_packet: HashMap<(RegionId, EntityId), Instant>,
     /// How far along its walk everything held is.
@@ -189,11 +192,19 @@ impl Edge {
         }
     }
 
-    /// Asks a region for one entity, under a token spent here and nowhere else.
-    fn ask(&mut self, region: RegionId, token: u64, kind: EntityKind, at: Pos3) {
+    /// Asks a region for one entity, under a token spent here and nowhere
+    /// else, and the name its records will carry.
+    fn ask(
+        &mut self,
+        region: RegionId,
+        token: u64,
+        name: u64,
+        kind: EntityKind,
+        at: Pos3,
+    ) {
         self.wanted.insert((region, token), at);
         self.link
-            .spawn(region, &[Spawn { position: at, kind, token }])
+            .spawn(region, &[Spawn { position: at, kind, token, name }])
             .expect("asks for an entity");
     }
 
@@ -249,8 +260,9 @@ impl Edge {
                 let Some(reader) = read_payload(&self.codec, &packet) else {
                     return;
                 };
-                let forgot: Vec<EntityId> = reader.despawns().collect();
-                let seen: Vec<EntityId> = reader.updates().map(|(id, _, _)| id).collect();
+                let forgot: Vec<EntityKey> = reader.despawns().collect();
+                let seen: Vec<EntityKey> =
+                    reader.updates().map(|(id, _, _)| id).collect();
                 for id in forgot {
                     self.forgot.insert((region, entity, id));
                 }
@@ -339,10 +351,17 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         // The origin's population: a bystander who stays put, filler to push
         // the origin's ids past anything the destination will allocate, and the
         // traveler.
-        edge.ask(origin_id, ORIGIN_BYSTANDER, EntityKind::observer(0), origin_home(0));
+        edge.ask(
+            origin_id,
+            ORIGIN_BYSTANDER,
+            ORIGIN_BYSTANDER,
+            EntityKind::observer(0),
+            origin_home(0),
+        );
         for k in 0..FILLER {
             edge.ask(
                 origin_id,
+                ORIGIN_FILLER + k,
                 ORIGIN_FILLER + k,
                 EntityKind::unattended(0),
                 origin_home(1 + k),
@@ -351,12 +370,14 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         edge.ask(
             origin_id,
             ORIGIN_TRAVELER,
+            ORIGIN_TRAVELER,
             EntityKind::observer(0),
             origin_home(1 + FILLER),
         );
         // And one bystander waiting in the destination.
         edge.ask(
             destination_id,
+            DESTINATION_BYSTANDER,
             DESTINATION_BYSTANDER,
             EntityKind::observer(0),
             destination_home(0),
@@ -370,10 +391,12 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         let bystander = edge.id(origin_id, ORIGIN_BYSTANDER);
         let traveler = edge.id(origin_id, ORIGIN_TRAVELER);
         let waiting = edge.id(destination_id, DESTINATION_BYSTANDER);
+        // The name the traveler was asked for under, in both regions.
+        let name = EntityKey::from_raw(ORIGIN_TRAVELER);
 
         // Before it goes anywhere, the origin's bystander is being sent it.
         edge.until("the origin's bystander to be sent the traveler", |e| {
-            e.seen.contains(&(origin_id, bystander, traveler))
+            e.seen.contains(&(origin_id, bystander, name))
         });
 
         // ---- the sequence in docs/adr/0003 -----------------------------
@@ -381,11 +404,13 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         // Spawn first, despawn second. Ordered the other way there is a window
         // where the entity exists nowhere, and nothing here needs that window.
 
-        // 1. Ask the destination for it, at the position the game chose.
+        // 1. Ask the destination for it, at the position the game chose and
+        //    under the name it already has.
         let asked_at = Instant::now();
         edge.ask(
             destination_id,
             DESTINATION_TRAVELER,
+            ORIGIN_TRAVELER,
             EntityKind::observer(0),
             destination_home(1),
         );
@@ -407,7 +432,8 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
 
         // The destination allocated its own id. The filler put the origin's
         // past every slot the destination has handed out, so these cannot
-        // coincide by luck.
+        // coincide by luck. Nothing downstream sees either: packets carry the
+        // one name.
         assert_ne!(landed, traveler, "the destination reused the origin's id");
         assert!(
             traveler.raw() > landed.raw(),
@@ -418,16 +444,16 @@ fn an_edge_moves_an_entity_from_one_region_into_another() {
         // The origin's bystander is told to forget it, which is what happened
         // there. The destination's is sent it, which is what happened here.
         edge.until("the origin's bystander to be told to forget the traveler", |e| {
-            e.forgot.contains(&(origin_id, bystander, traveler))
+            e.forgot.contains(&(origin_id, bystander, name))
         });
         edge.until("the destination's bystander to be sent the traveler", |e| {
-            e.seen.contains(&(destination_id, waiting, landed))
+            e.seen.contains(&(destination_id, waiting, name))
         });
 
         // And the traveler itself is now served by the destination: an avatar
         // always sees itself, so its own packets name it.
         edge.until("the traveler to be served by the destination", |e| {
-            e.seen.contains(&(destination_id, landed, landed))
+            e.seen.contains(&(destination_id, landed, name))
         });
 
         // The origin no longer counts it, and the destination does.

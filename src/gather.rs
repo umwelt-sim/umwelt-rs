@@ -28,7 +28,7 @@ pub struct DiscoveredEntity {
 }
 
 impl DiscoveredEntity {
-    /// Create a discovered entity from the three parts a cell 
+    /// Create a discovered entity from the three parts a cell
     /// traversal already has in hand.
     #[inline]
     pub const fn new(
@@ -77,18 +77,12 @@ pub struct DiscoveredEntities {
 impl DiscoveredEntities {
     /// Empty, allocating nothing until something is pushed.
     pub fn new() -> DiscoveredEntities {
-        DiscoveredEntities {
-            items: Vec::new(),
-            dists: Vec::new(),
-        }
+        DiscoveredEntities { items: Vec::new(), dists: Vec::new() }
     }
 
     /// Empty, with room for `n` before it grows. What a worker reuses.
     pub fn with_capacity(n: usize) -> DiscoveredEntities {
-        DiscoveredEntities {
-            items: Vec::with_capacity(n),
-            dists: Vec::with_capacity(n),
-        }
+        DiscoveredEntities { items: Vec::with_capacity(n), dists: Vec::with_capacity(n) }
     }
 
     /// Appends one, keeping cell-walk order.
@@ -240,7 +234,8 @@ impl CellSnapshot {
                         let bucket = grid.occupants_at(b as usize);
                         walk.sub_cells += 1;
                         walk.examined += bucket.len() as u32;
-                        walk.biggest_bucket = walk.biggest_bucket.max(bucket.len() as u32);
+                        walk.biggest_bucket =
+                            walk.biggest_bucket.max(bucket.len() as u32);
                         take(viewer, radius_sq, bucket, out);
                         if out.len() >= cap {
                             return walk;
@@ -279,11 +274,8 @@ fn take(
     entities: CellOccupants<'_>,
     out: &mut DiscoveredEntities,
 ) {
-    let (vx, vy, vz) = (
-        viewer.x.raw() as i64,
-        viewer.y.raw() as i64,
-        viewer.z.raw() as i64,
-    );
+    let (vx, vy, vz) =
+        (viewer.x.raw() as i64, viewer.y.raw() as i64, viewer.z.raw() as i64);
     let radius = radius_sq.raw();
     for i in 0..entities.len() {
         let dx = vx - entities.xs[i].raw() as i64;
@@ -325,11 +317,13 @@ mod tests {
         let cfg = WorldConfig::default();
         let mut seed = 0x5eed_1234_9abc_def0u64;
         let mut next = |m: i32| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed =
+                seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((seed >> 33) as u32 % m as u32) as i32
         };
-        let pts: Vec<Pos3> =
-            (0..3000).map(|_| Pos3::from_meters(next(4096), next(4096), next(1024))).collect();
+        let pts: Vec<Pos3> = (0..3000)
+            .map(|_| Pos3::from_meters(next(4096), next(4096), next(1024)))
+            .collect();
         let (xs, ys, zs): (Vec<Fixed>, Vec<Fixed>, Vec<Fixed>) = (
             pts.iter().map(|p| p.x).collect(),
             pts.iter().map(|p| p.y).collect(),
@@ -340,7 +334,15 @@ mod tests {
             live.insert(EntityId::from_raw(i as u32));
         }
         let mut snap = CellSnapshot::new(&cfg);
-        snap.update(&xs, &ys, &zs, &vec![0u16; pts.len()], &live);
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &vec![0u16; pts.len()],
+            &vec![0; pts.len()],
+            crate::id::RegionId::from_raw(0),
+            &live,
+        );
 
         let radius_sq = crate::fixed::DistSq::from_radius(cfg.horizontal_view_radius());
         for viewer in [
@@ -455,7 +457,15 @@ mod tests {
         let zs: Vec<_> = pts.iter().map(|p| p.z).collect();
         let tags = vec![0u16; xs.len()];
         let mut snap = CellSnapshot::new(cfg);
-        snap.update(&xs, &ys, &zs, &tags, &all_live(xs.len()));
+        snap.update(
+            &xs,
+            &ys,
+            &zs,
+            &tags,
+            &vec![0; xs.len()],
+            crate::id::RegionId::from_raw(0),
+            &all_live(xs.len()),
+        );
         snap
     }
 

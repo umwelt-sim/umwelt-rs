@@ -16,8 +16,8 @@
 //! as a `u32`. Both carry the same bodies, and the leading kind byte says which
 //! message it is either way.
 
-use crate::entity::{EntityId, EntityKind};
-use crate::id::{EntityHandle, RegionId};
+use crate::entity::EntityKind;
+use crate::id::{EntityHandle, EntityKey, RegionId};
 use crate::map::Placement;
 use crate::net::error::NetError;
 use crate::net::wire::Cursor;
@@ -369,14 +369,15 @@ pub enum ToClient<'a> {
     /// Not sent at connect time, because an edge has no home region: it learns
     /// which regions a client cares about when the client asks for one.
     Region(EdgeInfo),
-    /// A region allocated an id for the entity this handle asked for.
+    /// A region took the entity this handle asked for.
     Spawned {
         /// The handle that asked.
         handle: EntityHandle,
         /// Where it ended up.
         region: RegionId,
-        /// What that region calls it.
-        entity: EntityId,
+        /// Its name on the wire, the same in every region it is ever in.
+        /// A game finds itself in its observations by it.
+        name: EntityKey,
     },
     /// Gone, whatever caused it.
     Removed {
@@ -446,11 +447,11 @@ impl ToClient<'_> {
                 out.extend_from_slice(&at.col.to_le_bytes());
                 out.extend_from_slice(&at.row.to_le_bytes());
             }
-            ToClient::Spawned { handle, region, entity } => {
+            ToClient::Spawned { handle, region, name } => {
                 out.push(KIND_SPAWNED);
                 out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(&region.raw().to_le_bytes());
-                out.extend_from_slice(&entity.raw().to_le_bytes());
+                out.extend_from_slice(&name.raw().to_le_bytes());
             }
             ToClient::Removed { handle } => {
                 out.push(KIND_REMOVED);
@@ -509,9 +510,9 @@ impl ToClient<'_> {
                 let mut c = Cursor::new(body, "spawned");
                 let handle = EntityHandle::from_raw(c.u32()?);
                 let region = RegionId::from_raw(c.u32()?);
-                let entity = EntityId::from_raw(c.u32()?);
+                let name = EntityKey::from_raw(c.u64()?);
                 c.finish()?;
-                Ok(ToClient::Spawned { handle, region, entity })
+                Ok(ToClient::Spawned { handle, region, name })
             }
             KIND_REMOVED => {
                 let mut c = Cursor::new(body, "removed");
@@ -701,7 +702,7 @@ mod tests {
             ToClient::Spawned {
                 handle: h(7),
                 region: RegionId::from_raw(9),
-                entity: EntityId::from_raw(42),
+                name: EntityKey::from_raw(0x8000_1234_0000_002A),
             },
             ToClient::Removed { handle: h(7) },
             ToClient::State {
@@ -867,7 +868,7 @@ mod tests {
         ToClient::Spawned {
             handle: h(1),
             region: RegionId::from_raw(1),
-            entity: EntityId::from_raw(1),
+            name: EntityKey::from_raw(1),
         }
         .encode(&mut buf);
         assert!(FromClient::decode(&buf).is_err());

@@ -533,13 +533,13 @@ fn teleport(
                 shared.count_refused();
                 return;
             };
-            let (kind, from) = {
+            let (kind, from, name) = {
                 let entities = shared.entities();
                 let Some(entity) = entities.by_key.get(&key) else {
                     shared.count_refused();
                     return;
                 };
-                (entity.kind, entity.region)
+                (entity.kind, entity.region, entity.name)
             };
             if from == dest {
                 // Same region — a move, not a teleport.
@@ -560,17 +560,24 @@ fn teleport(
                     // Spawn in the destination. The new entity replaces the
                     // old one: when the destination confirms, the handle is
                     // remapped and the origin copy is despawned.
-                    let new_key =
-                        match shared.ask(Some(client), None, dest, position, kind) {
-                            Ok(k) => k,
-                            Err(_) => {
-                                let _ = shared.post(
-                                    client,
-                                    ToClient::TeleportFailed { handle, region: dest },
-                                );
-                                return;
-                            }
-                        };
+                    // The same name at the destination, so a client holding
+                    // it from the origin holds one entity across the move.
+                    let new_key = match shared.ask_named(
+                        Some(client),
+                        dest,
+                        position,
+                        kind,
+                        name,
+                    ) {
+                        Ok(k) => k,
+                        Err(_) => {
+                            let _ = shared.post(
+                                client,
+                                ToClient::TeleportFailed { handle, region: dest },
+                            );
+                            return;
+                        }
+                    };
                     // Link the new entity to the old one.
                     shared
                         .entities()
@@ -690,7 +697,7 @@ fn publish_to_regions(
             for region in shared.regions() {
                 let _ = shared.link.keepalive(region);
             }
-            learn_region_size(&shared);
+            learn_region_size(shared);
             last_keepalive = now;
         }
     }

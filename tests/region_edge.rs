@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use umwelt::internals::region::{Incoming, Presence, RegionClient, Spawn};
 use umwelt::internals::{RecordCodec, read_payload};
 use umwelt::net::{EdgeName, EdgeSink, Inbound};
-use umwelt::{ClientLimits, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
+use umwelt::{
+    ClientLimits, EntityId, EntityKey, EntityKind, Flow, Game, Handoff, Overrun,
+};
 use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, Wait};
 use umwelt::{WorldConfig, WorldSimulation};
 
@@ -28,6 +30,12 @@ const OBSERVERS: usize = 24;
 /// sent nothing themselves.
 const UNATTENDED: usize = 8;
 const PER_EDGE: usize = OBSERVERS + UNATTENDED;
+
+/// The name edge `e` gives its `n`th entity. The region writes it into every
+/// record, so it is what a packet is read by.
+fn name_of(e: usize, n: usize) -> u64 {
+    (e * 1000 + n) as u64
+}
 
 fn url() -> String {
     std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into())
@@ -184,12 +192,14 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                         position: home(e, n),
                         kind: EntityKind::observer(0),
                         token: n as u64,
+                        name: name_of(e, n),
                     })
                     .collect();
                 asked.extend((0..UNATTENDED).map(|n| Spawn {
                     position: home(e, OBSERVERS + n),
                     kind: EntityKind::unattended(0),
                     token: (OBSERVERS + n) as u64,
+                    name: name_of(e, OBSERVERS + n),
                 }));
                 link.spawn(region, &asked).expect("asks for its crowd");
 
@@ -260,9 +270,15 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                                 };
                                 // A packet is named by the avatar it was built
                                 // for, and that avatar always sees itself: it is
-                                // at distance zero from itself.
+                                // at distance zero from itself. Its records
+                                // carry the name this edge chose, not the id.
+                                let Some(n) = movable.iter().position(|&id| id == entity)
+                                else {
+                                    continue;
+                                };
+                                let mine = EntityKey::from_raw(name_of(e, n));
                                 for (id, pos, _tag) in reader.updates() {
-                                    if id == entity
+                                    if id == mine
                                         && pos.floor_meters().0 > 100 + e as i64 * 40
                                     {
                                         confirmed.fetch_add(1, Ordering::Relaxed);

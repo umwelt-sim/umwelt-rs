@@ -4,21 +4,22 @@
 //! [`TickObservation`] through [`ClientGame::observed`](crate::ClientGame::observed)
 //! and never assembles or decodes payloads.
 //!
-//! A payload consists of a header, then despawns, then state records.
+//! A payload consists of a header, then despawns, then state records. Every
+//! entity is named by its 64-bit name, the edge's key (`docs/adr/0010`).
 //!
 //! Despawns come first because they are few and cheap, and because a client
 //! that drops before it adds never holds more ghosts than the server thinks it
 //! does.
 
 use crate::codec::RecordCodec;
-use crate::entity::EntityId;
 use crate::fixed::Fixed;
+use crate::id::EntityKey;
 use crate::map::Placement;
 use crate::pos::{Pos3, WorldPos};
 
-/// Bytes a despawn occupies: just [`EntityId`]. A client already
+/// Bytes a despawn occupies: just the entity's name. A client already
 /// holds the position it is being told to forget.
-pub(crate) const DESPAWN_BYTES: usize = 4;
+pub(crate) const DESPAWN_BYTES: usize = 8;
 
 /// Fixed-size preamble.
 ///
@@ -120,23 +121,23 @@ impl PacketWriter {
         &mut self,
         tick: u32,
         sequence: u16,
-        despawns: &[EntityId],
+        despawns: &[u64],
         updates: I,
     ) -> &[u8]
     where
-        I: IntoIterator<Item = (EntityId, Pos3, u16)>,
+        I: IntoIterator<Item = (u64, Pos3, u16)>,
     {
         self.buf.clear();
         // Reserved, then rewritten once the counts are known.
         PacketHeader::default().encode(&mut self.buf);
 
-        for id in despawns {
-            self.buf.extend_from_slice(&id.raw().to_le_bytes());
+        for name in despawns {
+            self.buf.extend_from_slice(&name.to_le_bytes());
         }
 
         let mut updated = 0usize;
-        for (id, pos, tag) in updates {
-            self.codec.encode(id, pos, tag, &mut self.buf);
+        for (name, pos, tag) in updates {
+            self.codec.encode(name, pos, tag, &mut self.buf);
             updated += 1;
         }
 
@@ -181,6 +182,11 @@ pub struct TickObservation<'a> {
     placement: Option<Placement>,
     /// The region size every placed region shares. Unused when unplaced.
     region_size: Fixed,
+    /// Which despawns to report, by index. `None` reports them all. The
+    /// client's library half masks a despawn from one region for a name
+    /// another region is still sending, which is what a crossing looks like
+    /// from beside the seam.
+    keep: Option<Vec<bool>>,
 }
 
 impl<'a> TickObservation<'a> {
@@ -217,6 +223,23 @@ impl<'a> TickObservation<'a> {
             body: &buf[PacketHeader::BYTES..want],
             placement,
             region_size,
+            keep: None,
+        })
+    }
+
+    /// Reports only the despawns whose index in `keep` is true.
+    pub(crate) fn mask_despawns(&mut self, keep: Vec<bool>) {
+        debug_assert_eq!(keep.len(), self.header.despawns as usize);
+        self.keep = Some(keep);
+    }
+
+    /// Every despawn in the packet, masked or not, in order.
+    pub(crate) fn all_despawns(&self) -> impl Iterator<Item = EntityKey> + '_ {
+        (0..self.header.despawns as usize).map(move |k| {
+            let at = k * DESPAWN_BYTES;
+            EntityKey::from_raw(u64::from_le_bytes(
+                self.body[at..at + DESPAWN_BYTES].try_into().expect("sized"),
+            ))
         })
     }
 
@@ -247,32 +270,35 @@ impl<'a> TickObservation<'a> {
         self.header
     }
 
-    /// Entities the client should drop.
-    pub fn despawns(&self) -> impl Iterator<Item = EntityId> + '_ {
-        (0..self.header.despawns as usize).map(move |k| {
-            let at = k * DESPAWN_BYTES;
-            EntityId::from_raw(u32::from_le_bytes([
-                self.body[at],
-                self.body[at + 1],
-                self.body[at + 2],
-                self.body[at + 3],
-            ]))
-        })
+    /// Entities the client should drop, by name.
+    ///
+    /// A despawn from one region for an entity another region is still
+    /// sending, which is what a crossing looks like from beside the seam, is
+    /// not here: the library holds it back, and the entity goes when the last
+    /// region sending it says so.
+    pub fn despawns(&self) -> impl Iterator<Item = EntityKey> + '_ {
+        self.all_despawns()
+            .enumerate()
+            .filter(move |(k, _)| self.keep.as_ref().is_none_or(|keep| keep[*k]))
+            .map(|(_, name)| name)
     }
 
-    /// Positions and tags the client should adopt. An entity it does not hold
-    /// is one it is being told about for the first time.
+    /// Positions and tags the client should adopt, by name. An entity it does
+    /// not hold is one it is being told about for the first time.
     ///
-    /// Positions are in world coordinates: the region's local position on
-    /// the wire, rebuilt with the frame the edge sent for that region. A
-    /// region off the map is its own frame, so its positions read unchanged.
-    pub fn updates(&self) -> impl Iterator<Item = (EntityId, WorldPos, u16)> + '_ {
+    /// The name is the edge's key for the entity, the same in every region it
+    /// is ever in, so a client near a seam holding it from two regions holds
+    /// one entity. Positions are in world coordinates: the region's local
+    /// position on the wire, rebuilt with the frame the edge sent for that
+    /// region. A region off the map is its own frame, so its positions read
+    /// unchanged.
+    pub fn updates(&self) -> impl Iterator<Item = (EntityKey, WorldPos, u16)> + '_ {
         let base = self.header.despawns as usize * DESPAWN_BYTES;
         let stride = self.codec.record_bytes();
         (0..self.header.updates as usize).map(move |k| {
-            let (id, at, tag) =
+            let (name, at, tag) =
                 self.codec.decode(&self.body[base + k * stride..]).expect("sized");
-            (id, self.world(at), tag)
+            (EntityKey::from_raw(name), self.world(at), tag)
         })
     }
 }
@@ -287,8 +313,9 @@ mod tests {
         RecordCodec::new(&WorldConfig::default())
     }
 
-    fn id(n: u32) -> EntityId {
-        EntityId::from_raw(n)
+    /// A name on the wire, from a small number.
+    fn id(n: u32) -> u64 {
+        n as u64
     }
 
     #[test]
@@ -345,10 +372,15 @@ mod tests {
         assert_eq!(r.header().sequence, 5);
         assert_eq!(r.header().despawns, 2);
         assert_eq!(r.header().updates, 3);
-        assert_eq!(r.despawns().collect::<Vec<_>>(), gone);
+        assert_eq!(
+            r.despawns().collect::<Vec<_>>(),
+            gone.iter().map(|&n| EntityKey::from_raw(n)).collect::<Vec<_>>()
+        );
         let unplaced: Vec<_> = moved
             .iter()
-            .map(|&(id, at, tag)| (id, WorldPos::from_unplaced(at), tag))
+            .map(|&(id, at, tag)| {
+                (EntityKey::from_raw(id), WorldPos::from_unplaced(at), tag)
+            })
             .collect();
         assert_eq!(r.updates().collect::<Vec<_>>(), unplaced);
     }
@@ -357,7 +389,7 @@ mod tests {
     fn an_empty_payload_is_just_a_header() {
         let c = codec();
         let mut w = PacketWriter::new(c, 1200);
-        let bytes = w.build(1, 1, &[], std::iter::empty::<(EntityId, Pos3, u16)>());
+        let bytes = w.build(1, 1, &[], std::iter::empty::<(u64, Pos3, u16)>());
         assert_eq!(bytes.len(), PacketHeader::BYTES);
         let r = TickObservation::new(&c, bytes).expect("well formed");
         assert_eq!(r.despawns().count(), 0);
@@ -368,23 +400,23 @@ mod tests {
     fn a_payload_is_a_header_then_its_records() {
         let c = codec();
         let mut w = PacketWriter::new(c, 1200);
-        let gone: Vec<EntityId> = (0..5).map(id).collect();
-        let moved: Vec<(EntityId, Pos3, u16)> = (0..30)
+        let gone: Vec<u64> = (0..5).map(id).collect();
+        let moved: Vec<(u64, Pos3, u16)> = (0..30)
             .map(|k| (id(100 + k), Pos3::from_meters(k as i32, 0, 0), 0))
             .collect();
-        // 16 header + 5 × 4 despawns + 30 × 14 records = 16 + 20 + 420 = 456
-        assert_eq!(w.build(1, 1, &gone, moved).len(), 16 + 5 * 4 + 30 * 14);
+        // 16 header + 5 × 8 despawns + 30 × 18 records = 16 + 40 + 540 = 596
+        assert_eq!(w.build(1, 1, &gone, moved).len(), 16 + 5 * 8 + 30 * 18);
     }
 
     #[test]
     fn a_full_packet_of_records_fits_the_budget() {
-        // 1200 - 16 = 1184, and 1184 / 14 = 84 with 8 bytes left over.
+        // 1200 - 16 = 1184, and 1184 / 18 = 65 with 14 bytes left over.
         let c = codec();
         let mut w = PacketWriter::new(c, 1200);
-        let moved: Vec<(EntityId, Pos3, u16)> =
-            (0..84).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
-        assert_eq!(w.build(1, 1, &[], moved).len(), 16 + 84 * 14);
-        assert!(w.build(1, 1, &[], Vec::<(EntityId, Pos3, u16)>::new()).len() <= 1200);
+        let moved: Vec<(u64, Pos3, u16)> =
+            (0..65).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
+        assert_eq!(w.build(1, 1, &[], moved).len(), 16 + 65 * 18);
+        assert!(w.build(1, 1, &[], Vec::<(u64, Pos3, u16)>::new()).len() <= 1200);
     }
 
     #[test]
@@ -409,7 +441,7 @@ mod tests {
     fn building_a_payload_reuses_one_buffer_and_nothing_else() {
         let c = codec();
         let mut w = PacketWriter::new(c, 1200);
-        let moved: Vec<(EntityId, Pos3, u16)> =
+        let moved: Vec<(u64, Pos3, u16)> =
             (0..84).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
         w.build(1, 1, &[], moved.clone());
         let (cap, ptr) = (w.buf.capacity(), w.buf.as_ptr());
@@ -442,7 +474,7 @@ mod tests {
     fn the_buffer_is_reused_across_payloads() {
         let c = codec();
         let mut w = PacketWriter::new(c, 1200);
-        let moved: Vec<(EntityId, Pos3, u16)> =
+        let moved: Vec<(u64, Pos3, u16)> =
             (0..84).map(|k| (id(k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
         w.build(1, 1, &[], moved.clone());
         let cap = w.buf.capacity();

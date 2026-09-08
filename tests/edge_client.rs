@@ -14,10 +14,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use umwelt::Overrun;
 use umwelt::internals::edge::FromClient;
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{ClientGame, ClientHandle, ClientLimits, EdgeClient, EdgeServer};
-use umwelt::{EntityHandle, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
+use umwelt::{
+    ClientId, EntityHandle, EntityId, EntityKey, EntityKind, Flow, Game, Handoff,
+};
 use umwelt::{Pacing, RegionId, RegionServer, Step, TickObservation, Wait, WorldPos};
 use umwelt::{WorldConfig, WorldSimulation};
 
@@ -76,17 +79,18 @@ impl Game for Applier {
 /// decision about what silence means.
 struct Watcher {
     region: RegionId,
-    /// Handle to entity id, in the order the handles were spent.
-    ids: Arc<Mutex<Vec<(EntityHandle, EntityId)>>>,
+    /// Handle to the name the edge gave it, in the order the handles were
+    /// spent.
+    ids: Arc<Mutex<Vec<(EntityHandle, EntityKey)>>>,
     gone: Arc<Mutex<Vec<EntityHandle>>>,
     /// Positions that made the whole round trip.
     confirmed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClientGame for Watcher {
-    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-        assert_eq!(region, self.region, "an id from a region nobody asked about");
-        self.ids.lock().expect("not poisoned").push((handle, entity));
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {
+        assert_eq!(region, self.region, "a name from a region nobody asked about");
+        self.ids.lock().expect("not poisoned").push((handle, name));
     }
 
     fn removed(&mut self, handle: EntityHandle) {
@@ -256,6 +260,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
         EdgeSink::new(region, nats.clone(), runtime.handle().clone(), Arc::clone(&edges));
 
     let culled: Arc<Mutex<Option<EntityId>>> = Arc::new(Mutex::new(None));
+    let removed: Arc<Mutex<Vec<EntityKey>>> = Arc::new(Mutex::new(Vec::new()));
     let mut sim = WorldSimulation::new(
         cfg,
         Applier { inbound: Arc::clone(&inbound), ticks: 0, culled: Arc::clone(&culled) },
@@ -264,9 +269,10 @@ fn a_game_client_populates_a_region_through_an_edge() {
 
     let quic = edge_endpoint(runtime.handle());
     let at = quic.local_addr().expect("bound");
-    // The consumer's game does nothing here: a client that spawns, moves and
-    // despawns needs no callback at all.
-    let edge = EdgeServer::new(nats, runtime.handle().clone(), quic, |_handle| NoGame)
+    // The consumer's game only notes what the region takes away, by name: a
+    // client that spawns, moves and despawns needs no callback at all.
+    let noting = Noting { removed: Arc::clone(&removed) };
+    let edge = EdgeServer::new(nats, runtime.handle().clone(), quic, |_handle| noting)
         .expect("the edge starts");
 
     let stop = AtomicBool::new(false);
@@ -298,7 +304,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
         // frames a message, picks a datagram, or polls: which of the four
         // commands rides which is a property of the command, and what comes
         // back arrives as calls.
-        let ids: Arc<Mutex<Vec<(EntityHandle, EntityId)>>> =
+        let ids: Arc<Mutex<Vec<(EntityHandle, EntityKey)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let gone: Arc<Mutex<Vec<EntityHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let confirmed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -351,6 +357,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
         std::thread::scope(|inner| {
             let ids = &ids;
             let gone = &gone;
+            let removed = &removed;
             let stop = &stop;
             let confirmed = &confirmed;
 
@@ -386,12 +393,18 @@ fn a_game_client_populates_a_region_through_an_edge() {
             });
 
             // The region's own game despawned one entity that no client asked
-            // about. Only a removal can carry that.
+            // about. Only a removal can carry that. The region knows it by its
+            // id; the edge hears it by name, and that name is the one the
+            // client was given for the handle it now loses.
             wait_until("the game's own despawn to reach the client", stop, || {
-                let culled = *culled.lock().expect("not poisoned");
-                let Some(culled) = culled else { return false };
+                if culled.lock().expect("not poisoned").is_none() {
+                    return false;
+                }
+                let Some(&name) = removed.lock().expect("not poisoned").first() else {
+                    return false;
+                };
                 let held = ids.lock().expect("not poisoned");
-                let Some(&(handle, _)) = held.iter().find(|(_, id)| *id == culled) else {
+                let Some(&(handle, _)) = held.iter().find(|(_, n)| *n == name) else {
                     return false;
                 };
                 gone.lock().expect("not poisoned").contains(&handle)
@@ -417,5 +430,12 @@ fn a_game_client_populates_a_region_through_an_edge() {
     });
 }
 
-struct NoGame;
-impl umwelt::EdgeGame for NoGame {}
+/// The edge's game: keeps what the region took away, by name.
+struct Noting {
+    removed: Arc<Mutex<Vec<EntityKey>>>,
+}
+impl umwelt::EdgeGame for Noting {
+    fn removed(&mut self, entity: EntityKey, _client: Option<ClientId>) {
+        self.removed.lock().expect("not poisoned").push(entity);
+    }
+}

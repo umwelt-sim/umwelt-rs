@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{
-    ClientGame, ClientLimits, EdgeClient, EdgeGame, EdgeServer, EntityHandle, EntityId,
+    ClientGame, ClientLimits, EdgeClient, EdgeGame, EdgeServer, EntityHandle, EntityKey,
     EntityKind, Flow, Game, Handoff, Overrun, Pacing, Placement, Pos3, RegionId,
     RegionServer, Step, TickObservation, Wait, WorldConfig, WorldMap, WorldPos,
     WorldSimulation,
@@ -215,7 +215,7 @@ impl EdgeGame for Relay {}
 
 /// Records what the edge tells this client, in world coordinates.
 struct Watcher {
-    spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityId)>>>,
+    spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityKey)>>>,
     /// The newest world position the client was sent for each of its own
     /// entities, keyed by the handle the packet was built for.
     seen: Arc<Mutex<Vec<(EntityHandle, RegionId, WorldPos)>>>,
@@ -223,8 +223,8 @@ struct Watcher {
 }
 
 impl ClientGame for Watcher {
-    fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-        self.spawned.lock().expect("not poisoned").push((handle, region, entity));
+    fn spawned(&mut self, handle: EntityHandle, region: RegionId, name: EntityKey) {
+        self.spawned.lock().expect("not poisoned").push((handle, region, name));
     }
 
     fn observed(

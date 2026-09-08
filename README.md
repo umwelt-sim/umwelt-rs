@@ -100,7 +100,7 @@ Another common pattern is to create a cluster with internal replication. This al
 
 In Umwelt, the edge nodes are named deliberately. Their role is to sit as close to a group of game/simulation clients as possible. 
 
-This separation between pure logic simulation management and edge connectivity allows the regions to crash without disconnecting a game client. It also makes it easy to support seamless transition between regions, again without losing any connectivity or packets.
+This separation between pure logic simulation management and edge connectivity allows the regions to crash without disconnecting a game client. It is also what makes a seamless transition between regions possible: the edge reads the world map, keeps a second viewer across the seam so a client sees the far side before it gets there, and carries the entity across under the name the client already holds, without losing connectivity or packets. The design is [ADR 0010](docs/adr/0010-world-coordinates-at-the-edge-and-seamless-crossing.md), and `assets/diagram/seam.svg` draws it.
 
 ## How it Works
 

@@ -15,9 +15,9 @@ work lands. If a decision is reversed, a new record supersedes it and says so.
 | [0005](0005-where-state-lives.md) | Per-client state at the edge, world state in the region | Accepted, nothing to build |
 | [0006](0006-the-edge-server.md) | The edge server | Accepted, not built |
 | [0007](0007-library-scheduled-heartbeats.md) | Library-scheduled heartbeats, on both tiers | Accepted, not built |
-| [0008](0008-first-class-inter-region-teleport.md) | First-class inter-region teleport | Proposed |
+| [0008](0008-first-class-inter-region-teleport.md) | First-class inter-region teleport | Accepted |
 | [0009](0009-entity-kind-carries-a-game-tag.md) | EntityKind carries a game-defined tag | Accepted |
-| [0010](0010-world-coordinates-at-the-edge-and-seamless-crossing.md) | World coordinates at the edge, and seamless crossing | Proposed |
+| [0010](0010-world-coordinates-at-the-edge-and-seamless-crossing.md) | World coordinates at the edge, and seamless crossing | Accepted |
 
 ## Format
 

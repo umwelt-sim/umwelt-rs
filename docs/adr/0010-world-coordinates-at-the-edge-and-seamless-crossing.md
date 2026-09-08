@@ -1,6 +1,6 @@
 # 0010 — World coordinates at the edge, and seamless crossing
 
-Status: Proposed, 2026-09-07.
+Status: Accepted, 2026-09-08. Proposed 2026-09-07.
 Refines `docs/adr/0003` (the seamless case it deferred), `docs/adr/0005` (the
 edge holds the map, the region holds its box) and `docs/adr/0008` (the teleport
 sequence).
@@ -381,7 +381,10 @@ translated target. Two things differ from a requested teleport:
   remap. Anything sent before the spawn travels ahead of it on the edge's
   command subject and reaches the origin's game, so nothing is lost or
   reordered. The hold lasts one transition and is bounded by the connection's
-  flow-control window, the bound the stream already has.
+  flow-control window, the bound the stream already has. A transition the
+  destination never confirms is given up after the teleport timeout that
+  `docs/adr/0008` left open and now records: what was held goes to the region
+  the entity is still in, and the client is told the teleport failed.
 
 Spawn first, despawn second, as `docs/adr/0003` decided: at every step the
 entity exists somewhere, and an edge dying between the two leaves it in both
@@ -412,7 +415,10 @@ client on `teleported` and pays one more round trip of standing still.
 
 **What a crossing costs the crosser** is the teleport's own latency, which
 `docs/adr/0003` measured end to end at 10.5 to 22.9 ms with both regions on
-one machine, plus the hop that carries the intent. Computed at the quality
+one machine, plus the hop that carries the intent. Measured for the crossing
+itself, from the origin's tick that stopped the entity at its box to the
+client's `teleported` callback, both regions on one machine at 100 Hz, over
+four runs of ten crossings: median 9.5 to 11.4 ms, the slowest 14.1 ms. Computed at the quality
 harness's motion classes, that is under 4 cm of standing at the wall for a
 walker at 1.5 m/s and under 70 cm for a vehicle at 30 m/s, inside the tick or
 two a client draws behind. A client that reckons its own entity's motion
@@ -494,9 +500,14 @@ handles is where.
 band receives two packets a tick, and one in a corner receives four. Computed
 from the default config, a region serves about a quarter more viewers for the
 bands of its neighbors that face it, if the population is uniform. A crowd on
-a seam costs more, and a crowd away from one costs nothing. None of this is
-measured. A load generator that walks its bots across a seam is what measures
-it.
+a seam costs more, and a crowd away from one costs nothing. Measured, in the
+seam benchmark in `DESIGN.md`, with 8,192 entities in a 256 m strip along one
+side of a region and 1,000 viewers served from it on one thread: 7.21 ms a
+tick when the viewers stand in the strip as observers, 7.35 ms when they are
+shadows at the seam standing in for observers on the far side. A shadow costs
+what any viewer costs. A crowd standing on the seam itself, served by both
+regions at once, is not measured; a load generator that walks its bots across
+a seam is what measures it.
 
 **A move out of the box is no longer refused.** It is applied as far as the box
 allows, and the collision is reported. `docs/adr/0006` said a region applies a
@@ -513,7 +524,15 @@ and four more bytes per record on the wire. Serving shadows is the seam's
 cost, and it goes through the machinery every viewer already uses, bounded by
 the geometry above. No per-viewer per-tick work is added. No tier does another
 tier's job: the region reports its box and the world in it, the edge reads the
-map and assigns names, and the client adds an offset.
+map and assigns names, and the client adds an offset. Measured: every row of
+the whole-pipeline benchmark is within 3% of where it stood before this record
+was built, after each of its parts landed. One regression was found and
+removed on the way. The first cut looked a record's name up by entity id as
+the packet was written, and that one read cost 11% on the rows that send
+8,192 full packets of moving entities a tick, because a viewer's candidates
+sit in a few contiguous ranges of the snapshot and are scattered by id. The
+name is a column of the snapshot now, written in the pass that writes the
+position, and a record is built from its row alone.
 
 **Nothing of the region's crosses but the entity.** `docs/adr/0005` asked
 whether umwelt should carry the consumer's per-entity game state, and
@@ -536,10 +555,15 @@ the edge's own teleport on a boundary collision all run it.
 crossing and a plain spawn all show one name to everyone who can see the
 entity. The edge assigns it and is the only tier that can map it to a
 region's id, which is the table it already keeps. The price is four bytes per
-record: 65 records in a default packet instead of 84, computed, so a full
-ghost set refreshes over four packets instead of three. The alternative, a
-mapping sent to the client once per first sighting, costs less bandwidth and
-puts a table of region ids in the client, which is what this record refuses.
+record: 65 records in a default packet instead of 84, so a full ghost set
+refreshes over four packets instead of three. Measured in the quality harness
+in `DESIGN.md`, 60,000 entities and 200 viewers over 400 ticks at a ghost cap
+of 256: 64.9 records in a packet where there were 83.9, the same arrivals and
+departures per tick, and a mean angular error of 2.11 mrad where it was 1.82,
+which is each entity refreshed less often. At a cap of 512 the error goes from
+2.12 to 2.79 mrad. The alternative, a mapping sent to the client once per
+first sighting, costs less bandwidth and puts a table of region ids in the
+client, which is what this record refuses.
 
 **What a consumer changes.** It starts its broker with JetStream and writes
 its map to the bucket. It stops clamping at the box, since the library clamps
@@ -553,9 +577,11 @@ across a seam, so the seam has a measured cost.
 ## Open questions
 
 **Whether the ghost set should migrate after all.** The re-send above is
-computed, not measured. If a crowd on a seam makes it cost more than three
-packets, a viewer that inherits another's ghost table is the fix, and it is a
-library change this record chose not to make.
+computed, not measured; the seam benchmark measures what a shadow costs the
+region, not what the fresh viewer re-sends after a crossing. If a crowd on a
+seam makes it cost more than four packets, a viewer that inherits another's
+ghost table is the fix, and it is a library change this record chose not to
+make.
 
 **Whether a game should learn that a boundary collision was ignored.** The
 entity stands clamped at the box, which is right for an entity walking into a

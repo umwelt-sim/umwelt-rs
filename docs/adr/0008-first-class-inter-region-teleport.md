@@ -1,6 +1,6 @@
 # 0008 — First-class inter-region teleport
 
-Status: Proposed, 2026-08-31.
+Status: Accepted, 2026-09-08. Proposed 2026-08-31.
 Refines `docs/adr/0003`.
 
 ## Context
@@ -98,7 +98,10 @@ A consumer that carries game state implements `teleporting` to serialize and
 handles `spawned` on the destination edge to deserialize. One callback each
 direction.
 
-Moves during teleport are held, not dropped.
+Moves during teleport are held, not dropped. Since `docs/adr/0010` the hold
+is in world coordinates, latest move only, with entity messages queued in
+order beside it; the remap forwards both to the destination, and a held move
+that does not fit the destination is dropped rather than clamped to its box.
 
 The manual sequence still works. A game that needs a staged handoff or a
 round trip to a database uses the spawn/despawn primitives directly. The
@@ -110,18 +113,24 @@ answer.
 
 ## Open questions
 
-**Timeout.** Same as ADR 0003: what if the destination never answers. The
-edge owns the wait, so it owns the timeout. A timeout fires `teleport_failed`.
-The right duration depends on the deployment.
+**Timeout.** Decided 2026-09-08, with `docs/adr/0010`, because a crossing
+holds everything sent to an entity in transit and so needs a bound. The edge
+gives a transition up after `TELEPORT_TIMEOUT`, two seconds: the destination
+copy is forgotten, what was held goes to the region the entity is still in,
+and `teleport_failed` fires. `docs/adr/0003` measured the sequence at 10.5 to
+22.9 ms with both regions on one machine, so only a destination that is down
+or unreachable reaches the bound. Two seconds is a guess, exported as a public
+constant and not yet a setting; the right duration still depends on the
+deployment, and a setting can carry it when one asks.
 
 **Server-initiated teleport.** A region's game logic might decide to teleport
 an entity (a trap, a script, an admin action). That needs a new region-to-edge
 message. Separate record.
 
-**Whether `spawned` fires before `teleported`.** The client needs the new
-`EntityId` to match state packets. If `spawned` fires first, the client has
-the id when `teleported` arrives. If only `teleported` fires, it needs to
-carry the id. Both work. Not decided.
+**Whether `spawned` fires before `teleported`.** Decided with
+`docs/adr/0010`: `spawned` fires first, naming the destination region and the
+name the entity has held all along, then `teleported`. There is no new id to
+carry, because the client never sees a region's id.
 
 **Batch teleport.** Whether `teleport_many` is worth providing. Deferred
 until a use case measures it.

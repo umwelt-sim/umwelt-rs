@@ -69,10 +69,10 @@ and memory mapping are excluded.
 
 Budget selection is a filter that discards most of its input. Computed at the
 default config a viewer's subscription walks roughly 185 entities, of which
-**95 survive the view-radius test** (measured), and 98 records fit in an
-MTU-sized packet with no events pending, 77 under a full event backlog. So about
-half of what the gather examines fails the radius test, and under a full backlog
-about a fifth of what survives loses to the budget. Computed, half to three
+**95 survive the view-radius test** (measured), and 65 records fit in an
+MTU-sized packet with no events pending, 51 under a full event backlog. So about
+half of what the gather examines fails the radius test, a third of what survives
+loses to the budget, and under a full backlog nearly half of it does. Computed, half to three
 fifths of what is examined never reaches a client, and the budget binds only
 under a backlog or under crowding.
 
@@ -327,8 +327,9 @@ the same guaranteed delivery path as events.
 floor now. `PacketBudget::state_bytes_available` takes the bytes actually queued
 and holds back `min(queued, reserve)`, so state takes the whole packet when
 nothing is pending, and a backlog past the reserve waits its turn rather than
-starving state. At a 12-byte record: 98 records idle, 90 with 100 bytes queued,
-77 under a full backlog.
+starving state. At the 18-byte record: 65 records idle, 60 with 100 bytes
+queued, 51 under a full backlog; it was 98, 90 and 77 at the 12-byte record this
+was decided against.
 
 ~~**Blocked on client registration.** `Entity(EntityId)` means "the client
 controlling this entity" and nothing maps a connection to an avatar yet.~~
@@ -490,6 +491,11 @@ Region 4096 m = 4,194,304 units = 2^22. Cell 128 m = 131,072 units = 2^17.
 container, and 22 total bits of a position within a 4096 m region. Avoid
 Q-notation entirely; say "an `i32` with 10 fractional bits."
 
+World coordinates never reach this layout. `WorldPos` (`docs/adr/0010`) is
+three `i64` axes with the same 10 fractional bits, held by the edge and the
+client only; the edge adds a placed region's offset on the way in and takes it
+off on the way out, and a region computes in its own frame throughout.
+
 ---
 
 ## Configuration
@@ -526,8 +532,8 @@ Wire precision is lossless, so `horizontal_bits` is `log2(region_raw)`,
 `vertical_bits` is `log2(vertical_raw)`, and both precision-reduction shifts are zero.
 A single global precision has to serve the nearest entity, and at arm's length
 sub-pixel error is sub-millimeter, so there is nothing to trade away. The cost
-is bounded: a record is 12 bytes at the default region and 16 at the largest one
-`Fixed` can express.
+is bounded: the position is 8 bytes at the default region and 12 at the largest
+one `Fixed` can express, in an 18-byte and a 22-byte record.
 
 `WorldConfig::with_cell_size_m` overrides the derived cell size and recomputes
 the grid. It exists so the cell-size sweep can be re-run and panics rather than
@@ -546,8 +552,10 @@ rather than merely unchecked.
 
 ### Records per packet
 
-The record is **12 bytes**, measured rather than assumed: 4 for an `EntityId`
-and 8 for a position packed at 22, 22, and 20 bits. `RecordCodec::record_bytes`
+The record is **18 bytes**, measured rather than assumed: 8 for the entity's
+name, the 64-bit key the edge assigned (`docs/adr/0010`), 8 for a position
+packed at 22, 22, and 20 bits, and 2 for the game tag (`docs/adr/0009`). It
+was 12 before the tag and 14 before the name. `RecordCodec::record_bytes`
 computes it from config.
 
 The packet figures below were computed against constants that were on
@@ -562,19 +570,24 @@ there are two figures:
 ```
 max_state_bytes = payload_bytes - header_bytes
                 = 1200 - 16 = 1184
-idle records    = 1184 / 12 = 98
+idle records    = 1184 / 18 = 65
 
 min_state_bytes = payload_bytes - (header_bytes + event_reserve_bytes)
                 = 1200 - (16 + 256) = 928
-records under a full backlog = 928 / 12 = 77
+records under a full backlog = 928 / 18 = 51
 ```
 
 `state_bytes_available(pending_event_bytes)` gives the figure between them.
 
-**A uniform viewer gathers 95 candidates and 98 fit in a packet, so it is not
-oversubscribed in the calm case.** Earlier revisions of this document, and three
-published posts, said it was. That rested on an assumed 16-byte record. The
-budget binds under crowding and not otherwise.
+**A uniform viewer gathers 95 candidates and 65 fit in a packet, so it is
+mildly oversubscribed even in the calm case.** At the 12-byte record 98 fit,
+and earlier revisions of this document, and three published posts, said the
+calm case was oversubscribed on an assumed 16-byte record and then that it was
+not. The name put it back over by thirty. What that costs is measured in
+the quality harness: 64.9 records in a packet where there were 83.9,
+the same arrivals and departures per tick, and a mean angular error of 2.11
+mrad where it was 1.82 at a ghost cap of 256, since each entity is refreshed
+less often. The budget binds harder under crowding.
 
 Of the remaining inputs, `payload_bytes` at 1200 is well founded: Ethernet MTU is
 1500, an IPv6 header takes 40 and UDP 8, leaving 1452, and 1200 survives tunnels,
@@ -591,9 +604,10 @@ position updates fill every packet and a client can stand in a mob without
 learning it died. The number itself is arbitrary.
 
 Record size varies with region and precision, since bits per axis is
-`log2(extent / precision)`. A 16 km region costs 13 bytes. Coarsening precision
-to 1/16 m costs 10, saving 2 bytes at the price of rounded motion below
-`precision * tick_hz`, which is 1.25 m/s at 20 Hz.
+`log2(extent / precision)`. A 16 km region costs 19 bytes. Coarsening precision
+to 1/16 m costs 16, saving 2 bytes at the price of rounded motion below
+`precision * tick_hz`, which is 1.25 m/s at 20 Hz. The name and the tag are
+fixed.
 
 ---|---|
 | region | 4096 m |
@@ -613,7 +627,7 @@ to 1/16 m costs 10, saving 2 bytes at the price of rounded motion below
 | horizontal precision | 1/1024 m, lossless (fixed) |
 | vertical bits | 20 (derived) |
 | wire steps per cell | 131,072 |
-| record bytes | 12 |
+| record bytes | 18 |
 
 Only region size, vertical extent, view radius, max speed, and tick rate are
 authored. Everything else in this table derives from those five.
@@ -622,12 +636,15 @@ authored. Everything else in this table derives from those five.
 
 ## What is built
 
-`fixed`, `pos`, `config`, `subscription`, `entity`, `snapshot`, `gather`,
-`odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`, `net`, and
-both halves of `net`: the region link and the edge server. 302 library tests
-pass, and three integration tests run against a live broker: one drives a region
-and three edges end to end, one moves an entity from one region into another, and
-one takes a game client through an edge into a region and out again.
+`fixed`, `pos`, `map`, `config`, `subscription`, `entity`, `snapshot`,
+`gather`, `odometer`, `ghost`, `select`, `budget`, `codec`, `packet`, `sim`,
+`net`, and both halves of `net`: the region link and the edge server. 362
+library tests pass, and nine integration tests run against a live broker with
+JetStream: one drives a region and three edges end to end, one moves an entity
+from one region into another, one takes a game client through an edge into a
+region and out again, one teleports, one carries a game message, one places a
+spawn by the map, one reports collisions, one serves a client across a seam
+through a shadow, and one crosses a seam.
 
 A tick runs end to end: the game moves entities, the odometer observes how far
 they went, the snapshot is rebuilt in cell order, and every due viewer is
@@ -756,7 +773,7 @@ Consequences of scoring on displacement rather than elapsed time:
   grace period the ghost is gone and a returning entity is sent regardless.
   ~~Unverified: no measurement of churn exists.~~ Measured: 0.49 first sightings
   per packet for a walking viewer and 2.92 for one crossing a crowd at 30 m/s,
-  against 98 records. Grace trades that count against ghosts held past their
+  against 65 records. Grace trades that count against ghosts held past their
   usefulness, and one tick is the best of that trade; see §Quality harness.
 
 Displacement is `|dx| + |dy| + |dz|`. Computed: that over-estimates the
@@ -848,7 +865,7 @@ protocol's overheads.
 
 The event reserve is a floor rather than a subtraction:
 `state = payload - header - min(pending, reserve)`. Measured against the default
-config, 98 records fit an idle packet and 77 under a backlog at or past the
+config, 65 records fit an idle packet and 51 under a backlog at or past the
 reserve.
 
 ### Payload assembly
@@ -1142,7 +1159,7 @@ change the set the workers are iterating over, and spawning between ticks would
 write the position arrays after the snapshot had been built from them.
 
 **An entity is not a viewer, and the spawn says which is being asked for.** An
-entity is a thing with a position: it can be seen, and it costs 12 bytes of
+entity is a thing with a position: it can be seen, and it costs a row of the
 snapshot and a visit during a gather walk. A viewer is an observer: an avatar
 entity plus the replication state kept for it, and it costs a subscription, a
 gather, a score, a selection and a packet every tick it is served, plus a ghost
@@ -1446,6 +1463,110 @@ be usable by whatever reads the control plane, which may be in another VPC, and
 a client is told where to connect by the game's matchmaking rather than by
 umwelt.
 
+### The map
+
+`docs/adr/0010`. A `WorldMap` places regions on a grid of squares one region
+size wide; a region in an adjacent square is adjacent along the whole side. The
+deployment writes it, as bytes the library defines, to the JetStream key-value
+bucket `umwelt` under the key `map`, and every edge reads it once at startup.
+No process serves it and nothing watches it; a changed map reaches an edge by
+restarting the edge. A region never learns whether it is placed, so a lobby, a
+raid or a dungeon is the same binary as the overworld with no entry in the map.
+
+The edge owns the world coordinate space. A client spawns and moves by
+`WorldPos`; the edge finds the placed region under a position and translates
+into that region's frame, inside its box or not. `tests/map.rs` writes a map of
+two regions, starts an edge, and sees a spawn by world position land in the
+east region at the right local position, and a second edge count an empty map.
+
+### Boundary and view collisions
+
+`docs/adr/0010`. The region resolves every move and decides nothing about the
+map. A move that would leave the box is clamped to it and reported once, as a
+`BoundaryCollision` carrying the target as asked; the entity has to come back
+inside before it is reported again, so a game holding an entity against a wall
+costs one event. When a viewer's subscription is rebuilt, which is on a cell
+change, the region also reports whether the unclamped view box reaches its own
+box: `ViewCollision` with the position, and `ViewCleared` when it no longer
+does. Both are queued off the hot path like a despawn and published in `settle`
+to the edge that owns the entity. Measured: the whole-pipeline benchmark did
+not move, within noise, every row.
+
+### Shadows
+
+`docs/adr/0010`. The edge answers a `ViewCollision` by keeping a second viewer
+in each placed neighbor the view reaches, a shadow: the library's third
+`EntityKind` role, spawned inside the neighbor's box at the point nearest the
+observer, moved along the seam as the observer moves, never in any snapshot so
+no viewer is sent it, and never reported to a consumer's game. Its packets go
+to the observer's client under the observer's own handle, so the client is
+served the far side of the seam before its entity gets there, and the view does
+not appear to shrink at a border. `ViewCleared`, the observer's removal and a
+disconnect all release it.
+
+Measured, `cargo bench --bench seam`, 8,192 entities in a 256 m strip along one
+side and 1,000 viewers served from it on one thread: 7.21 ms a tick with the
+viewers standing in the strip as observers, 7.35 ms with them as shadows at
+the seam, 316 and 331 candidates gathered. A shadow costs what any viewer
+costs. `tests/seam.rs` walks a client toward a seam and sees the neighbor's
+packets arrive under its own handle, at world positions on the far side, before
+its entity reaches the seam, and stop when it walks away.
+
+### Names on the wire
+
+`docs/adr/0010`. A client never sees a region's `EntityId`. Every record and
+despawn carries the 64-bit name the edge assigned when it asked for the
+entity, which the region writes in place of its id; an entity the region's own
+game spawned is named by its region and id composed, top bit clear, and every
+edge-minted key has the top bit set. A teleport asks the destination for the
+same name, so a bystander sees an entity walk across a seam under one name and
+nothing at the client maps anything. The client keeps, per name, which regions
+are sending it, and a despawn from one region while another still sends the
+name is not reported.
+
+The name a record carries is a column of the snapshot, written in the pass that
+writes the position. The first cut looked it up by entity id as the packet was
+written, and that one read cost 11% on the two pipeline rows that send 8,192
+full packets of moving entities a tick (uniform/10000 from 25.6 to 28.45 ms,
+motion/moving from 25.7 to 28.59 ms): a viewer's candidates sit in a few
+contiguous ranges of the snapshot and are scattered by id. With the column both
+rows are back to 25.3 and 25.4 ms, and the snapshot update pass is within 1% of
+where it was. What the wider record costs the client is under records per
+packet.
+
+### Crossing
+
+`docs/adr/0010`. The edge answers a `BoundaryCollision` for an entity it owns
+by looking the target up in the map. Nothing placed beyond is a wall, dropped
+and counted, the entity standing where the region stopped it. Otherwise the
+edge runs the teleport of `docs/adr/0008` into the neighbor, on its own
+initiative: one entry point starts every teleport, asked for or a crossing,
+and a client is told of a failure only when it asked. While the destination
+has not answered, the entity leaving holds what arrives for it, the latest
+move in world coordinates and entity messages in order, and the remap forwards
+both to the destination. A transition the destination never confirms is given
+up after `TELEPORT_TIMEOUT`, two seconds, and the client told. The shadows
+swap by the reports that made them: the remap releases the old entity's, and
+the destination's own view collision puts one in the origin. A game developer
+building an edge is given nothing new to call; `teleporting` and
+`teleport_arrived` fire as they do for a requested teleport, with the client
+optional.
+
+Measured, `tests/crossing.rs`, two placed regions on one machine at 100 Hz
+whose games walk tagged entities east one meter a tick, from the origin's tick
+that stopped the entity at its box to the client's `teleported` callback, four
+runs of ten crossings: median 9.5 to 11.4 ms, the slowest 14.1 ms, inside
+`docs/adr/0003`'s 10.5 to 22.9 ms for a requested teleport. The same test
+checks that the crosser is confirmed in the origin then the destination under
+one name and handle, that its position is continuous across the seam within
+five meters, that twenty entity messages sent the instant the transition starts
+reach the destination's game in order and never the origin's, that a bystander
+whose view straddles the seam is never told to forget it, that a shadow stands
+in the origin once it is across, that a side with nothing beyond is one wall
+and no crossing, that a client walking its own entity across lands where its
+last move said, and that a teleport into a region nobody serves fails after the
+timeout with the entity still the client's to move.
+
 ### The smoke test
 
 The smoke test is `herd`, the companion repo, and none of it lives here: herd
@@ -1555,8 +1676,10 @@ reaches 38.71 ms of the 50 ms period at 24,576 observers, and delivery still
 keeps up. That is one M1 on loopback. §Open items still wants this curve on
 hardware someone would rent, and still wants a definition of comfortable.
 
-**Payload volume.** 24,576 observers at 98 records each and 20 Hz is 48 million
-records per second, or 578 MB/s, across eight edges. That is what the reliable
+**Payload volume.** 24,576 observers at the 98 records a packet held then and
+20 Hz is 48 million records per second, or 578 MB/s, across eight edges. The
+record is 18 bytes now and 65 fit, so the same observers carry 32 million
+records a second in the same bytes. That is what the reliable
 ordered stream is carrying in place of datagrams.
 
 **Two regions, measured**, before the three-peer split, with one program driving
@@ -1712,13 +1835,15 @@ physically drifted across it.
 This does not indict TRIBES. Two things visible in the paper make it a non-issue
 there: the state mask means idle objects are not in the update list at all, and a
 32-player match does not oversubscribe a packet. Computed at our default config,
-a viewer gathers roughly 95 candidates against 98 record slots when idle and 77
-under a full event backlog, so the calm uniform case is not oversubscribed at all
-and reaches only 1.2x under a full backlog. The budget binds under crowding.
-(Two earlier versions of this document were wrong here. One said 185 candidates
-and 3.2x; 185 is the number *examined* and about half fail the radius test. The
-other said 74 and 58 slots, which are 16-byte-record figures against a measured
-12-byte record.)
+a viewer gathers roughly 95 candidates against 65 record slots when idle and 51
+under a full event backlog, so the calm uniform case is oversubscribed 1.5x and
+reaches 1.9x under a full backlog. The budget binds in the calm case now, and
+harder under crowding. (Earlier versions of this document were wrong here in
+both directions. One said 185 candidates and 3.2x; 185 is the number *examined*
+and about half fail the radius test. One said 74 and 58 slots, which are
+16-byte-record figures against a then-measured 12-byte record. One said the calm
+case was not oversubscribed at all, which was true of the 12-byte record and
+stopped being true when the game tag and then the name widened it to 18.)
 
 ### Decided: the score is accumulated position error
 
@@ -1824,7 +1949,7 @@ clean-room number. A server-class result needs a server with nothing else on it,
 which nothing here has been run on.
 
 **Whole-tick figures taken before payload assembly understate a tick.** A tick
-now encodes ~98 records per viewer and hands them to a sink, work that did not
+now encodes ~65 records per viewer and hands them to a sink, work that did not
 exist when the earliest pipeline tables were taken. Measured against a rerun of
 the same scenarios, the gap is 0.39 µs per viewer on the uniform region and 0.27
 on the town square. §Thread scaling, §Whole-pipeline benchmark and §Ghost cap
@@ -2238,6 +2363,26 @@ Every table below is one sweep of `cargo run --release --example harness`, each
 row a full 400-tick run, all from one session at the defaults this tuning
 settled. Error is mean angular error in milliradians, by separation.
 
+**Taken at the 12-byte record, when 98 records fit a packet.** The game tag and
+then the entity's name widened it to 18, and 65 fit. What that costs was
+measured by rerunning the harness at the same defaults, 60,000 entities and 200
+viewers over 400 ticks with the 1/d curve and a grace of 1:
+
+| | at 98 slots | at 65 slots |
+|---|---|---|
+| records a packet, cap 256 | 83.9 | 64.9 |
+| bytes a packet, cap 256 | 1193 | 1188 |
+| arrivals and departures a tick | 0.58 | 0.58 |
+| mean angular error, cap 256 | 1.82 mrad | 2.11 mrad |
+| mean angular error, cap 512 | 2.12 mrad | 2.79 mrad |
+| never updated, unrepresented | 8.5%, 9.5% | 8.5%, 9.5% |
+
+The packet is as full as it was and carries the same bytes; each entity is
+refreshed less often, which is the whole of the difference. The tuning the
+tables below settled is a comparison between rows of one sweep, and none of it
+moved: the curve, the grace and the cap all land where they did. The absolute
+error figures in those tables are the 98-slot ones.
+
 **The curve**, at the default ghost cap of 256:
 
 | curve | 0-32 m | 32-64 m | 64-128 m | 128 m+ |
@@ -2291,11 +2436,15 @@ session, with the walk cap matched to the ghost cap throughout:
 
 The cap is bounded from both ends. **Below about 160 a client's packet does not
 fill**, because only a ghost that moved consumes a slot: at a cap of 64 a viewer
-sends 42 records of the 98 its 1,200-byte payload paid for. Above 256 every
-ghost is refreshed less often and every band's error grows, while cost rises by
-1.8 to 2.0x per doubling of the cap. Quality is flat from 160 to 384,
+sends 42 records of the 98 its 1,200-byte payload paid for at the time. Above
+256 every ghost is refreshed less often and every band's error grows, while cost
+rises by 1.8 to 2.0x per doubling of the cap. Quality is flat from 160 to 384,
 which is where the cap is a real dial; 256 is the top of that, keeping packet-fill
-margin for a crowd denser or slower than this one.
+margin for a crowd denser or slower than this one. At the 18-byte record the
+packet fills from a lower cap, since 65 slots is what has to be filled: measured
+at 42.0 records used at a cap of 64 and 64.9 of 65 from 128 up. Nothing moves
+the cap, because what bounds it above is refresh frequency and not packet
+fill.
 
 The cost columns are the same benchmark at two thread counts, since the single
 thread figure is what the older tables in this document are comparable to and
@@ -2540,7 +2689,7 @@ disperse cycle, crowding damage, a lifespan, and a spawner.
 | ticks started late | 0 of 1,200 |
 | duty | 33% |
 | candidates per viewer | 290 |
-| records per packet | 97.8 of 98 |
+| records per packet | 97.8 of 98, at the 12-byte record of the time |
 | despawn records per packet | 1.1 to 1.5 |
 | subscriptions changed | 0.23% of viewers served, about 18 a tick |
 | deaths | 21.5 a second, population held at 50,000 |
@@ -2548,7 +2697,8 @@ disperse cycle, crowding damage, a lifespan, and a spawner.
 
 The figures a consumer sees agree with the ones the benchmarks report against
 hand-built fixtures: 290 candidates against 268 for the clustered fixture and
-323 for the town square, and 97.8 records against 98.0.
+323 for the town square, and 97.8 records against 98.0. The record is 18 bytes
+now and 65 fit a packet; this run has not been repeated.
 
 **The despawn path carries load for the first time.** Between one and one and a
 half despawn records ride every packet, from ghosts aging out of a set and from
@@ -2887,6 +3037,13 @@ Secondary things it would exercise that current benchmarks do not: subdivision
 cost with many dense cells rather than one, and `update` scaling with slot count
 and cell count together rather than one at a time.
 
+**A crowd on a seam.** The seam benchmark spreads its entities along a border
+strip and serves them to viewers on one side. A crowd standing on the seam
+itself is served by both regions at once, and a client in a corner band
+receives four packets a tick; neither is measured. A load generator that walks
+bots across a seam is what measures it, and `docs/adr/0010` leaves whether the
+ghost set should migrate open until it does.
+
 ---
 
 ## Build order
@@ -2906,7 +3063,10 @@ and cell count together rather than one at a time.
    move what they own, and are sent the replication back. Not built: the
    datagram path, and the edge server that holds game client sockets
 9. Checkpoint path (full-fidelity, distinct from the wire payload)
-10. Cross-region: boundary replication, authority epochs, handoff
+10. Cross-region: ~~boundary replication~~, authority epochs, ~~handoff~~.
+    Seeing across a seam is a shadow and crossing one is the teleport, both
+    built (`docs/adr/0010`). Authority epochs remain, and nothing yet hands a
+    client from one edge to another.
 11. Control plane
 12. Second library consumer, to prove the API is not shaped around `herd`
 
@@ -3118,7 +3278,9 @@ reasonable fit for the bot harness and for a later gameplay scripting tier.
 - `CellList::push` panics on overflow. Unreachable through the public path, but it
   is a panic in a library.
 - `MAX_CELL_RADIUS` of 4 sizes every `CellList` inline at 81 cells.
-- Region-local coordinates only. A global coordinate space would need `i64`.
+- ~~Region-local coordinates only. A global coordinate space would need `i64`.~~
+  Built: `WorldPos` is `i64` at the edge and the client (`docs/adr/0010`), and
+  the region still computes in its own frame.
 - Stale `CellSet` in a panic message at `subscription.rs:136`.
 - Axis convention: `pos.rs` uses z-up. An earlier Elixir design used Y-up to match
   Unity and Unreal. Never resolved deliberately.

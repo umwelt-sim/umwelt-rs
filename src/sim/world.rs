@@ -878,6 +878,18 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         &self.game
     }
 
+    /// The consumer's game, to change between ticks.
+    ///
+    /// A game holds the consumer's own state, and something outside the tick
+    /// loop may have to reach it: an administrative command, a scenario a test
+    /// sets up, a region placing its own scenery before anything connects.
+    /// Taking `&mut self` is what keeps that between ticks, where a tick is
+    /// not reading the same state on another thread.
+    #[inline]
+    pub fn game_mut(&mut self) -> &mut G {
+        &mut self.game
+    }
+
     /// Delivers a game message to the game before the next tick.
     ///
     /// Calls [`Game::message_received`] immediately. Call this between ticks

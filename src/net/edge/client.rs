@@ -30,14 +30,16 @@ use tokio::task::JoinHandle;
 
 use crate::codec::RecordCodec;
 use crate::entity::EntityKind;
+use crate::fixed::Fixed;
 use crate::game::ClientGame;
 use crate::id::{EntityHandle, RegionId};
+use crate::map::Placement;
 use crate::net::edge::protocol::{
     Framer, FromClient, MAX_MOVES_PER_DATAGRAM, MOVE_BYTES, MOVES_HEADER_BYTES, ToClient,
 };
 use crate::net::error::NetError;
 use crate::packet::TickObservation;
-use crate::pos::Pos3;
+use crate::pos::WorldPos;
 
 /// What a client holds, shared with every handle to it.
 struct Shared {
@@ -49,14 +51,24 @@ struct Shared {
     /// a stale one names nothing rather than something else.
     handles: AtomicU32,
     game: Mutex<Box<dyn ClientGame>>,
-    /// How to read each region's packets, learned from the edge before any of
-    /// them arrive. A game never sees one: it is told entities and positions.
-    codecs: Mutex<HashMap<RegionId, RecordCodec>>,
+    /// How to read each region's packets and where that region sits, learned
+    /// from the edge before any of them arrive. A game never sees one: it is
+    /// told entities and world positions.
+    frames: Mutex<HashMap<RegionId, Frame>>,
     /// The entities this client is holding. A handle leaves the moment it is
     /// given back or reported gone, so this is bounded by what is alive rather
     /// than by everything ever spawned, and a command naming something absent
     /// is one this end declines to send.
     live: Mutex<HashMap<EntityHandle, Held>>,
+}
+
+/// How to read one region's packets into the world frame.
+#[derive(Clone, Debug)]
+struct Frame {
+    codec: RecordCodec,
+    /// `None` for a region off the map, whose world frame is its own.
+    placement: Option<Placement>,
+    region_size: Fixed,
 }
 
 /// One entity this client is holding.
@@ -72,18 +84,13 @@ struct Held {
 
 impl Shared {
     /// Asks for an entity.
-    fn ask(
-        &self,
-        region: RegionId,
-        at: Pos3,
-        kind: EntityKind,
-    ) -> Result<EntityHandle, NetError> {
+    fn ask(&self, at: WorldPos, kind: EntityKind) -> Result<EntityHandle, NetError> {
         let handle = EntityHandle::from_raw(self.handles.fetch_add(1, Ordering::Relaxed));
         self.live
             .lock()
             .expect("not poisoned")
             .insert(handle, Held { region: None, walked: false });
-        reliable(self, &FromClient::Spawn { handle, region, position: at, kind })?;
+        reliable(self, &FromClient::Spawn { handle, position: at, kind })?;
         Ok(handle)
     }
 
@@ -115,7 +122,7 @@ impl Shared {
 ///
 /// ```no_run
 /// use umwelt::{ClientGame, EdgeClient, EntityHandle, EntityId, EntityKind};
-/// use umwelt::{TickObservation, Pos3, RegionId};
+/// use umwelt::{TickObservation, RegionId, WorldPos};
 ///
 /// /// A game that counts what it can see.
 /// #[derive(Default)]
@@ -149,13 +156,10 @@ impl Shared {
 /// let sending = client.handle();
 ///
 /// // Valid at once: a move under this handle is held at the edge until the
-/// // region answers.
-/// let avatar = sending.spawn(
-///     RegionId::from_raw(7),
-///     Pos3::from_meters(2048, 2048, 0),
-///     EntityKind::observer(0),
-/// )?;
-/// sending.move_entity(avatar, Pos3::from_meters(2049, 2048, 0))?;
+/// // region answers. The position is in world coordinates, and the edge's
+/// // map says which region that is.
+/// let avatar = sending.spawn(WorldPos::from_meters(2048, 2048, 0), EntityKind::observer(0))?;
+/// sending.move_entity(avatar, WorldPos::from_meters(2049, 2048, 0))?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct EdgeClient {
@@ -183,7 +187,7 @@ impl EdgeClient {
             out: queue,
             handles: AtomicU32::new(1),
             game: Mutex::new(Box::new(NoGame)),
-            codecs: Mutex::new(HashMap::new()),
+            frames: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
         });
         let built = game(ClientHandle { shared: Arc::downgrade(&shared) });
@@ -242,26 +246,46 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
-    /// Asks for an entity, in the region this game put this client in.
+    /// Asks for an entity at a world position. The edge finds the region on
+    /// its map; a client never names one.
     ///
     /// Returns the handle to name it by from here on, valid at once: a move
     /// sent under it before the region answers is held by the edge and sent
-    /// when the id arrives. The id itself reaches
-    /// [`ClientGame::spawned`](crate::ClientGame::spawned).
-    ///
-    /// The region is named because an edge has none — it reaches every region
-    /// through one wildcard subscription and has no business deciding where a
-    /// player belongs. That is the game's, kept out of band;.
+    /// when the id arrives. The region and id reach
+    /// [`ClientGame::spawned`](crate::ClientGame::spawned). A position no
+    /// placed region covers is dropped by the edge and counted there.
     pub fn spawn(
         &self,
-        region: RegionId,
-        at: Pos3,
+        at: WorldPos,
         kind: EntityKind,
     ) -> Result<EntityHandle, NetError> {
-        self.live()?.ask(region, at, kind)
+        self.live()?.ask(at, kind)
     }
 
-    /// Teleports an entity to another region.
+    /// Asks for an entity in a named region, which is the one way to start in
+    /// a region off the map: a lobby, an instance, a place no walk reaches.
+    /// `at` is in that region's frame: the map's if it is placed, its own if
+    /// not. Otherwise as [`spawn`](Self::spawn).
+    pub fn spawn_into(
+        &self,
+        region: RegionId,
+        at: WorldPos,
+        kind: EntityKind,
+    ) -> Result<EntityHandle, NetError> {
+        let shared = self.live()?;
+        let handle =
+            EntityHandle::from_raw(shared.handles.fetch_add(1, Ordering::Relaxed));
+        shared
+            .live
+            .lock()
+            .expect("not poisoned")
+            .insert(handle, Held { region: None, walked: false });
+        reliable(&shared, &FromClient::SpawnInto { handle, region, position: at, kind })?;
+        Ok(handle)
+    }
+
+    /// Teleports an entity to a world position, which the edge resolves
+    /// through its map.
     ///
     /// The handle stays valid throughout. Moves sent during the transition are
     /// held at the edge and forwarded when the destination confirms.
@@ -272,27 +296,39 @@ impl ClientHandle {
     /// [`ClientGame::teleported`](crate::ClientGame::teleported). On failure,
     /// [`ClientGame::teleport_failed`](crate::ClientGame::teleport_failed)
     /// fires and the entity stays where it was.
-    ///
-    /// The edge orchestrates the spawn-in-destination and despawn-from-origin
-    /// sequence. The client does not need to manage id swaps.
-    pub fn teleport(
+    pub fn teleport(&self, handle: EntityHandle, at: WorldPos) -> Result<(), NetError> {
+        let shared = self.live()?;
+        if !shared.live.lock().expect("not poisoned").contains_key(&handle) {
+            return Err(NetError::Unknown("handle"));
+        }
+        reliable(&shared, &FromClient::Teleport { handle, at })
+    }
+
+    /// Teleports an entity into a named region, which is the one door into a
+    /// region off the map. `at` is in that region's frame: the map's if it is
+    /// placed, its own if not. Otherwise as [`teleport`](Self::teleport).
+    pub fn teleport_into(
         &self,
         handle: EntityHandle,
-        to: RegionId,
-        at: Pos3,
+        region: RegionId,
+        at: WorldPos,
     ) -> Result<(), NetError> {
         let shared = self.live()?;
         if !shared.live.lock().expect("not poisoned").contains_key(&handle) {
             return Err(NetError::Unknown("handle"));
         }
-        reliable(&shared, &FromClient::Teleport { handle, region: to, position: at })
+        reliable(&shared, &FromClient::TeleportInto { handle, region, at })
     }
 
-    /// Sends a new absolute position.
+    /// Sends a new absolute position, in world coordinates.
     ///
     /// A handle this client is not holding is dropped: it has been given back
     /// or reported gone, and there is nothing to move.
-    pub fn move_entity(&self, handle: EntityHandle, to: Pos3) -> Result<(), NetError> {
+    pub fn move_entity(
+        &self,
+        handle: EntityHandle,
+        to: WorldPos,
+    ) -> Result<(), NetError> {
         self.move_entities(&[(handle, to)])
     }
 
@@ -308,7 +344,10 @@ impl ClientHandle {
     /// The first move for a handle goes on the ordered stream instead. A spawn
     /// travels there and a datagram can pass it, so a first move sent as a
     /// datagram can reach the edge before the spawn that named the handle.
-    pub fn move_entities(&self, moves: &[(EntityHandle, Pos3)]) -> Result<(), NetError> {
+    pub fn move_entities(
+        &self,
+        moves: &[(EntityHandle, WorldPos)],
+    ) -> Result<(), NetError> {
         let shared = self.live()?;
         // How many fit is the connection's answer, not a constant's: the path
         // decides what a datagram may carry, and a smaller one than loopback's
@@ -317,7 +356,7 @@ impl ClientHandle {
         let room = shared.conn.max_datagram_size().unwrap_or(0);
         let per_batch = room.saturating_sub(MOVES_HEADER_BYTES) / MOVE_BYTES;
         let per_batch = per_batch.clamp(1, MAX_MOVES_PER_DATAGRAM);
-        let mut batch: Vec<(EntityHandle, Pos3)> = Vec::new();
+        let mut batch: Vec<(EntityHandle, WorldPos)> = Vec::new();
         for &(handle, to) in moves {
             let first = {
                 let mut live = shared.live.lock().expect("not poisoned");
@@ -374,11 +413,7 @@ impl ClientHandle {
     /// The edge resolves the handle and relays automatically. The message
     /// arrives at [`Game::message_received`](crate::Game::message_received)
     /// with the entity's id as the sender. Reliable and ordered.
-    pub fn entity_send(
-        &self,
-        handle: EntityHandle,
-        body: &[u8],
-    ) -> Result<(), NetError> {
+    pub fn entity_send(&self, handle: EntityHandle, body: &[u8]) -> Result<(), NetError> {
         reliable(
             &*self.live()?,
             &FromClient::EntityMessage { handle, body: body.to_vec() },
@@ -468,7 +503,12 @@ fn deliver(shared: &Shared, body: &[u8]) {
         if let Ok(codec) =
             RecordCodec::for_extents(info.region_size_m, info.vertical_extent_m)
         {
-            shared.codecs.lock().expect("not poisoned").insert(info.region, codec);
+            let frame = Frame {
+                codec,
+                placement: info.placement,
+                region_size: Fixed::from_meters(info.region_size_m),
+            };
+            shared.frames.lock().expect("not poisoned").insert(info.region, frame);
         }
         return;
     }
@@ -483,9 +523,16 @@ fn deliver(shared: &Shared, body: &[u8]) {
         // runs. The world arrives before the first spawn into a region, on the
         // reliable stream, so a missing codec means a handle this client never
         // spent.
-        let held = shared.codecs.lock().expect("not poisoned").get(&region).cloned();
-        let Some(codec) = held else { return };
-        let Some(state) = TickObservation::new(&codec, packet) else { return };
+        let held = shared.frames.lock().expect("not poisoned").get(&region).cloned();
+        let Some(frame) = held else { return };
+        let Some(state) = TickObservation::in_frame(
+            &frame.codec,
+            packet,
+            frame.placement,
+            frame.region_size,
+        ) else {
+            return;
+        };
         shared.with_game(|game| game.observed(handle, region, &state));
         return;
     }
@@ -497,8 +544,7 @@ fn deliver(shared: &Shared, body: &[u8]) {
         // to repeat the region on every one. The game is told it too, since it
         // is the only tier that sees more than one region at a time.
         ToClient::Spawned { handle, region, .. } => {
-            if let Some(held) =
-                shared.live.lock().expect("not poisoned").get_mut(&handle)
+            if let Some(held) = shared.live.lock().expect("not poisoned").get_mut(&handle)
             {
                 held.region = Some(region);
             }

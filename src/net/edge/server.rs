@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::game::{EdgeGame, TeleportDecision};
 use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
+use crate::map::WorldMap;
 use crate::net::control::{self, EdgeHeartbeat};
 use crate::net::edge::handle::{
     Client, Counters, EdgeHandle, EdgeStats, Entities, Outgoing, Shared, finish_leaving,
@@ -33,7 +34,7 @@ use crate::net::region::client::{Incoming, RegionClient};
 use crate::net::region::edges::EdgeName;
 use crate::net::region::protocol::{PROTOCOL_VERSION, Spawn};
 use crate::net::version::ServerVersion;
-use crate::pos::Pos3;
+use crate::pos::{Pos3, WorldPos};
 
 /// How long a region is given to say what world it runs.
 ///
@@ -124,6 +125,13 @@ impl EdgeServer {
     ) -> Result<EdgeServer, NetError> {
         let (name, prefix) = mint_identity();
         let name = EdgeName::new(name).expect("a minted name is well formed");
+        // Read once and kept for this edge's lifetime. No bucket and no key
+        // are an empty map; a key that does not decode is an error, so a bad
+        // deployment does not pass for a plain one.
+        let map = runtime
+            .block_on(WorldMap::read(&nats))
+            .map_err(NetError::Map)?
+            .unwrap_or_default();
         let link = RegionClient::new(nats, runtime.clone(), name.clone())?;
 
         let (outbound, queue) = std::sync::mpsc::channel();
@@ -141,8 +149,13 @@ impl EdgeServer {
             // name a client can hold across every region the entity visits.
             entity_keys: Mint::seeded(prefix),
             counters: Counters::default(),
+            map,
+            region_size: Mutex::new(None),
             teleport_state: Mutex::new(HashMap::new()),
         });
+        // Best effort: a placed region that is up says how big every placed
+        // region is. Retried from the publishing thread until one answers.
+        learn_region_size(&shared);
         // The handle exists before the game, and the game before the server, so
         // neither has to be constructed twice.
         let built = game(EdgeHandle { shared: Arc::downgrade(&shared) });
@@ -386,7 +399,7 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
         // every region through one wildcard subscription and has no way to know
         // which regions exist, let alone where a player belongs — that is the
         // game's, and the game is what told this client where it is.
-        FromClient::Spawn { handle, region, position, kind } => {
+        FromClient::Spawn { handle, position, kind } => {
             let taken = shared
                 .clients()
                 .get(&client)
@@ -397,9 +410,14 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
                 shared.count_refused();
                 return;
             }
-            // A position outside the region is refused there, not here: an edge
-            // that checked would have to hold every region's world.
-            let _ = shared.ask(Some(client), Some(handle), region, position, kind);
+            // The map says which region, and the world position becomes that
+            // region's own. A position no placed region covers is the edge of
+            // the world, or an edge that has not yet learned a region size.
+            let Some((region, local)) = shared.locate(position) else {
+                shared.count_off_map();
+                return;
+            };
+            let _ = shared.ask(Some(client), Some(handle), region, local, kind);
         }
         // A move for a handle this connection is not holding is dropped
         // silently rather than counted. A region's game can despawn anything,
@@ -408,15 +426,33 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
         // was a mistake, a first move overtaking the spawn that named it, is
         // gone: a client sends its first move for a handle on the ordered
         // stream, where it cannot pass anything.
+        FromClient::SpawnInto { handle, region, position, kind } => {
+            let taken = shared
+                .clients()
+                .get(&client)
+                .is_some_and(|held| held.handles.contains_key(&handle));
+            if taken {
+                shared.count_refused();
+                return;
+            }
+            let Some(local) = shared.to_frame(region, position) else {
+                shared.count_off_map();
+                return;
+            };
+            let _ = shared.ask(Some(client), Some(handle), region, local, kind);
+        }
+        // A move is translated into the frame of the region the entity is in,
+        // inside its box or not. If it lies outside, the region's own move
+        // path decides what that means; the edge does not.
         FromClient::Move { handle, position } => {
             if let Some(key) = key_of(shared, client, handle) {
-                shared.set_position(key, position);
+                shared.set_world_positions([(key, position)]);
             }
         }
         FromClient::Moves(moves) => {
             // Resolved in one pass under one lock, rather than taking it again
             // for every move in the batch.
-            let resolved: Vec<(EntityKey, Pos3)> = {
+            let resolved: Vec<(EntityKey, WorldPos)> = {
                 let clients = shared.clients();
                 let Some(held) = clients.get(&client) else { return };
                 moves
@@ -426,9 +462,7 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
                     })
                     .collect()
             };
-            for (key, to) in resolved {
-                shared.set_position(key, to);
-            }
+            shared.set_world_positions(resolved);
         }
         FromClient::Despawn { handle } => match key_of(shared, client, handle) {
             Some(key) => shared.release(key),
@@ -442,16 +476,48 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
                 shared.count_refused();
                 return;
             };
-            let resolved = shared
-                .entities()
-                .by_key
-                .get(&key)
-                .and_then(|e| Some((e.region, e.id?)));
+            let resolved =
+                shared.entities().by_key.get(&key).and_then(|e| Some((e.region, e.id?)));
             if let Some((region, id)) = resolved {
                 shared.tell_region(Outgoing::Message(region, id, body));
             }
         }
-        FromClient::Teleport { handle, region: dest, position } => {
+        FromClient::Teleport { handle, at } => {
+            let Some((dest, local)) = shared.locate(at) else {
+                shared.count_off_map();
+                let _ = shared.post(
+                    client,
+                    ToClient::TeleportFailed { handle, region: RegionId::from_raw(0) },
+                );
+                return;
+            };
+            teleport(shared, client, handle, dest, local, at);
+        }
+        FromClient::TeleportInto { handle, region: dest, at } => {
+            let Some(local) = shared.to_frame(dest, at) else {
+                shared.count_off_map();
+                let _ = shared
+                    .post(client, ToClient::TeleportFailed { handle, region: dest });
+                return;
+            };
+            teleport(shared, client, handle, dest, local, at);
+        }
+    }
+}
+
+/// The client half of a teleport, once the destination and the position in
+/// its frame are known. `at` is the same position in world coordinates, for
+/// the consumer's game.
+fn teleport(
+    shared: &Arc<Shared>,
+    client: ClientId,
+    handle: EntityHandle,
+    dest: RegionId,
+    position: Pos3,
+    at: WorldPos,
+) {
+    {
+        {
             // Look up the entity this handle names. `clients` then
             // `entities`, one at a time, per the locking rule on `Shared`.
             let Some(key) = key_of(shared, client, handle) else {
@@ -474,31 +540,28 @@ fn on_client(shared: &Arc<Shared>, client: ClientId, message: FromClient) {
             // Ask the consumer's game whether to allow it.
             let mut decision = TeleportDecision::Allow;
             shared.with_game(|game| {
-                decision = game.teleporting(key, client, from, dest, position);
+                decision = game.teleporting(key, client, from, dest, at);
             });
             match decision {
                 TeleportDecision::Deny => {
-                    let _ = shared.post(
-                        client,
-                        ToClient::TeleportFailed { handle, region: dest },
-                    );
+                    let _ = shared
+                        .post(client, ToClient::TeleportFailed { handle, region: dest });
                 }
                 TeleportDecision::Allow | TeleportDecision::Carry(_) => {
                     // Spawn in the destination. The new entity replaces the
                     // old one: when the destination confirms, the handle is
                     // remapped and the origin copy is despawned.
-                    let new_key = match shared.ask(
-                        Some(client), None, dest, position, kind,
-                    ) {
-                        Ok(k) => k,
-                        Err(_) => {
-                            let _ = shared.post(
-                                client,
-                                ToClient::TeleportFailed { handle, region: dest },
-                            );
-                            return;
-                        }
-                    };
+                    let new_key =
+                        match shared.ask(Some(client), None, dest, position, kind) {
+                            Ok(k) => k,
+                            Err(_) => {
+                                let _ = shared.post(
+                                    client,
+                                    ToClient::TeleportFailed { handle, region: dest },
+                                );
+                                return;
+                            }
+                        };
                     // Link the new entity to the old one.
                     shared
                         .entities()
@@ -611,13 +674,58 @@ fn publish_to_regions(
         }
         shared.flush_moves();
 
-        // Keep regions alive when the edge has nothing else to say.
+        // Keep regions alive when the edge has nothing else to say, and keep
+        // asking placed regions how big a region is until one has answered.
         let now = Instant::now();
         if now.duration_since(last_keepalive) >= REGION_KEEPALIVE {
             for region in shared.regions() {
                 let _ = shared.link.keepalive(region);
             }
+            learn_region_size(&shared);
             last_keepalive = now;
+        }
+    }
+}
+
+/// What world a region runs, asked once and cached. `None` if the region did
+/// not answer, and not cached then: a region that is not up yet may be by the
+/// next ask. Blocks on the runtime, so only from a plain thread.
+fn world_of(shared: &Arc<Shared>, region: RegionId) -> Option<EdgeInfo> {
+    let known = shared.worlds.lock().expect("not poisoned").get(&region).copied();
+    if let Some(info) = known {
+        return Some(info);
+    }
+    let offer = shared.link.info(region, INFO_TIMEOUT).ok()?;
+    // Only the two extents and the frame cross to a client. What the region
+    // told this edge otherwise, versions, view radius, speed cap, tick rate,
+    // digest, is this link's business and stops here.
+    let info = EdgeInfo {
+        region,
+        region_size_m: offer.config.region_size().floor_meters(),
+        vertical_extent_m: offer.config.vertical_extent().floor_meters(),
+        placement: shared.map.placement_of(region),
+    };
+    shared.worlds.lock().expect("not poisoned").insert(region, info);
+    if info.placement.is_some() {
+        let mut size = shared.region_size.lock().expect("not poisoned");
+        if size.is_none() {
+            *size = Some(offer.config.region_size());
+        }
+    }
+    Some(info)
+}
+
+/// Learns the region size every placed region shares from the first placed
+/// region to answer. Nothing to learn on a map of islands.
+fn learn_region_size(shared: &Arc<Shared>) {
+    if shared.region_size.lock().expect("not poisoned").is_some() {
+        return;
+    }
+    for (region, _) in shared.map.iter() {
+        if world_of(shared, region).is_some()
+            && shared.region_size.lock().expect("not poisoned").is_some()
+        {
+            return;
         }
     }
 }
@@ -642,29 +750,7 @@ fn tell_the_world(shared: &Arc<Shared>, region: RegionId, batch: &[Spawn]) {
         return;
     }
 
-    let info = {
-        let known = shared.worlds.lock().expect("not poisoned").get(&region).copied();
-        match known {
-            Some(info) => info,
-            // Not cached on failure: a region that is not up yet may be by the
-            // next spawn.
-            None => match shared.link.info(region, INFO_TIMEOUT) {
-                Ok(offer) => {
-                    // Only the two extents cross to a client. What the region
-                    // told this edge — versions, view radius, speed cap, tick
-                    // rate, digest — is this link's business and stops here.
-                    let info = EdgeInfo {
-                        region,
-                        region_size_m: offer.config.region_size().floor_meters(),
-                        vertical_extent_m: offer.config.vertical_extent().floor_meters(),
-                    };
-                    shared.worlds.lock().expect("not poisoned").insert(region, info);
-                    info
-                }
-                Err(_) => return,
-            },
-        }
-    };
+    let Some(info) = world_of(shared, region) else { return };
 
     for client in owners {
         if shared.post(client, ToClient::Region(info)).is_ok() {
@@ -747,7 +833,8 @@ mod tests {
     fn a_key_prefix_fits_31_bits_and_is_the_name_s_low_bits() {
         let (name, prefix) = mint_identity();
         assert_eq!(prefix >> 31, 0, "the top bit is the mint's, not the prefix's");
-        let bits = u64::from_str_radix(name.trim_start_matches("edge-"), 16).expect("hex");
+        let bits =
+            u64::from_str_radix(name.trim_start_matches("edge-"), 16).expect("hex");
         assert_eq!(prefix, (bits & 0x7fff_ffff) as u32);
     }
 

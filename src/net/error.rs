@@ -48,6 +48,11 @@ pub enum NetError {
     BadEdgeName(&'static str),
     /// A subject did not parse into the tokens it should have.
     BadSubject,
+    /// The world map could not be read from the broker, or did not decode.
+    Map(crate::map::MapError),
+    /// A world position no placed region covers, or one that does not fit the
+    /// region it was aimed at.
+    OffMap,
     /// The two ends do not speak the same protocol version.
     ProtocolMismatch {
         /// What this side speaks.
@@ -87,6 +92,8 @@ impl fmt::Display for NetError {
             }
             BadEdgeName(why) => write!(f, "edge name: {why}"),
             BadSubject => write!(f, "subject does not parse"),
+            Map(e) => write!(f, "the world map: {e}"),
+            OffMap => write!(f, "no placed region covers that position"),
             ProtocolMismatch { ours, theirs } => {
                 write!(f, "this end speaks protocol {ours}, the other speaks {theirs}")
             }

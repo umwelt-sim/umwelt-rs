@@ -58,6 +58,10 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
+    pub(crate) fn i64(&mut self) -> Result<i64, NetError> {
+        Ok(self.u64()? as i64)
+    }
+
     /// Everything after the cursor, consuming the rest. For a variable-length
     /// tail like a game message body.
     pub(crate) fn rest(self) -> &'a [u8] {

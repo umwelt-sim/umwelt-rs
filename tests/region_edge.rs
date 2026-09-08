@@ -263,7 +263,7 @@ fn edges_populate_a_region_and_are_sent_the_movement_back() {
                                 // at distance zero from itself.
                                 for (id, pos, _tag) in reader.updates() {
                                     if id == entity
-                                        && pos.x.floor_meters() > 100 + e as i32 * 40
+                                        && pos.floor_meters().0 > 100 + e as i64 * 40
                                     {
                                         confirmed.fetch_add(1, Ordering::Relaxed);
                                     }

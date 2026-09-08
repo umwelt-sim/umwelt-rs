@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{
     ClientGame, ClientId, ClientLimits, EdgeClient, EdgeGame, EdgeServer, EntityHandle,
-    EntityId, EntityKey, EntityKind, Flow, Game, Handoff, Overrun, Pacing, Pos3, RegionId,
-    RegionServer, Step, TeleportDecision, TickObservation, Wait, WorldConfig, WorldSimulation,
+    EntityId, EntityKey, EntityKind, Flow, Game, Handoff, Overrun, Pacing, RegionId,
+    RegionServer, Step, TeleportDecision, TickObservation, Wait, WorldConfig, WorldPos,
+    WorldSimulation,
 };
 
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -229,7 +230,7 @@ impl EdgeGame for TeleportEdge {
         _client: ClientId,
         _from: RegionId,
         _to: RegionId,
-        _at: Pos3,
+        _at: WorldPos,
     ) -> TeleportDecision {
         if self.deny.load(Ordering::Relaxed) {
             return TeleportDecision::Deny;
@@ -355,7 +356,9 @@ fn a_client_teleports_an_entity_between_regions() {
 
         let endpoint = game_endpoint(runtime.handle());
         let conn = runtime
-            .block_on(async { endpoint.connect(at, "localhost").expect("configured").await })
+            .block_on(async {
+                endpoint.connect(at, "localhost").expect("configured").await
+            })
             .expect("connects to the edge");
 
         let spawned: Arc<Mutex<Vec<(EntityHandle, RegionId, EntityId)>>> =
@@ -380,7 +383,11 @@ fn a_client_teleports_an_entity_between_regions() {
 
         // Spawn an entity in the origin.
         let avatar = sending
-            .spawn(origin_id, Pos3::from_meters(200, 200, 0), EntityKind::observer(0))
+            .spawn_into(
+                origin_id,
+                WorldPos::from_meters(200, 200, 0),
+                EntityKind::observer(0),
+            )
             .expect("asks for an entity");
 
         // Wait for the origin to confirm.
@@ -394,9 +401,7 @@ fn a_client_teleports_an_entity_between_regions() {
         }
 
         // Move it so we know the handle works.
-        sending
-            .move_entity(avatar, Pos3::from_meters(201, 200, 0))
-            .expect("moves");
+        sending.move_entity(avatar, WorldPos::from_meters(201, 200, 0)).expect("moves");
         wait_until("movement to round-trip", &stop, || {
             confirmed.load(Ordering::Relaxed) > 0
         });
@@ -407,7 +412,7 @@ fn a_client_teleports_an_entity_between_regions() {
             Some(b"inventory:sword,shield".to_vec());
 
         sending
-            .teleport(avatar, dest_id, Pos3::from_meters(2000, 2000, 0))
+            .teleport_into(avatar, dest_id, WorldPos::from_meters(2000, 2000, 0))
             .expect("sends teleport");
 
         // Wait for the teleported callback.
@@ -419,7 +424,11 @@ fn a_client_teleports_an_entity_between_regions() {
         // entries: the original spawn and the teleport arrival.
         {
             let s = spawned.lock().expect("not poisoned");
-            assert_eq!(s.len(), 2, "spawned should fire twice: once for origin, once for teleport");
+            assert_eq!(
+                s.len(),
+                2,
+                "spawned should fire twice: once for origin, once for teleport"
+            );
             // Second spawned is in the destination.
             assert_eq!(s[1].0, avatar, "same handle");
             assert_eq!(s[1].1, dest_id, "arrived in destination");
@@ -462,7 +471,7 @@ fn a_client_teleports_an_entity_between_regions() {
         // The entity can still be moved after teleporting.
         let before = confirmed.load(Ordering::Relaxed);
         sending
-            .move_entity(avatar, Pos3::from_meters(2001, 2000, 0))
+            .move_entity(avatar, WorldPos::from_meters(2001, 2000, 0))
             .expect("moves after teleport");
         wait_until("movement after teleport to round-trip", &stop, || {
             confirmed.load(Ordering::Relaxed) > before
@@ -473,7 +482,7 @@ fn a_client_teleports_an_entity_between_regions() {
         // Try teleporting back, but the edge denies it.
         edge_game.deny.store(true, Ordering::Relaxed);
         sending
-            .teleport(avatar, origin_id, Pos3::from_meters(200, 200, 0))
+            .teleport_into(avatar, origin_id, WorldPos::from_meters(200, 200, 0))
             .expect("sends denied teleport");
 
         wait_until("the client to receive teleport_failed", &stop, || {
@@ -495,7 +504,7 @@ fn a_client_teleports_an_entity_between_regions() {
         // The entity can still be moved — it stayed in the destination.
         let before = confirmed.load(Ordering::Relaxed);
         sending
-            .move_entity(avatar, Pos3::from_meters(2002, 2000, 0))
+            .move_entity(avatar, WorldPos::from_meters(2002, 2000, 0))
             .expect("moves after denied teleport");
         wait_until("movement after denied teleport to round-trip", &stop, || {
             confirmed.load(Ordering::Relaxed) > before
@@ -505,7 +514,11 @@ fn a_client_teleports_an_entity_between_regions() {
 
         assert!(
             sending
-                .teleport(EntityHandle::from_raw(9_999), dest_id, Pos3::from_meters(0, 0, 0))
+                .teleport_into(
+                    EntityHandle::from_raw(9_999),
+                    dest_id,
+                    WorldPos::from_meters(0, 0, 0)
+                )
                 .is_err(),
             "a handle nobody spent must be refused"
         );
@@ -534,7 +547,7 @@ impl EdgeGame for SharedTeleportEdge {
         _client: ClientId,
         _from: RegionId,
         _to: RegionId,
-        _at: Pos3,
+        _at: WorldPos,
     ) -> TeleportDecision {
         if self.0.deny.load(Ordering::Relaxed) {
             return TeleportDecision::Deny;

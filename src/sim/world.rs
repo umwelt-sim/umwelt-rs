@@ -1004,8 +1004,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
                 let runs = &runs;
                 scope.spawn(move || {
                     loop {
-                        let Some((c, vs)) =
-                            runs.lock().expect("not poisoned").next()
+                        let Some((c, vs)) = runs.lock().expect("not poisoned").next()
                         else {
                             break;
                         };
@@ -1391,7 +1390,8 @@ mod tests {
         }
 
         let codec = RecordCodec::new(&WorldConfig::default());
-        let seen: Mutex<Vec<(EntityId, Pos3, u16)>> = Mutex::new(Vec::new());
+        let seen: Mutex<Vec<(EntityId, crate::pos::WorldPos, u16)>> =
+            Mutex::new(Vec::new());
         s.tick_with(&|o: Outbound<'_>| {
             let r = TickObservation::new(&codec, o.bytes).expect("well formed");
             *seen.lock().unwrap() = r.updates().collect();
@@ -1399,7 +1399,11 @@ mod tests {
         let seen = seen.into_inner().unwrap();
         assert!(!seen.is_empty());
         for (id, pos, _tag) in seen {
-            assert_eq!(Some(pos), s.position(id), "the wire is lossless at this config");
+            assert_eq!(
+                Some(pos),
+                s.position(id).map(crate::pos::WorldPos::from_unplaced),
+                "the wire is lossless at this config"
+            );
         }
     }
 
@@ -1574,7 +1578,8 @@ mod tests {
                     tick: 0,
                 };
                 for k in 0..40i32 {
-                    let at = Pos3::from_meters(256 + (k % 8) * 512, 256 + (k / 8) * 512, 0);
+                    let at =
+                        Pos3::from_meters(256 + (k % 8) * 512, 256 + (k / 8) * 512, 0);
                     avatars.push(step.spawn(at, 0));
                 }
             }

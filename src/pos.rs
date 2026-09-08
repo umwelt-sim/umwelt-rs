@@ -38,6 +38,7 @@ use core::{
 };
 
 use crate::fixed::{DistSq, Fixed};
+use crate::map::Placement;
 
 /// A 3D position or displacement, region-local.
 ///
@@ -155,6 +156,117 @@ impl SubAssign for Pos3 {
 impl fmt::Debug for Pos3 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "({}, {}, {})", self.x, self.y, self.z)
+    }
+}
+
+/// A position in the world frame, which an edge and a game client speak and a
+/// region never sees.
+///
+/// Three `i64` in the same raw units as [`Fixed`], 1/1024 m. `x` and `y` are
+/// a placement's square times the region size plus the position inside it;
+/// `z` passes through from the region's own frame, since placed regions tile a
+/// plane. A region off the map is its own frame, and a world position in it
+/// is its local one (`docs/adr/0010`).
+///
+/// Nothing in the simulation takes one of these. The translation to and from
+/// a region's [`Pos3`] happens at the edge on the way in and in the client's
+/// library half on the way out.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct WorldPos {
+    /// East, in raw units.
+    pub x: i64,
+    /// North, in raw units.
+    pub y: i64,
+    /// Up, in raw units.
+    pub z: i64,
+}
+
+impl WorldPos {
+    /// The origin of the world frame.
+    pub const ZERO: WorldPos = WorldPos { x: 0, y: 0, z: 0 };
+
+    /// From raw units.
+    #[inline]
+    pub const fn from_raw(x: i64, y: i64, z: i64) -> WorldPos {
+        WorldPos { x, y, z }
+    }
+
+    /// From whole meters.
+    #[inline]
+    pub const fn from_meters(x: i64, y: i64, z: i64) -> WorldPos {
+        WorldPos {
+            x: x << crate::fixed::FIXED_SHIFT,
+            y: y << crate::fixed::FIXED_SHIFT,
+            z: z << crate::fixed::FIXED_SHIFT,
+        }
+    }
+
+    /// Each axis in whole meters, rounded toward negative infinity.
+    #[inline]
+    pub const fn floor_meters(self) -> (i64, i64, i64) {
+        let s = crate::fixed::FIXED_SHIFT;
+        (self.x >> s, self.y >> s, self.z >> s)
+    }
+
+    /// The world position of a local one in a placed region.
+    ///
+    /// `region_size` is the world config's, which every placed region shares.
+    #[inline]
+    pub const fn from_local(at: Pos3, square: Placement, region_size: Fixed) -> WorldPos {
+        let size = region_size.raw() as i64;
+        WorldPos {
+            x: square.col as i64 * size + at.x.raw() as i64,
+            y: square.row as i64 * size + at.y.raw() as i64,
+            z: at.z.raw() as i64,
+        }
+    }
+
+    /// This position in a placed region's own frame, whether or not it lies
+    /// inside that region's box. `None` if an axis does not fit the region's
+    /// numbers at all.
+    #[inline]
+    pub const fn to_local(self, square: Placement, region_size: Fixed) -> Option<Pos3> {
+        let size = region_size.raw() as i64;
+        let x = self.x - square.col as i64 * size;
+        let y = self.y - square.row as i64 * size;
+        match (fits(x), fits(y), fits(self.z)) {
+            (Some(x), Some(y), Some(z)) => Some(Pos3::new(x, y, z)),
+            _ => None,
+        }
+    }
+
+    /// The world position of a local one in a region off the map, which is
+    /// the same numbers.
+    #[inline]
+    pub const fn from_unplaced(at: Pos3) -> WorldPos {
+        WorldPos { x: at.x.raw() as i64, y: at.y.raw() as i64, z: at.z.raw() as i64 }
+    }
+
+    /// This position in a region off the map, which is the same numbers if
+    /// they fit.
+    #[inline]
+    pub const fn to_unplaced(self) -> Option<Pos3> {
+        match (fits(self.x), fits(self.y), fits(self.z)) {
+            (Some(x), Some(y), Some(z)) => Some(Pos3::new(x, y, z)),
+            _ => None,
+        }
+    }
+}
+
+/// A raw world coordinate as a region coordinate, if it fits one.
+#[inline]
+const fn fits(raw: i64) -> Option<Fixed> {
+    if raw < i32::MIN as i64 || raw > i32::MAX as i64 {
+        None
+    } else {
+        Some(Fixed::from_raw(raw as i32))
+    }
+}
+
+impl fmt::Debug for WorldPos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let m = |raw: i64| raw as f64 / crate::fixed::FIXED_ONE as f64;
+        write!(f, "WorldPos({:.3}m, {:.3}m, {:.3}m)", m(self.x), m(self.y), m(self.z))
     }
 }
 
@@ -350,5 +462,54 @@ mod tests {
         let a = Pos3::from_meters(10, 20, 30);
         let d = Pos3::from_meters(1, 2, 3);
         assert_eq!((a + d) - d, a);
+    }
+}
+
+#[cfg(test)]
+mod world_pos_tests {
+    use super::*;
+
+    #[test]
+    fn a_local_position_round_trips_through_every_sign_of_square() {
+        let size = Fixed::from_meters(4096);
+        let at = Pos3::from_meters(100, 200, 3);
+        for (col, row) in [(0, 0), (1, 0), (0, 1), (-1, -1), (7, -3), (-3, 7)] {
+            let square = Placement::new(col, row);
+            let world = WorldPos::from_local(at, square, size);
+            assert_eq!(world.x, col as i64 * size.raw() as i64 + at.x.raw() as i64);
+            assert_eq!(world.y, row as i64 * size.raw() as i64 + at.y.raw() as i64);
+            assert_eq!(world.z, at.z.raw() as i64);
+            assert_eq!(world.to_local(square, size), Some(at), "square ({col}, {row})");
+        }
+    }
+
+    #[test]
+    fn a_position_outside_the_box_still_translates_into_the_frame() {
+        let size = Fixed::from_meters(4096);
+        // Ten meters west of square (1, 0) is inside square (0, 0), but in
+        // region (1, 0)'s frame it is x = -10 m: what a boundary collision
+        // will carry.
+        let world = WorldPos::from_meters(4096 - 10, 5, 0);
+        assert_eq!(
+            world.to_local(Placement::new(1, 0), size),
+            Some(Pos3::from_meters(-10, 5, 0))
+        );
+    }
+
+    #[test]
+    fn a_coordinate_that_does_not_fit_a_region_is_none() {
+        let size = Fixed::from_meters(4096);
+        let far = WorldPos::from_raw(1 << 40, 0, 0);
+        assert_eq!(far.to_local(Placement::new(0, 0), size), None);
+        assert_eq!(far.to_unplaced(), None);
+        let tall = WorldPos::from_raw(0, 0, i64::from(i32::MAX) + 1);
+        assert_eq!(tall.to_local(Placement::new(0, 0), size), None);
+    }
+
+    #[test]
+    fn an_unplaced_region_is_the_identity() {
+        let at = Pos3::from_meters(-5, 4000, 12);
+        assert_eq!(WorldPos::from_unplaced(at).to_unplaced(), Some(at));
+        assert_eq!(WorldPos::from_meters(-5, 4000, 12), WorldPos::from_unplaced(at));
     }
 }

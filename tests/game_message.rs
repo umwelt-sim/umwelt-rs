@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{ClientGame, ClientHandle, ClientLimits, EdgeClient, EdgeGame, EdgeServer};
 use umwelt::{EntityId, EntityKind, Flow, Game, Handoff, Overrun};
-use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, Wait};
+use umwelt::{Pacing, RegionId, RegionServer, Step, Wait, WorldPos};
 use umwelt::{WorldConfig, WorldSimulation};
 
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -242,13 +242,16 @@ fn a_game_message_travels_from_client_to_sim() {
                 endpoint.connect(at, "localhost").expect("configured").await
             })
             .expect("connects to the edge");
-        let client =
-            EdgeClient::new(conn, runtime.handle().clone(), |_handle| Silent)
-                .expect("opens a stream");
+        let client = EdgeClient::new(conn, runtime.handle().clone(), |_handle| Silent)
+            .expect("opens a stream");
         let sending: ClientHandle = client.handle();
 
         let handle = sending
-            .spawn(region, Pos3::from_meters(200, 200, 0), EntityKind::observer(0))
+            .spawn_into(
+                region,
+                WorldPos::from_meters(200, 200, 0),
+                EntityKind::observer(0),
+            )
             .expect("asks for an entity");
 
         // Wait for the entity to be claimed in the region, so the edge can
@@ -268,10 +271,7 @@ fn a_game_message_travels_from_client_to_sim() {
 
         let messages = received_for_loop.lock().expect("not poisoned");
         assert_eq!(messages.len(), 1, "exactly one message arrived");
-        assert_eq!(
-            messages[0].1, payload,
-            "the body arrived unmodified"
-        );
+        assert_eq!(messages[0].1, payload, "the body arrived unmodified");
 
         stop.store(true, Ordering::Relaxed);
 

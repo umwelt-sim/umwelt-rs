@@ -13,6 +13,7 @@ pub mod entity;
 pub mod fixed;
 pub mod game;
 pub mod id;
+pub mod map;
 pub mod net;
 pub mod packet;
 pub mod pos;
@@ -35,12 +36,13 @@ pub use entity::{EntityId, EntityKind, Live, LiveIter, LiveSet};
 pub use fixed::{DistSq, Fixed};
 pub use game::{ClientGame, EdgeGame, Game, TeleportDecision};
 pub use id::{ClientId, EntityHandle, EntityKey, RegionId};
+pub use map::{MapError, Placement, Side, WorldMap};
 pub use net::{
     ClientHandle, EdgeClient, EdgeHandle, EdgeServer, NetError, ProtocolVersion,
     RegionServer, ServerVersion,
 };
 pub use packet::TickObservation;
-pub use pos::{CellCoord, CellId, Pos2, Pos3};
+pub use pos::{CellCoord, CellId, Pos2, Pos3, WorldPos};
 // From modules the crate keeps to itself. A consumer names these — `Policy` and
 // `Weights` to tune replication, the rest to read what a region reports — and
 // nothing else in those modules.

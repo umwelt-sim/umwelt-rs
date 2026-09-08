@@ -15,14 +15,16 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::entity::{EntityId, EntityKind};
+use crate::fixed::Fixed;
 use crate::game::EdgeGame;
 use crate::id::{ClientId, EntityHandle, EntityKey, Mint, RegionId};
+use crate::map::WorldMap;
 use crate::net::control::EdgeLoad;
 use crate::net::edge::protocol::{EdgeInfo, ToClient};
 use crate::net::error::NetError;
 use crate::net::region::client::RegionClient;
 use crate::net::region::protocol::{Presence, Spawn};
-use crate::pos::Pos3;
+use crate::pos::{Pos3, WorldPos};
 
 /// What this edge has done since it started.
 ///
@@ -46,6 +48,13 @@ pub struct EdgeStats {
     /// Commands this edge declined, for an unknown handle or one belonging to
     /// another connection.
     pub refused: u64,
+    /// Regions on the world map this edge read at startup. Zero is a
+    /// deployment of islands, or an edge that found no map.
+    pub placed_regions: u32,
+    /// World positions no placed region covers, dropped. Counted apart from
+    /// `refused` because a client walking into the edge of the world is not
+    /// making a mistake.
+    pub off_map: u64,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +67,7 @@ pub(crate) struct Counters {
     undeliverable: AtomicU64,
     commands: AtomicU64,
     refused: AtomicU64,
+    off_map: AtomicU64,
 }
 
 /// One connected game client.
@@ -175,6 +185,13 @@ pub(crate) struct Shared {
     pub(crate) client_ids: Mint,
     pub(crate) entity_keys: Mint,
     pub(crate) counters: Counters,
+    /// Which region sits where, read once when this edge started
+    /// (`docs/adr/0010`). Empty when the broker held no map.
+    pub(crate) map: WorldMap,
+    /// The region size every placed region shares, learned from the first
+    /// placed region to answer `info`. `None` until one has, during which a
+    /// world position cannot be placed and is refused.
+    pub(crate) region_size: Mutex<Option<Fixed>>,
     /// Game state carried during a teleport, keyed by the destination entity's
     /// key. Inserted when the teleport is initiated, consumed when the
     /// destination's `Presence::Added` arrives.
@@ -208,6 +225,55 @@ impl Shared {
 
     pub(crate) fn count_command(&self) {
         self.counters.commands.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_off_map(&self) {
+        self.counters.off_map.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The placed region a world position falls in and the position inside
+    /// it. `None` off the map, or before any placed region has said how big a
+    /// region is.
+    pub(crate) fn locate(&self, at: WorldPos) -> Option<(RegionId, Pos3)> {
+        let size = (*self.region_size.lock().expect("not poisoned"))?;
+        self.map.locate(at, size)
+    }
+
+    /// A world position in one region's frame, inside its box or not. A region
+    /// off the map is its own frame.
+    pub(crate) fn to_frame(&self, region: RegionId, at: WorldPos) -> Option<Pos3> {
+        match self.map.placement_of(region) {
+            Some(square) => {
+                let size = (*self.region_size.lock().expect("not poisoned"))?;
+                at.to_local(square, size)
+            }
+            None => at.to_unplaced(),
+        }
+    }
+
+    /// World positions for entities this edge holds, each translated into the
+    /// frame of the region its entity is in. A position that does not fit
+    /// that frame is dropped and counted.
+    pub(crate) fn set_world_positions(
+        &self,
+        moves: impl IntoIterator<Item = (EntityKey, WorldPos)>,
+    ) {
+        let mut local: Vec<(EntityKey, Pos3)> = Vec::new();
+        let mut dropped = 0u64;
+        {
+            let entities = self.entities();
+            for (key, to) in moves {
+                let Some(held) = entities.by_key.get(&key) else { continue };
+                match self.to_frame(held.region, to) {
+                    Some(at) => local.push((key, at)),
+                    None => dropped += 1,
+                }
+            }
+        }
+        if dropped > 0 {
+            self.counters.off_map.fetch_add(dropped, Ordering::Relaxed);
+        }
+        self.set_positions(local);
     }
 
     pub(crate) fn count_refused(&self) {
@@ -322,12 +388,6 @@ impl Shared {
         }
         let mut waiting = self.moves.lock().expect("not poisoned");
         waiting.extend(queued);
-    }
-
-    /// One entity's position. Use [`set_positions`](Self::set_positions) for
-    /// more than one.
-    pub(crate) fn set_position(&self, key: EntityKey, to: Pos3) {
-        self.set_positions([(key, to)]);
     }
 
     /// Queues a position, latest wins.
@@ -461,6 +521,8 @@ impl Shared {
             undeliverable: self.counters.undeliverable.load(Ordering::Relaxed),
             commands: self.counters.commands.load(Ordering::Relaxed),
             refused: self.counters.refused.load(Ordering::Relaxed),
+            placed_regions: self.map.len() as u32,
+            off_map: self.counters.off_map.load(Ordering::Relaxed),
         }
     }
 
@@ -527,11 +589,27 @@ impl EdgeHandle {
     pub fn spawn(
         &self,
         client: ClientId,
-        region: RegionId,
-        at: Pos3,
+        at: WorldPos,
         kind: EntityKind,
     ) -> Result<EntityKey, NetError> {
-        self.live()?.ask(Some(client), None, region, at, kind)
+        let shared = self.live()?;
+        let (region, local) = shared.locate(at).ok_or(NetError::OffMap)?;
+        shared.ask(Some(client), None, region, local, kind)
+    }
+
+    /// As [`spawn`](Self::spawn), into a named region, which is the one way
+    /// into a region off the map. `at` is in that region's frame: the map's
+    /// if it is placed, its own if not.
+    pub fn spawn_into(
+        &self,
+        client: ClientId,
+        region: RegionId,
+        at: WorldPos,
+        kind: EntityKind,
+    ) -> Result<EntityKey, NetError> {
+        let shared = self.live()?;
+        let local = shared.to_frame(region, at).ok_or(NetError::OffMap)?;
+        shared.ask(Some(client), None, region, local, kind)
     }
 
     /// An entity with no client behind it, which lives until this edge does.
@@ -540,11 +618,24 @@ impl EdgeHandle {
     /// than [`spawn`](Self::spawn) asked for.
     pub fn spawn_detached(
         &self,
-        region: RegionId,
-        at: Pos3,
+        at: WorldPos,
         kind: EntityKind,
     ) -> Result<EntityKey, NetError> {
-        self.live()?.ask(None, None, region, at, kind)
+        let shared = self.live()?;
+        let (region, local) = shared.locate(at).ok_or(NetError::OffMap)?;
+        shared.ask(None, None, region, local, kind)
+    }
+
+    /// As [`spawn_detached`](Self::spawn_detached), into a named region.
+    pub fn spawn_detached_into(
+        &self,
+        region: RegionId,
+        at: WorldPos,
+        kind: EntityKind,
+    ) -> Result<EntityKey, NetError> {
+        let shared = self.live()?;
+        let local = shared.to_frame(region, at).ok_or(NetError::OffMap)?;
+        shared.ask(None, None, region, local, kind)
     }
 
     /// Sends a new absolute position.
@@ -553,14 +644,15 @@ impl EdgeHandle {
     /// arrives unprompted — a region's game can despawn anything, and an entity
     /// can die between a caller reading its keys and sending the batch — so
     /// this is a race rather than a mistake, and `refused` counts mistakes.
-    pub fn move_entity(&self, entity: EntityKey, to: Pos3) -> Result<(), NetError> {
-        self.live()?.set_position(entity, to);
+    pub fn move_entity(&self, entity: EntityKey, to: WorldPos) -> Result<(), NetError> {
+        self.live()?.set_world_positions([(entity, to)]);
         Ok(())
     }
 
-    /// Several at once, however many regions the batch spans.
-    pub fn move_entities(&self, moves: &[(EntityKey, Pos3)]) -> Result<(), NetError> {
-        self.live()?.set_positions(moves.iter().copied());
+    /// Several at once, however many regions the batch spans. Each position is
+    /// translated into the frame of the region its entity is in.
+    pub fn move_entities(&self, moves: &[(EntityKey, WorldPos)]) -> Result<(), NetError> {
+        self.live()?.set_world_positions(moves.iter().copied());
         Ok(())
     }
 
@@ -690,30 +782,22 @@ pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence
                     return;
                 };
                 held.id = Some(entity);
-                let out = (
-                    held.client,
-                    held.handle,
-                    held.pending.take(),
-                    held.replaces.take(),
-                );
+                let out =
+                    (held.client, held.handle, held.pending.take(), held.replaces.take());
                 entities.by_id.insert((region, entity), key);
                 out
             };
 
             if let Some(old_key) = replaces {
-                complete_teleport(
-                    shared, key, entity, region, client, pending, old_key,
-                );
+                complete_teleport(shared, key, entity, region, client, pending, old_key);
             } else {
                 // Normal spawn, not a teleport.
                 if let Some(to) = pending {
                     shared.queue_move(region, entity, to);
                 }
                 if let (Some(client), Some(handle)) = (client, handle) {
-                    let _ = shared.post(
-                        client,
-                        ToClient::Spawned { handle, region, entity },
-                    );
+                    let _ =
+                        shared.post(client, ToClient::Spawned { handle, region, entity });
                 }
                 shared.with_game(|game| game.spawned(key, client, region, entity));
             }
@@ -796,11 +880,7 @@ fn complete_teleport(
 
     // Despawn the origin copy from its region.
     if let Some(old_id) = old_id {
-        shared
-            .moves
-            .lock()
-            .expect("not poisoned")
-            .remove(&(from_region, old_id));
+        shared.moves.lock().expect("not poisoned").remove(&(from_region, old_id));
         shared.tell_region(Outgoing::Despawn(from_region, old_id));
     }
 
@@ -818,8 +898,8 @@ fn complete_teleport(
     // Tell the client: Spawned first (so it has the new entity id), then
     // Teleported.
     if let (Some(client), Some(handle)) = (client, handle) {
-        let _ =
-            shared.post(client, ToClient::Spawned { handle, region: dest, entity: new_entity });
+        let _ = shared
+            .post(client, ToClient::Spawned { handle, region: dest, entity: new_entity });
         let _ = shared.post(client, ToClient::Teleported { handle, region: dest });
     }
 

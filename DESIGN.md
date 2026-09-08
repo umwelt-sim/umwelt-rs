@@ -2774,6 +2774,25 @@ Monotone and close to linear in the cap, which it was not before the fix. The
 cap is a dial between cost and how many entities a client can see. Every row
 from 256 up is over a tick on one thread; at eight the default cap is 27%.
 
+Rerun 2026-09-07 at `50b1501`, one thread, after sub-cell subdivision, the
+distance-ordered ghost set and the refresh timer:
+
+| ghost cap | tick | of a tick | per viewer | records sent |
+|---|---|---|---|---|
+| 64 | 18.77 ms | 38% | 2.29 µs | 64.0 |
+| 128 | 36.21 ms | 72% | 4.42 µs | 84.0 |
+| 256 | 69.08 ms | 138% | 8.43 µs | 84.0 |
+| 512 | 136.32 ms | 273% | 16.64 µs | 84.0 |
+| 1,024 | 261.08 ms | 522% | 31.87 µs | 84.0 |
+
+Records per packet fell from 98 to 84 when the record grew from 12 to 14
+bytes for the game tag (`docs/adr/0009`). The cap-256 row rose from 54.1 ms
+in three steps, measured by rebuilding this bench at each commit: 56.3 ms
+after sub-cells (`2d7e9e9`), 63.7 ms after choosing the ghost set by distance
+(`a4e6a4d`), and 69.9 ms after the five commits ending in the refresh timer
+(`1f862b6`). Which of those five moved it is not measured. At a ghost cap of
+256 the walk cap sweep now reads 256/512/1,024 = 68.8/90.5/106.5 ms.
+
 The cap of 64 is the one row that got *cheaper* than its pre-assembly figure,
 and the records column says why: it fills only 64 of the 98 slots a packet
 holds, so it encodes a third fewer records than any row below it. That is the

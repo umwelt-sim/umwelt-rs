@@ -12,7 +12,9 @@
 
 use crate::codec::RecordCodec;
 use crate::entity::EntityId;
-use crate::pos::Pos3;
+use crate::fixed::Fixed;
+use crate::map::Placement;
+use crate::pos::{Pos3, WorldPos};
 
 /// Bytes a despawn occupies: just [`EntityId`]. A client already
 /// holds the position it is being told to forget.
@@ -174,6 +176,11 @@ pub struct TickObservation<'a> {
     codec: &'a RecordCodec,
     header: PacketHeader,
     body: &'a [u8],
+    /// The region's square on the world map, or `None` for a region off the
+    /// map, whose world frame is its own.
+    placement: Option<Placement>,
+    /// The region size every placed region shares. Unused when unplaced.
+    region_size: Fixed,
 }
 
 impl<'a> TickObservation<'a> {
@@ -185,6 +192,18 @@ impl<'a> TickObservation<'a> {
         codec: &'a RecordCodec,
         buf: &'a [u8],
     ) -> Option<TickObservation<'a>> {
+        TickObservation::in_frame(codec, buf, None, Fixed::ZERO)
+    }
+
+    /// As [`new`](Self::new), reading positions into the world frame of a
+    /// placed region. `None` for the placement is a region off the map, whose
+    /// world positions are its local ones.
+    pub(crate) fn in_frame(
+        codec: &'a RecordCodec,
+        buf: &'a [u8],
+        placement: Option<Placement>,
+        region_size: Fixed,
+    ) -> Option<TickObservation<'a>> {
         let header = PacketHeader::decode(buf)?;
         let want = PacketHeader::BYTES
             + header.despawns as usize * DESPAWN_BYTES
@@ -192,7 +211,22 @@ impl<'a> TickObservation<'a> {
         if buf.len() < want {
             return None;
         }
-        Some(TickObservation { codec, header, body: &buf[PacketHeader::BYTES..want] })
+        Some(TickObservation {
+            codec,
+            header,
+            body: &buf[PacketHeader::BYTES..want],
+            placement,
+            region_size,
+        })
+    }
+
+    /// A region-local position in this observation's world frame.
+    #[inline]
+    fn world(&self, at: Pos3) -> WorldPos {
+        match self.placement {
+            Some(square) => WorldPos::from_local(at, square, self.region_size),
+            None => WorldPos::from_unplaced(at),
+        }
     }
 
     /// Which tick this observation was built from.
@@ -228,11 +262,17 @@ impl<'a> TickObservation<'a> {
 
     /// Positions and tags the client should adopt. An entity it does not hold
     /// is one it is being told about for the first time.
-    pub fn updates(&self) -> impl Iterator<Item = (EntityId, Pos3, u16)> + '_ {
+    ///
+    /// Positions are in world coordinates: the region's local position on
+    /// the wire, rebuilt with the frame the edge sent for that region. A
+    /// region off the map is its own frame, so its positions read unchanged.
+    pub fn updates(&self) -> impl Iterator<Item = (EntityId, WorldPos, u16)> + '_ {
         let base = self.header.despawns as usize * DESPAWN_BYTES;
         let stride = self.codec.record_bytes();
         (0..self.header.updates as usize).map(move |k| {
-            self.codec.decode(&self.body[base + k * stride..]).expect("sized")
+            let (id, at, tag) =
+                self.codec.decode(&self.body[base + k * stride..]).expect("sized");
+            (id, self.world(at), tag)
         })
     }
 }
@@ -306,7 +346,11 @@ mod tests {
         assert_eq!(r.header().despawns, 2);
         assert_eq!(r.header().updates, 3);
         assert_eq!(r.despawns().collect::<Vec<_>>(), gone);
-        assert_eq!(r.updates().collect::<Vec<_>>(), moved);
+        let unplaced: Vec<_> = moved
+            .iter()
+            .map(|&(id, at, tag)| (id, WorldPos::from_unplaced(at), tag))
+            .collect();
+        assert_eq!(r.updates().collect::<Vec<_>>(), unplaced);
     }
 
     #[test]
@@ -325,8 +369,9 @@ mod tests {
         let c = codec();
         let mut w = PacketWriter::new(c, 1200);
         let gone: Vec<EntityId> = (0..5).map(id).collect();
-        let moved: Vec<(EntityId, Pos3, u16)> =
-            (0..30).map(|k| (id(100 + k), Pos3::from_meters(k as i32, 0, 0), 0)).collect();
+        let moved: Vec<(EntityId, Pos3, u16)> = (0..30)
+            .map(|k| (id(100 + k), Pos3::from_meters(k as i32, 0, 0), 0))
+            .collect();
         // 16 header + 5 × 4 despawns + 30 × 14 records = 16 + 20 + 420 = 456
         assert_eq!(w.build(1, 1, &gone, moved).len(), 16 + 5 * 4 + 30 * 14);
     }

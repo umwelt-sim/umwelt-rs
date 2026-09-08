@@ -10,15 +10,11 @@ jobs:
     runs-on: ubuntu-latest
 
     # The integration tests under tests/ talk to a real broker. They read
-    # NATS_URL and fall back to this address, which is where the service
-    # container below is published.
-    services:
-      nats:
-        image: nats:2
-        ports:
-          - 4222:4222
-
+    # NATS_URL and fall back to 127.0.0.1:4222, which is where the container
+    # below listens. Started as a step rather than a service so it can be given
+    # -js: the world map lives in a JetStream key-value bucket.
     steps:
       - uses: actions/checkout@v7
+      - run: docker run -d --name nats -p 4222:4222 nats:2 -js
       - run: rustup update stable && rustup default stable
       - run: cargo test --locked

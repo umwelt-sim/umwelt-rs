@@ -17,11 +17,11 @@
 //! message it is either way.
 
 use crate::entity::{EntityId, EntityKind};
-use crate::fixed::Fixed;
 use crate::id::{EntityHandle, RegionId};
+use crate::map::Placement;
 use crate::net::error::NetError;
 use crate::net::wire::Cursor;
-use crate::pos::Pos3;
+use crate::pos::WorldPos;
 
 /// One kind space across both directions, so a message is never ambiguous
 /// about which way it was meant to travel. Not public: a consumer reads
@@ -40,6 +40,8 @@ pub(crate) const KIND_TELEPORT: u8 = 10;
 pub(crate) const KIND_TELEPORTED: u8 = 11;
 pub(crate) const KIND_TELEPORT_FAILED: u8 = 12;
 pub(crate) const KIND_ENTITY_MESSAGE: u8 = 13;
+pub(crate) const KIND_TELEPORT_INTO: u8 = 14;
+pub(crate) const KIND_SPAWN_INTO: u8 = 15;
 
 /// Names a kind for an error message, without echoing the peer's bytes.
 ///
@@ -60,6 +62,8 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
         KIND_TELEPORTED => "teleported",
         KIND_TELEPORT_FAILED => "teleport failed",
         KIND_ENTITY_MESSAGE => "entity message",
+        KIND_TELEPORT_INTO => "teleport into",
+        KIND_SPAWN_INTO => "spawn into",
         _ => "unknown",
     }
 }
@@ -71,10 +75,11 @@ pub(crate) fn kind_name(kind: u8) -> &'static str {
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Bytes a position occupies: three raw [`Fixed`] axes, as on the region wire.
-const POS_BYTES: usize = 12;
+/// A `WorldPos` on this wire: three little-endian `i64`.
+const WORLD_BYTES: usize = 24;
 
 /// Bytes one move in a batch takes: a handle and a position.
-pub(crate) const MOVE_BYTES: usize = 4 + POS_BYTES;
+pub(crate) const MOVE_BYTES: usize = 4 + WORLD_BYTES;
 
 /// Bytes a batch spends before its first move: the kind byte and the count.
 pub(crate) const MOVES_HEADER_BYTES: usize = 5;
@@ -104,11 +109,16 @@ pub struct EdgeInfo {
     pub region_size_m: i32,
     /// Its vertical extent, in meters.
     pub vertical_extent_m: i32,
+    /// Where the region sits on the world map, or `None` for a region off
+    /// the map, whose world frame is its own (`docs/adr/0010`). This is the
+    /// frame the client rebuilds world positions with.
+    pub placement: Option<Placement>,
 }
 
 impl EdgeInfo {
-    /// Its width on the wire.
-    pub const BYTES: usize = 12;
+    /// Its width on the wire: the three fields, a flag byte, and a placement
+    /// written whether or not the flag is set.
+    pub const BYTES: usize = 21;
 }
 
 /// What a game client sends its edge.
@@ -128,10 +138,22 @@ pub enum FromClient {
     Spawn {
         /// This connection's name for it from here on.
         handle: EntityHandle,
-        /// Where the game decided this client belongs.
+        /// Where to put it, in world coordinates. The edge finds the region
+        /// on the map; a position no placed region covers is refused.
+        position: WorldPos,
+        /// What is behind it.
+        kind: EntityKind,
+    },
+    /// Asks for an entity in a named region, which is the one way to start
+    /// in a region off the map. `position` is in that region's frame: the
+    /// map's if it is placed, its own if not.
+    SpawnInto {
+        /// This connection's name for it from here on.
+        handle: EntityHandle,
+        /// The region to start in.
         region: RegionId,
-        /// Where to put it.
-        position: Pos3,
+        /// Where to put it, in the region's frame.
+        position: WorldPos,
         /// What is behind it.
         kind: EntityKind,
     },
@@ -139,12 +161,12 @@ pub enum FromClient {
     Move {
         /// Which entity.
         handle: EntityHandle,
-        /// Where it is now.
-        position: Pos3,
+        /// Where it is now, in world coordinates.
+        position: WorldPos,
     },
     /// Several new positions at once, which is what a client with more than a
     /// handful of entities sends. Latest-only, so this rides a datagram too.
-    Moves(Vec<(EntityHandle, Pos3)>),
+    Moves(Vec<(EntityHandle, WorldPos)>),
     /// Gives an entity back.
     Despawn {
         /// Which entity.
@@ -164,16 +186,26 @@ pub enum FromClient {
         /// The game's own bytes.
         body: Vec<u8>,
     },
-    /// Asks the edge to teleport an entity to another region. The handle stays
-    /// valid throughout — moves sent during the transition are held at the edge
-    /// and forwarded when the destination confirms.
+    /// Asks the edge to teleport an entity to a world position, which the edge
+    /// resolves through the map. The handle stays valid throughout: moves sent
+    /// during the transition are held at the edge and forwarded when the
+    /// destination confirms.
     Teleport {
+        /// Which entity.
+        handle: EntityHandle,
+        /// Where to put it, in world coordinates.
+        at: WorldPos,
+    },
+    /// Asks the edge to teleport an entity into a named region, which is the
+    /// one door into a region off the map. `at` is in that region's frame:
+    /// the map's if it is placed, its own if not.
+    TeleportInto {
         /// Which entity.
         handle: EntityHandle,
         /// The destination region.
         region: RegionId,
-        /// Where to put it in the destination.
-        position: Pos3,
+        /// Where to put it, in the destination's frame.
+        at: WorldPos,
     },
 }
 
@@ -189,24 +221,30 @@ impl FromClient {
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
         match self {
-            FromClient::Spawn { handle, region, position, kind } => {
+            FromClient::Spawn { handle, position, kind } => {
                 out.push(KIND_SPAWN);
                 out.extend_from_slice(&handle.raw().to_le_bytes());
+                put_world(*position, out);
+                kind.encode_wire(out);
+            }
+            FromClient::SpawnInto { handle, region, position, kind } => {
+                out.push(KIND_SPAWN_INTO);
+                out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(&region.raw().to_le_bytes());
-                put_pos(*position, out);
+                put_world(*position, out);
                 kind.encode_wire(out);
             }
             FromClient::Move { handle, position } => {
                 out.push(KIND_MOVE);
                 out.extend_from_slice(&handle.raw().to_le_bytes());
-                put_pos(*position, out);
+                put_world(*position, out);
             }
             FromClient::Moves(moves) => {
                 out.push(KIND_MOVES);
                 out.extend_from_slice(&(moves.len() as u32).to_le_bytes());
                 for (handle, position) in moves {
                     out.extend_from_slice(&handle.raw().to_le_bytes());
-                    put_pos(*position, out);
+                    put_world(*position, out);
                 }
             }
             FromClient::Despawn { handle } => {
@@ -222,11 +260,16 @@ impl FromClient {
                 out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(body);
             }
-            FromClient::Teleport { handle, region, position } => {
+            FromClient::Teleport { handle, at } => {
                 out.push(KIND_TELEPORT);
                 out.extend_from_slice(&handle.raw().to_le_bytes());
+                put_world(*at, out);
+            }
+            FromClient::TeleportInto { handle, region, at } => {
+                out.push(KIND_TELEPORT_INTO);
+                out.extend_from_slice(&handle.raw().to_le_bytes());
                 out.extend_from_slice(&region.raw().to_le_bytes());
-                put_pos(*position, out);
+                put_world(*at, out);
             }
         }
     }
@@ -239,16 +282,24 @@ impl FromClient {
             KIND_SPAWN => {
                 let mut c = Cursor::new(body, "client spawn");
                 let handle = EntityHandle::from_raw(c.u32()?);
-                let region = RegionId::from_raw(c.u32()?);
-                let position = get_pos(&mut c)?;
+                let position = get_world(&mut c)?;
                 let kind = EntityKind::decode_wire(&mut c)?;
                 c.finish()?;
-                Ok(FromClient::Spawn { handle, region, position, kind })
+                Ok(FromClient::Spawn { handle, position, kind })
+            }
+            KIND_SPAWN_INTO => {
+                let mut c = Cursor::new(body, "client spawn into");
+                let handle = EntityHandle::from_raw(c.u32()?);
+                let region = RegionId::from_raw(c.u32()?);
+                let position = get_world(&mut c)?;
+                let kind = EntityKind::decode_wire(&mut c)?;
+                c.finish()?;
+                Ok(FromClient::SpawnInto { handle, region, position, kind })
             }
             KIND_MOVE => {
                 let mut c = Cursor::new(body, "client move");
                 let handle = EntityHandle::from_raw(c.u32()?);
-                let position = get_pos(&mut c)?;
+                let position = get_world(&mut c)?;
                 c.finish()?;
                 Ok(FromClient::Move { handle, position })
             }
@@ -262,7 +313,7 @@ impl FromClient {
                 }
                 let mut moves = Vec::with_capacity(count);
                 for _ in 0..count {
-                    moves.push((EntityHandle::from_raw(c.u32()?), get_pos(&mut c)?));
+                    moves.push((EntityHandle::from_raw(c.u32()?), get_world(&mut c)?));
                 }
                 c.finish()?;
                 Ok(FromClient::Moves(moves))
@@ -283,10 +334,17 @@ impl FromClient {
             KIND_TELEPORT => {
                 let mut c = Cursor::new(body, "client teleport");
                 let handle = EntityHandle::from_raw(c.u32()?);
-                let region = RegionId::from_raw(c.u32()?);
-                let position = get_pos(&mut c)?;
+                let at = get_world(&mut c)?;
                 c.finish()?;
-                Ok(FromClient::Teleport { handle, region, position })
+                Ok(FromClient::Teleport { handle, at })
+            }
+            KIND_TELEPORT_INTO => {
+                let mut c = Cursor::new(body, "client teleport into");
+                let handle = EntityHandle::from_raw(c.u32()?);
+                let region = RegionId::from_raw(c.u32()?);
+                let at = get_world(&mut c)?;
+                c.finish()?;
+                Ok(FromClient::TeleportInto { handle, region, at })
             }
             got => Err(NetError::Unexpected {
                 expected: "a client command",
@@ -379,6 +437,10 @@ impl ToClient<'_> {
                 out.extend_from_slice(&info.region.raw().to_le_bytes());
                 out.extend_from_slice(&info.region_size_m.to_le_bytes());
                 out.extend_from_slice(&info.vertical_extent_m.to_le_bytes());
+                let at = info.placement.unwrap_or(Placement::new(0, 0));
+                out.push(info.placement.is_some() as u8);
+                out.extend_from_slice(&at.col.to_le_bytes());
+                out.extend_from_slice(&at.row.to_le_bytes());
             }
             ToClient::Spawned { handle, region, entity } => {
                 out.push(KIND_SPAWNED);
@@ -422,11 +484,20 @@ impl ToClient<'_> {
                 let region = RegionId::from_raw(c.u32()?);
                 let region_size_m = c.i32()?;
                 let vertical_extent_m = c.i32()?;
+                let placed = c.u8()?;
+                let col = c.i32()?;
+                let row = c.i32()?;
                 c.finish()?;
+                let placement = match placed {
+                    0 => None,
+                    1 => Some(Placement::new(col, row)),
+                    _ => return Err(NetError::Malformed("region placement flag")),
+                };
                 Ok(ToClient::Region(EdgeInfo {
                     region,
                     region_size_m,
                     vertical_extent_m,
+                    placement,
                 }))
             }
             KIND_SPAWNED => {
@@ -476,19 +547,15 @@ impl ToClient<'_> {
     }
 }
 
-fn put_pos(pos: Pos3, out: &mut Vec<u8>) {
-    out.reserve(POS_BYTES);
-    out.extend_from_slice(&pos.x.raw().to_le_bytes());
-    out.extend_from_slice(&pos.y.raw().to_le_bytes());
-    out.extend_from_slice(&pos.z.raw().to_le_bytes());
+fn put_world(at: WorldPos, out: &mut Vec<u8>) {
+    out.reserve(WORLD_BYTES);
+    out.extend_from_slice(&at.x.to_le_bytes());
+    out.extend_from_slice(&at.y.to_le_bytes());
+    out.extend_from_slice(&at.z.to_le_bytes());
 }
 
-fn get_pos(c: &mut Cursor<'_>) -> Result<Pos3, NetError> {
-    Ok(Pos3::new(
-        Fixed::from_raw(c.i32()?),
-        Fixed::from_raw(c.i32()?),
-        Fixed::from_raw(c.i32()?),
-    ))
+fn get_world(c: &mut Cursor<'_>) -> Result<WorldPos, NetError> {
+    Ok(WorldPos::from_raw(c.i64()?, c.i64()?, c.i64()?))
 }
 
 /// Reads length-prefixed messages off a QUIC stream.
@@ -570,23 +637,27 @@ mod tests {
         EntityHandle::from_raw(raw)
     }
 
-    fn pos() -> Pos3 {
-        Pos3::from_meters(100, 200, 5)
+    fn pos() -> WorldPos {
+        WorldPos::from_meters(-100, 200_000, 5)
     }
 
     fn up() -> Vec<FromClient> {
         vec![
             FromClient::Spawn {
                 handle: h(7),
-                region: RegionId::from_raw(9),
                 position: pos(),
                 kind: EntityKind::observer(0),
             },
             FromClient::Spawn {
                 handle: h(0),
+                position: WorldPos::from_raw(i64::MIN, i64::MAX, 0),
+                kind: EntityKind::unattended(0),
+            },
+            FromClient::SpawnInto {
+                handle: h(8),
                 region: RegionId::from_raw(4_000_000_000),
                 position: pos(),
-                kind: EntityKind::unattended(0),
+                kind: EntityKind::observer(3),
             },
             FromClient::Move { handle: h(9), position: pos() },
             FromClient::Moves(vec![(h(1), pos()), (h(2), pos()), (h(3), pos())]),
@@ -594,15 +665,13 @@ mod tests {
             FromClient::Despawn { handle: h(4_000_000_000) },
             FromClient::Message(b"the game's own".to_vec()),
             FromClient::Message(Vec::new()),
-            FromClient::EntityMessage {
-                handle: h(3),
-                body: b"plant lettuce".to_vec(),
-            },
+            FromClient::EntityMessage { handle: h(3), body: b"plant lettuce".to_vec() },
             FromClient::EntityMessage { handle: h(3), body: Vec::new() },
-            FromClient::Teleport {
+            FromClient::Teleport { handle: h(5), at: pos() },
+            FromClient::TeleportInto {
                 handle: h(5),
                 region: RegionId::from_raw(42),
-                position: pos(),
+                at: pos(),
             },
         ]
     }
@@ -613,6 +682,13 @@ mod tests {
                 region: RegionId::from_raw(9),
                 region_size_m: 4096,
                 vertical_extent_m: 1024,
+                placement: Some(Placement::new(-3, 7)),
+            }),
+            ToClient::Region(EdgeInfo {
+                region: RegionId::from_raw(10),
+                region_size_m: 4096,
+                vertical_extent_m: 1024,
+                placement: None,
             }),
             ToClient::Spawned {
                 handle: h(7),
@@ -623,14 +699,8 @@ mod tests {
             ToClient::State { handle: h(7), packet: b"a packet" },
             ToClient::State { handle: h(7), packet: b"" },
             ToClient::Message(b"the game's own"),
-            ToClient::Teleported {
-                handle: h(5),
-                region: RegionId::from_raw(42),
-            },
-            ToClient::TeleportFailed {
-                handle: h(5),
-                region: RegionId::from_raw(42),
-            },
+            ToClient::Teleported { handle: h(5), region: RegionId::from_raw(42) },
+            ToClient::TeleportFailed { handle: h(5), region: RegionId::from_raw(42) },
         ]
     }
 
@@ -691,7 +761,7 @@ mod tests {
         // 1,093 bytes together against 1,156 apart, but one datagram against
         // sixty-eight, each of which would carry its own UDP and QUIC headers
         // and cost a send.
-        let batch: Vec<(EntityHandle, Pos3)> =
+        let batch: Vec<(EntityHandle, WorldPos)> =
             (0..MAX_MOVES_PER_DATAGRAM as u32).map(|n| (h(n), pos())).collect();
         let mut framed = Vec::new();
         FromClient::Moves(batch.clone()).encode(&mut framed);
@@ -720,15 +790,26 @@ mod tests {
     fn the_wire_sizes_are_what_they_look_like() {
         let mut buf = Vec::new();
         FromClient::Move { handle: h(1), position: pos() }.encode(&mut buf);
-        assert_eq!(buf.len(), 1 + 4 + POS_BYTES, "kind, handle, position");
+        assert_eq!(buf.len(), 1 + 4 + WORLD_BYTES, "kind, handle, world position");
         FromClient::Spawn {
             handle: h(1),
-            region: RegionId::from_raw(1),
             position: pos(),
             kind: EntityKind::observer(0),
         }
         .encode(&mut buf);
-        assert_eq!(buf.len(), 1 + 4 + 4 + POS_BYTES + 3, "a region and a 3-byte kind");
+        assert_eq!(
+            buf.len(),
+            1 + 4 + WORLD_BYTES + 3,
+            "a world position and a 3-byte kind"
+        );
+        ToClient::Region(EdgeInfo {
+            region: RegionId::from_raw(1),
+            region_size_m: 4096,
+            vertical_extent_m: 1024,
+            placement: None,
+        })
+        .encode(&mut buf);
+        assert_eq!(buf.len(), 1 + EdgeInfo::BYTES, "a region's frame is fixed width");
         FromClient::Despawn { handle: h(1) }.encode(&mut buf);
         assert_eq!(buf.len(), 1 + 4);
     }

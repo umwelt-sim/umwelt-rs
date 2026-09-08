@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use crate::entity::EntityId;
 use crate::id::{ClientId, EntityHandle, EntityKey, RegionId};
 use crate::packet::TickObservation;
-use crate::pos::Pos3;
+use crate::pos::WorldPos;
 use crate::sim::Step;
 
 /// What the edge's game decides when a client asks to teleport.
@@ -187,7 +187,7 @@ pub trait EdgeGame: Send + 'static {
         client: ClientId,
         from: RegionId,
         to: RegionId,
-        at: Pos3,
+        at: WorldPos,
     ) -> TeleportDecision {
         TeleportDecision::Allow
     }

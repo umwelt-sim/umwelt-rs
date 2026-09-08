@@ -233,8 +233,8 @@ via QUIC, and create your `ClientHandle`.
 
 ```rust,no_run
 use umwelt::{
-    ClientGame, ClientHandle, EdgeClient, EntityHandle, EntityId, EntityKind, TickObservation, Pos3,
-    RegionId,
+    ClientGame, ClientHandle, EdgeClient, EntityHandle, EntityId, EntityKind, TickObservation,
+    RegionId, WorldPos,
 };
 
 /// The player's side, called when the edge has something to say.
@@ -281,15 +281,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sending = client.handle();
 
     // Usable at once: a move sent under this handle is held at the edge until
-    // the region answers with an id.
+    // the region answers with an id. The position is in world coordinates;
+    // the edge's map says which region that is.
     let farmer = sending.spawn(
-        RegionId::from_raw(7),
-        Pos3::from_meters(2048, 2048, 0),
+        WorldPos::from_meters(2048, 2048, 0),
         // An observer can see things; the tag identifies what this entity is
         // to the game client (a farmer, a pet, a projectile).
         EntityKind::observer(0),
     )?;
-    sending.move_entity(farmer, Pos3::from_meters(2049, 2048, 0))?;
+    sending.move_entity(farmer, WorldPos::from_meters(2049, 2048, 0))?;
     Ok(())
 }
 ```

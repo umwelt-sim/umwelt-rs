@@ -18,7 +18,7 @@ use umwelt::internals::edge::FromClient;
 use umwelt::net::{EdgeSink, Edges, Inbound};
 use umwelt::{ClientGame, ClientHandle, ClientLimits, EdgeClient, EdgeServer};
 use umwelt::{EntityHandle, EntityId, EntityKind, Flow, Game, Handoff, Overrun};
-use umwelt::{Pacing, Pos3, RegionId, RegionServer, Step, TickObservation, Wait};
+use umwelt::{Pacing, RegionId, RegionServer, Step, TickObservation, Wait, WorldPos};
 use umwelt::{WorldConfig, WorldSimulation};
 
 /// Entities the client asks for. Small: this is a wiring test, not a load one.
@@ -104,7 +104,7 @@ impl ClientGame for Watcher {
         // with. A packet reaching this client is one built for an avatar it
         // owns, and an avatar always sees itself.
         for (_, pos, _) in observation.updates() {
-            if pos.x.floor_meters() > 200 {
+            if pos.floor_meters().0 > 200 {
                 self.confirmed.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -112,8 +112,8 @@ impl ClientGame for Watcher {
 }
 
 /// Where one entity starts. A column, so they are all in view of each other.
-fn home(n: usize) -> Pos3 {
-    Pos3::from_meters(200, 200 + n as i32, 0)
+fn home(n: usize) -> WorldPos {
+    WorldPos::from_meters(200, 200 + n as i64, 0)
 }
 
 /// Waits, and stops everything before failing.
@@ -341,7 +341,7 @@ fn a_game_client_populates_a_region_through_an_edge() {
         let handles: Vec<EntityHandle> = (0..WANTED)
             .map(|n| {
                 sending
-                    .spawn(region, home(n), EntityKind::observer(0))
+                    .spawn_into(region, home(n), EntityKind::observer(0))
                     .expect("asks for an entity")
             })
             .collect();
@@ -368,17 +368,12 @@ fn a_game_client_populates_a_region_through_an_edge() {
                 let mut at = 0i32;
                 while !stop.load(Ordering::Relaxed) {
                     at = (at + 1) % 64;
-                    let moves: Vec<(EntityHandle, Pos3)> = handles
+                    let moves: Vec<(EntityHandle, WorldPos)> = handles
                         .iter()
                         .enumerate()
                         .map(|(n, handle)| {
-                            let base = home(n);
-                            let to = Pos3::from_meters(
-                                base.x.floor_meters() + at,
-                                base.y.floor_meters(),
-                                0,
-                            );
-                            (*handle, to)
+                            let (bx, by, _) = home(n).floor_meters();
+                            (*handle, WorldPos::from_meters(bx + at as i64, by, 0))
                         })
                         .collect();
                     let _ = sending.move_entities(&moves);

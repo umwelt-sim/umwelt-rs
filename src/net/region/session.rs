@@ -46,9 +46,9 @@ use crate::net::control::RegionLoad;
 use crate::net::error::NetError;
 use crate::net::region::edges::{EdgeId, EdgeStats, Edges};
 use crate::net::region::protocol::{
-    DespawnEntities, GameMessage, KIND_DESPAWN_ENTITIES, KIND_GAME_MESSAGE, KIND_KEEPALIVE,
-    KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MoveEntities, Presence, Spawn, SpawnEntities,
-    kind_name,
+    DespawnEntities, GameMessage, KIND_DESPAWN_ENTITIES, KIND_GAME_MESSAGE,
+    KIND_KEEPALIVE, KIND_MOVE_ENTITIES, KIND_SPAWN_ENTITIES, MoveEntities, Presence,
+    Spawn, SpawnEntities, kind_name,
 };
 use crate::net::region::subjects;
 use crate::pos::Pos3;
@@ -95,6 +95,9 @@ pub struct Settled {
     pub unregistered: u32,
     /// Presence messages published, additions and removals together.
     pub reported: u32,
+    /// Boundary and view collisions published to the edges that own the
+    /// entities. A region-owned entity has no edge to tell.
+    pub collisions: u32,
 }
 
 /// What a region has been doing, between heartbeats.
@@ -234,7 +237,9 @@ impl Inbound {
             KIND_GAME_MESSAGE => {
                 match GameMessage::decode(body) {
                     Ok(m) => {
-                        self.messages.lock().expect("not poisoned")
+                        self.messages
+                            .lock()
+                            .expect("not poisoned")
                             .push((edge, m.entity, m.body));
                         self.received.fetch_add(1, Ordering::Relaxed);
                         if let Some(stats) = self.edges.stats(edge) {
@@ -303,9 +308,10 @@ impl Inbound {
             }
         }
 
-        // Positions are written last: `positions_mut` borrows the whole `Step`,
-        // so nothing else on it is reachable while the slices are held.
-        let mut writes: Vec<(usize, Pos3)> = Vec::new();
+        // Moves are applied after everything else in the batch, through
+        // `move_to`, which is what clamps one aimed outside the box and reports
+        // the collision to whichever edge owns the entity.
+        let mut writes: Vec<(EntityId, Pos3)> = Vec::new();
 
         for command in commands {
             match command {
@@ -345,24 +351,18 @@ impl Inbound {
                 Command::Move { edge, moves } => {
                     let stats = self.edges.stats(edge);
                     for (id, pos) in moves {
-                        if self.edges.edge_for(id) != Some(edge)
-                            || !cfg.contains(pos)
-                            || !step.contains(id)
-                        {
+                        if self.edges.edge_for(id) != Some(edge) || !step.contains(id) {
                             refuse(&mut out, &stats);
                             continue;
                         }
-                        writes.push((id.index(), pos));
+                        writes.push((id, pos));
                     }
                 }
             }
         }
 
-        let (xs, ys, zs, _) = step.positions_mut();
-        for (at, pos) in writes {
-            xs[at] = pos.x;
-            ys[at] = pos.y;
-            zs[at] = pos.z;
+        for (id, pos) in writes {
+            step.move_to(id, pos);
             out.moved += 1;
         }
 
@@ -407,6 +407,36 @@ impl Inbound {
             let Some(edge) = self.edges.edge_for(id) else { continue };
             self.edges.release(id);
             self.retire(sim, sink, Some(edge), id, &mut out);
+        }
+
+        // Something reached the box. The region says so to the edge that owns
+        // the entity and nothing more: what is beyond the box, and whether the
+        // entity should go there, is that edge's (`docs/adr/0010`). An entity
+        // with no edge has nobody to tell.
+        for &(id, target) in sim.boundary_collisions() {
+            if let Some(edge) = self.edges.edge_for(id)
+                && sink
+                    .presence(edge, Presence::BoundaryCollision { entity: id, target })
+                    .is_ok()
+            {
+                out.collisions += 1;
+            }
+        }
+        for &(id, position) in sim.view_collisions() {
+            if let Some(edge) = self.edges.edge_for(id)
+                && sink
+                    .presence(edge, Presence::ViewCollision { entity: id, position })
+                    .is_ok()
+            {
+                out.collisions += 1;
+            }
+        }
+        for &id in sim.view_cleared() {
+            if let Some(edge) = self.edges.edge_for(id)
+                && sink.presence(edge, Presence::ViewCleared { entity: id }).is_ok()
+            {
+                out.collisions += 1;
+            }
         }
 
         for (edge, id, kind, token) in fresh {

@@ -114,6 +114,10 @@ pub(crate) struct Viewer {
     pub pending_despawns: Vec<EntityId>,
     pub sequence: u16,
     pub send_period: u8,
+    /// Whether its subscription box was clipped to the region when it was
+    /// last rebuilt, which is its view reaching the box. Decided only on a
+    /// cell change, since only a cell change can change it.
+    pub at_boundary: bool,
     /// Whether it is being served. A slot that is not is free for reuse.
     pub registered: bool,
 }
@@ -127,6 +131,7 @@ impl Viewer {
     ) {
         self.avatar = avatar;
         self.sub = None;
+        self.at_boundary = false;
         self.ghosts.clear();
         self.pending_despawns.clear();
         self.sequence = 0;

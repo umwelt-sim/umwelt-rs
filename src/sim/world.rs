@@ -101,6 +101,12 @@ pub struct Step<'a> {
     /// game performs is otherwise invisible to anything outside the game, and
     /// something has to tell the edge that owned it.
     despawned: &'a mut Vec<EntityId>,
+    /// Whether each slot's entity stands against the box. Set by a move that
+    /// was clamped to it and cleared by one that lands inside, so a game that
+    /// keeps walking an entity into a wall reports one collision.
+    at_wall: &'a mut Vec<bool>,
+    /// Boundary collisions this tick: the entity, and the position it wanted.
+    collisions: &'a mut Vec<(EntityId, Pos3)>,
     cfg: &'a WorldConfig,
     tick: u32,
 }
@@ -162,15 +168,33 @@ impl Step<'_> {
     }
 
     /// Moves an entity. An id that is not alive is ignored.
+    ///
+    /// A target outside the box is clamped to it, and the collision is
+    /// reported through
+    /// [`boundary_collisions`](WorldSimulation::boundary_collisions) with the
+    /// target as asked. It is reported once, and again only after a later move
+    /// has put the entity back inside. The region does not know what is beyond
+    /// its box; the edge that owns the entity does (`docs/adr/0010`).
     pub fn move_to(&mut self, id: EntityId, pos: Pos3) {
-        debug_assert!(self.cfg.contains(pos), "moved outside the region to {pos:?}");
         if !self.live.contains(id) {
             return;
         }
         let at = id.index();
-        self.xs[at] = pos.x;
-        self.ys[at] = pos.y;
-        self.zs[at] = pos.z;
+        if self.cfg.contains(pos) {
+            self.at_wall[at] = false;
+            self.xs[at] = pos.x;
+            self.ys[at] = pos.y;
+            self.zs[at] = pos.z;
+            return;
+        }
+        let inside = self.cfg.clamp(pos);
+        self.xs[at] = inside.x;
+        self.ys[at] = inside.y;
+        self.zs[at] = inside.z;
+        if !self.at_wall[at] {
+            self.at_wall[at] = true;
+            self.collisions.push((id, pos));
+        }
     }
 
     /// Offsets an entity, saturating at the bounds of [`Fixed`] on each axis.
@@ -220,6 +244,7 @@ impl Step<'_> {
         self.ys.push(pos.y);
         self.zs.push(pos.z);
         self.tags.push(tag);
+        self.at_wall.push(false);
         self.live.insert(id);
         id
     }
@@ -337,6 +362,10 @@ struct Scratch {
     writer: PacketWriter,
     /// Despawns drained from a viewer's queue for this packet.
     despawns: Vec<EntityId>,
+    /// Viewers whose view reached the box this tick, and where they stood.
+    view_collisions: Vec<(EntityId, Pos3)>,
+    /// Viewers whose view stopped reaching the box this tick.
+    view_cleared: Vec<EntityId>,
     stats: TickStats,
 }
 
@@ -378,11 +407,29 @@ fn serve<S: PayloadSink>(
         return false;
     }
 
-    let sub = Subscription::at_center(f.cfg, f.cfg.cell_of(at.horizontal()));
+    let center = f.cfg.cell_of(at.horizontal());
+    let sub = Subscription::at_center(f.cfg, center);
     // A box only moves when its viewer crosses a cell boundary, so this counts
     // crossings rather than motion.
     if v.sub != Some(sub) {
         w.stats.subs_changed += 1;
+        // Whether the box had to be clipped to the region, which is the view
+        // reaching the box. Decided only here, because only a cell change can
+        // change it: nothing runs for a viewer standing still, or one walking
+        // within a cell (`docs/adr/0010`).
+        let radius = f.cfg.cell_radius() as i32;
+        let last = f.cfg.cells_per_axis() as i32 - 1;
+        let (cx, cy) = (center.x as i32, center.y as i32);
+        let at_boundary = cx - radius < 0
+            || cx + radius > last
+            || cy - radius < 0
+            || cy + radius > last;
+        if at_boundary {
+            w.view_collisions.push((avatar, at));
+        } else if v.at_boundary {
+            w.view_cleared.push(avatar);
+        }
+        v.at_boundary = at_boundary;
     }
     v.sub = Some(sub);
 
@@ -399,7 +446,7 @@ fn serve<S: PayloadSink>(
     w.despawns.extend(v.pending_despawns.drain(..taking));
     let slots = state.saturating_sub(taking * DESPAWN_BYTES) / v.budget.record_bytes();
 
-    let Scratch { found, selection, writer, despawns, stats } = w;
+    let Scratch { found, selection, writer, despawns, stats, .. } = w;
     select(f.tick, found, f.odo, f.policy, slots, &mut v.ghosts, selection);
 
     v.sequence = v.sequence.wrapping_add(1);
@@ -567,6 +614,14 @@ pub struct WorldSimulation<G: Game, S: PayloadSink = NullSink> {
     live: LiveSet,
     /// Cleared at the start of every tick and filled by [`Step::despawn`].
     despawned: Vec<EntityId>,
+    /// See [`Step`]'s field of the same name.
+    at_wall: Vec<bool>,
+    /// Boundary collisions during the last tick.
+    collisions: Vec<(EntityId, Pos3)>,
+    /// Viewers whose view reached the box during the last tick.
+    view_collisions: Vec<(EntityId, Pos3)>,
+    /// Viewers whose view stopped reaching the box during the last tick.
+    view_cleared: Vec<EntityId>,
 
     odo: Odometer,
     snap: CellSnapshot,
@@ -628,6 +683,10 @@ impl<G: Game> WorldSimulation<G, NullSink> {
             prev_tags: Vec::new(),
             live: LiveSet::new(),
             despawned: Vec::new(),
+            at_wall: Vec::new(),
+            collisions: Vec::new(),
+            view_collisions: Vec::new(),
+            view_cleared: Vec::new(),
             odo: Odometer::new(),
             snap,
             viewers: Vec::new(),
@@ -667,6 +726,10 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             prev_tags: self.prev_tags,
             live: self.live,
             despawned: self.despawned,
+            at_wall: self.at_wall,
+            collisions: self.collisions,
+            view_collisions: self.view_collisions,
+            view_cleared: self.view_cleared,
             odo: self.odo,
             snap: self.snap,
             viewers: self.viewers,
@@ -715,6 +778,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             selection: Selection::with_capacity(ghosts),
             writer: PacketWriter::new(codec, payload),
             despawns: Vec::with_capacity(ghosts),
+            view_collisions: Vec::new(),
+            view_cleared: Vec::new(),
             stats: TickStats::default(),
         });
     }
@@ -770,6 +835,27 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
     #[inline]
     pub fn despawned(&self) -> &[EntityId] {
         &self.despawned
+    }
+
+    /// Entities a move tried to take outside the box during the last tick,
+    /// each with the position it wanted. Reported once per push, and again only
+    /// after the entity has been back inside. Which edge owns each is the
+    /// session's to look up, and what lies beyond the box is that edge's to
+    /// know (`docs/adr/0010`).
+    pub fn boundary_collisions(&self) -> &[(EntityId, Pos3)] {
+        &self.collisions
+    }
+
+    /// Viewers whose view reached the box during the last tick, each with its
+    /// avatar's position: on the cell change that brought the subscription
+    /// past the region, and on each cell change while it stays there.
+    pub fn view_collisions(&self) -> &[(EntityId, Pos3)] {
+        &self.view_collisions
+    }
+
+    /// Viewers whose view stopped reaching the box during the last tick.
+    pub fn view_cleared(&self) -> &[EntityId] {
+        &self.view_cleared
     }
 
     /// Entities currently alive.
@@ -886,6 +972,7 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             pending_despawns: Vec::new(),
             sequence: 0,
             send_period: limits.send_period.max(1),
+            at_boundary: false,
             registered: true,
         });
         id
@@ -927,6 +1014,9 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
 
         {
             self.despawned.clear();
+            self.collisions.clear();
+            self.view_collisions.clear();
+            self.view_cleared.clear();
             let mut step = Step {
                 xs: &mut self.xs,
                 ys: &mut self.ys,
@@ -934,6 +1024,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
                 tags: &mut self.tags,
                 live: &mut self.live,
                 despawned: &mut self.despawned,
+                at_wall: &mut self.at_wall,
+                collisions: &mut self.collisions,
                 cfg: &self.cfg,
                 tick: self.tick,
             };
@@ -976,6 +1068,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         let workers = &mut self.workers;
         for w in workers.iter_mut() {
             w.stats = TickStats::default();
+            w.view_collisions.clear();
+            w.view_cleared.clear();
         }
         if viewers.is_empty() {
             return TickStats::default();
@@ -989,6 +1083,8 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
             for (k, v) in viewers.iter_mut().enumerate() {
                 serve(&frame, ViewerId::from_raw(k as u32), v, w, on_viewer);
             }
+            self.view_collisions.append(&mut w.view_collisions);
+            self.view_cleared.append(&mut w.view_cleared);
             return w.stats;
         }
 
@@ -1024,8 +1120,10 @@ impl<G: Game, S: PayloadSink> WorldSimulation<G, S> {
         });
 
         let mut stats = TickStats::default();
-        for w in workers.iter() {
+        for w in workers.iter_mut() {
             stats.merge(w.stats);
+            self.view_collisions.append(&mut w.view_collisions);
+            self.view_cleared.append(&mut w.view_cleared);
         }
         stats
     }
@@ -1087,6 +1185,8 @@ mod tests {
             tags: &mut sim.tags,
             live: &mut sim.live,
             despawned: &mut sim.despawned,
+            at_wall: &mut sim.at_wall,
+            collisions: &mut sim.collisions,
             cfg: &sim.cfg,
             tick: 0,
         };
@@ -1320,6 +1420,8 @@ mod tests {
             tags: &mut s.tags,
             live: &mut s.live,
             despawned: &mut s.despawned,
+            at_wall: &mut s.at_wall,
+            collisions: &mut s.collisions,
             cfg: &s.cfg,
             tick: 0,
         };
@@ -1574,6 +1676,8 @@ mod tests {
                     tags: &mut s.tags,
                     live: &mut s.live,
                     despawned: &mut s.despawned,
+                    at_wall: &mut s.at_wall,
+                    collisions: &mut s.collisions,
                     cfg: &s.cfg,
                     tick: 0,
                 };
@@ -1716,6 +1820,8 @@ mod tests {
             tags: &mut sim.tags,
             live: &mut sim.live,
             despawned: &mut sim.despawned,
+            at_wall: &mut sim.at_wall,
+            collisions: &mut sim.collisions,
             cfg: &sim.cfg,
             tick: 0,
         }
@@ -1851,5 +1957,155 @@ mod tests {
         step.despawn(ids[3]);
         assert_eq!(step.entities().collect::<Vec<_>>(), vec![ids[0], ids[2], ids[4]]);
         assert_eq!(step.entity_count(), 3);
+    }
+
+    /// Spawns one entity on the first tick, then moves it to the next planned
+    /// target each tick through `move_to`, and stands still once the plan is
+    /// spent.
+    struct Plan {
+        start: Pos3,
+        targets: std::collections::VecDeque<Pos3>,
+        who: Option<EntityId>,
+    }
+
+    impl Plan {
+        fn new(start: Pos3, targets: &[Pos3]) -> Plan {
+            Plan { start, targets: targets.iter().copied().collect(), who: None }
+        }
+    }
+
+    impl Game for Plan {
+        fn step(&mut self, w: &mut Step<'_>) {
+            match self.who {
+                None => self.who = Some(w.spawn(self.start, 0)),
+                Some(id) => {
+                    if let Some(to) = self.targets.pop_front() {
+                        w.move_to(id, to);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_move_past_the_box_is_clamped_and_reported_once_per_push() {
+        let cfg = WorldConfig::default();
+        let size = cfg.region_size();
+        let beyond = Pos3::new(
+            Fixed::from_raw(size.raw() + Fixed::from_meters(1).raw()),
+            Fixed::from_meters(100),
+            Fixed::ZERO,
+        );
+        let inside = Pos3::from_meters(4000, 100, 0);
+        let mut s = WorldSimulation::new(
+            cfg,
+            Plan::new(inside, &[beyond, beyond, inside, beyond]),
+        );
+        s.tick();
+        let id = s.game().who.expect("spawned");
+        assert!(s.boundary_collisions().is_empty(), "a spawn inside is no collision");
+
+        s.tick();
+        assert_eq!(
+            s.boundary_collisions(),
+            &[(id, beyond)],
+            "reported with the target as asked"
+        );
+        let at = s.position(id).expect("alive");
+        assert_eq!(at.x.raw(), size.raw() - 1, "clamped to the last position inside");
+        assert_eq!(at.y, beyond.y);
+
+        s.tick();
+        assert!(
+            s.boundary_collisions().is_empty(),
+            "held against the wall costs one report"
+        );
+
+        s.tick();
+        assert!(s.boundary_collisions().is_empty(), "a move back inside is no collision");
+        assert_eq!(s.position(id), Some(inside));
+
+        s.tick();
+        assert_eq!(
+            s.boundary_collisions(),
+            &[(id, beyond)],
+            "reported again after coming back"
+        );
+    }
+
+    #[test]
+    fn a_viewer_reports_its_view_reaching_the_box_on_a_cell_change() {
+        let cfg = WorldConfig::default();
+        let cell = cfg.cell_size().raw();
+        // Two cells from the east side, which at a cell radius of two is where
+        // the subscription box would first reach past the region.
+        let near = Pos3::new(
+            Fixed::from_raw(cfg.region_size().raw() - cell - cell / 2),
+            Fixed::from_meters(2048),
+            Fixed::ZERO,
+        );
+        let along = Pos3::new(near.x, Fixed::from_raw(near.y.raw() + cell), Fixed::ZERO);
+        let mid = Pos3::from_meters(2048, 2048, 0);
+        let mut s =
+            WorldSimulation::new(cfg, Plan::new(mid, &[mid, near, near, along, mid]));
+        s.set_thread_count(1);
+        s.tick();
+        let id = s.game().who.expect("spawned");
+        s.register_viewer(id, ClientLimits::default());
+
+        s.tick();
+        assert!(
+            s.view_collisions().is_empty(),
+            "a first serve in the middle reports nothing"
+        );
+        assert!(s.view_cleared().is_empty());
+
+        s.tick();
+        assert_eq!(
+            s.view_collisions(),
+            &[(id, near)],
+            "the cell change that reached the box"
+        );
+
+        s.tick();
+        assert!(s.view_collisions().is_empty(), "standing there costs nothing");
+
+        s.tick();
+        assert_eq!(
+            s.view_collisions(),
+            &[(id, along)],
+            "again on a cell change along the side"
+        );
+
+        s.tick();
+        assert!(s.view_collisions().is_empty());
+        assert_eq!(
+            s.view_cleared(),
+            &[id],
+            "cleared on the cell change that left the band"
+        );
+
+        for _ in 0..100 {
+            s.tick();
+            assert!(s.view_collisions().is_empty() && s.view_cleared().is_empty());
+        }
+    }
+
+    #[test]
+    fn view_collisions_survive_more_than_one_worker() {
+        let cfg = WorldConfig::default();
+        let corner = Pos3::from_meters(10, 10, 0);
+        let mut s = WorldSimulation::new(cfg, Plan::new(corner, &[]));
+        s.set_thread_count(4);
+        s.tick();
+        let id = s.game().who.expect("spawned");
+        // Enough viewers that more than one worker takes a run.
+        let ids = populate(&mut s, 64);
+        for &v in &ids {
+            s.register_viewer(v, ClientLimits::default());
+        }
+        s.register_viewer(id, ClientLimits::default());
+        s.tick();
+        assert!(s.view_collisions().iter().any(|&(who, _)| who == id));
     }
 }

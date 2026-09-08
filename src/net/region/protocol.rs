@@ -238,7 +238,9 @@ impl EntityKind {
     }
 
     /// Reads three bytes: role, then tag as little-endian u16.
-    pub(crate) fn decode_wire(c: &mut crate::net::wire::Cursor<'_>) -> Result<EntityKind, NetError> {
+    pub(crate) fn decode_wire(
+        c: &mut crate::net::wire::Cursor<'_>,
+    ) -> Result<EntityKind, NetError> {
         let role = c.u8()?;
         let tag = c.u16()?;
         match role {
@@ -247,7 +249,6 @@ impl EntityKind {
             _ => Err(NetError::Malformed("entity kind role")),
         }
     }
-
 }
 
 /// One entity an edge is asking for.
@@ -374,14 +375,56 @@ pub enum Presence {
         /// The id that is gone.
         entity: EntityId,
     },
+    /// A move would have taken the entity outside the box. It stands at the
+    /// box; `target` is where it wanted to be, in this region's coordinates.
+    /// Reported once per push, and again only after the entity has been back
+    /// inside (`docs/adr/0010`).
+    BoundaryCollision {
+        /// Which entity.
+        entity: EntityId,
+        /// Where it wanted to be.
+        target: Pos3,
+    },
+    /// The viewer on this entity has its view reaching the box: reported on
+    /// the cell change that brought its subscription past the region, and on
+    /// each cell change while it stays there.
+    ViewCollision {
+        /// Which entity.
+        entity: EntityId,
+        /// Where it stands.
+        position: Pos3,
+    },
+    /// The viewer on this entity no longer has its view reaching the box.
+    ViewCleared {
+        /// Which entity.
+        entity: EntityId,
+    },
+}
+
+fn put_pos3(at: Pos3, out: &mut Vec<u8>) {
+    out.extend_from_slice(&at.x.raw().to_le_bytes());
+    out.extend_from_slice(&at.y.raw().to_le_bytes());
+    out.extend_from_slice(&at.z.raw().to_le_bytes());
+}
+
+fn get_pos3(c: &mut Cursor<'_>) -> Result<Pos3, NetError> {
+    Ok(Pos3::new(
+        crate::fixed::Fixed::from_raw(c.i32()?),
+        crate::fixed::Fixed::from_raw(c.i32()?),
+        crate::fixed::Fixed::from_raw(c.i32()?),
+    ))
 }
 
 impl Presence {
-    /// One presence report's width on the wire.
-    pub const BYTES: usize = 13;
+    /// One presence report's width on the wire: the widest variant, which is
+    /// a kind, an id and a position.
+    pub const BYTES: usize = 17;
 
     const ADDED: u8 = 1;
     const REMOVED: u8 = 2;
+    const BOUNDARY: u8 = 3;
+    const VIEW: u8 = 4;
+    const VIEW_CLEARED: u8 = 5;
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.clear();
@@ -395,6 +438,20 @@ impl Presence {
                 out.push(Presence::REMOVED);
                 out.extend_from_slice(&entity.raw().to_le_bytes());
             }
+            Presence::BoundaryCollision { entity, target } => {
+                out.push(Presence::BOUNDARY);
+                out.extend_from_slice(&entity.raw().to_le_bytes());
+                put_pos3(*target, out);
+            }
+            Presence::ViewCollision { entity, position } => {
+                out.push(Presence::VIEW);
+                out.extend_from_slice(&entity.raw().to_le_bytes());
+                put_pos3(*position, out);
+            }
+            Presence::ViewCleared { entity } => {
+                out.push(Presence::VIEW_CLEARED);
+                out.extend_from_slice(&entity.raw().to_le_bytes());
+            }
         }
     }
 
@@ -406,6 +463,13 @@ impl Presence {
         let got = match what {
             Presence::ADDED => Presence::Added { entity, token: c.u64()? },
             Presence::REMOVED => Presence::Removed { entity },
+            Presence::BOUNDARY => {
+                Presence::BoundaryCollision { entity, target: get_pos3(&mut c)? }
+            }
+            Presence::VIEW => {
+                Presence::ViewCollision { entity, position: get_pos3(&mut c)? }
+            }
+            Presence::VIEW_CLEARED => Presence::ViewCleared { entity },
             _ => return Err(NetError::Malformed("presence kind")),
         };
         c.finish()?;
@@ -685,9 +749,7 @@ mod tests {
             EntityKind::unattended(42),
             EntityKind::observer(65535),
         ] {
-            let m = SpawnEntities {
-                spawns: vec![want(1, kind, 0)],
-            };
+            let m = SpawnEntities { spawns: vec![want(1, kind, 0)] };
             let mut buf = Vec::new();
             m.encode(&mut buf);
             let back = SpawnEntities::decode(&buf[1..]).expect("well formed");
@@ -800,6 +862,15 @@ mod tests {
             Presence::Added { entity: ent(41), token: 0x0123_4567_89AB_CDEF },
             Presence::Added { entity: ent(41), token: 0 },
             Presence::Removed { entity: ent(9) },
+            Presence::BoundaryCollision {
+                entity: ent(9),
+                target: Pos3::from_meters(-3, 5000, 7),
+            },
+            Presence::ViewCollision {
+                entity: ent(10),
+                position: Pos3::from_meters(1, 2, 3),
+            },
+            Presence::ViewCleared { entity: ent(11) },
         ] {
             let mut buf = Vec::new();
             m.encode(&mut buf);

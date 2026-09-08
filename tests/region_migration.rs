@@ -221,6 +221,15 @@ impl Edge {
 
     fn take(&mut self, message: Incoming) {
         match message {
+            // Reports of something reaching a box, which nothing here moves
+            // into: heard and ignored.
+            Incoming::Presence {
+                what:
+                    Presence::BoundaryCollision { .. }
+                    | Presence::ViewCollision { .. }
+                    | Presence::ViewCleared { .. },
+                ..
+            } => {}
             Incoming::Presence { region, what: Presence::Added { entity, token } } => {
                 let at = *self
                     .wanted

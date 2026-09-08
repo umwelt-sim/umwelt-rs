@@ -766,6 +766,11 @@ impl core::fmt::Debug for EdgeHandle {
 /// in one place.
 pub(crate) fn on_presence(shared: &Arc<Shared>, region: RegionId, what: Presence) {
     match what {
+        // Answered from the shadow and crossing work on: for now the region
+        // is heard and nothing is done.
+        Presence::BoundaryCollision { .. }
+        | Presence::ViewCollision { .. }
+        | Presence::ViewCleared { .. } => {}
         Presence::Added { entity, token } => {
             let key = EntityKey::from_raw(token);
 

@@ -168,7 +168,7 @@ pub struct WorldConfig {
 }
 
 impl WorldConfig {
-    /// Starts building a world configuration. 
+    /// Starts building a world configuration.
     /// Every field has a default and [`WorldConfigBuilder::build`] validates the result.
     pub fn builder() -> WorldConfigBuilder {
         WorldConfigBuilder::default()
@@ -319,6 +319,19 @@ impl WorldConfig {
         self.contains_2d(pos.horizontal())
             && pos.z.raw() >= 0
             && pos.z.raw() < self.vertical_extent.raw()
+    }
+
+    /// The nearest position inside the region and vertical range. A position
+    /// already inside comes back unchanged.
+    #[inline]
+    pub const fn clamp(&self, pos: Pos3) -> Pos3 {
+        let side = self.region_size.raw() - 1;
+        let top = self.vertical_extent.raw() - 1;
+        Pos3::new(
+            Fixed::from_raw(clamp_raw(pos.x.raw(), side)),
+            Fixed::from_raw(clamp_raw(pos.y.raw(), side)),
+            Fixed::from_raw(clamp_raw(pos.z.raw(), top)),
+        )
     }
 
     // -- misc -------------------------------------------------------------
@@ -794,5 +807,17 @@ mod tests {
         let a = base().build().unwrap();
         let b = base().vertical_extent_m(512).build().unwrap();
         assert_ne!(a.protocol_hash(), b.protocol_hash());
+    }
+}
+
+/// `raw` held to `0..=last`.
+#[inline]
+const fn clamp_raw(raw: i32, last: i32) -> i32 {
+    if raw < 0 {
+        0
+    } else if raw > last {
+        last
+    } else {
+        raw
     }
 }
